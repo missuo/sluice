@@ -118,6 +118,9 @@ pub struct Listener {
 #[derive(Debug, Clone)]
 pub enum ListenerKind {
     Tls { cert: String, key: String, http2: bool },
+    /// SNI-based certs loaded from a directory (`<host>.crt`/`<host>.key`),
+    /// served via Pingora's TLS callback and hot-swappable.
+    TlsDynamic { cert_dir: String, http2: bool },
     RedirectHttps,
 }
 
@@ -488,8 +491,20 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
     }
     let tls = child(node, "tls")
         .ok_or_else(|| format!("listener {addr:?}: needs a `tls` block or `redirect-to-https true`"))?;
+    let http2 = child_bool(node, "http2").unwrap_or(false);
+
+    // Dynamic SNI certs from a directory, or a single cert/key pair.
+    if let Some(dir) = prop_str(tls, "cert-dir") {
+        if !Path::new(dir).is_dir() {
+            return Err(format!("listener {addr:?}: cert-dir not a directory: {dir}"));
+        }
+        return Ok(Listener {
+            addr,
+            kind: ListenerKind::TlsDynamic { cert_dir: dir.to_string(), http2 },
+        });
+    }
     let cert = prop_str(tls, "cert")
-        .ok_or_else(|| format!("listener {addr:?}: tls missing cert"))?
+        .ok_or_else(|| format!("listener {addr:?}: tls needs cert+key or cert-dir"))?
         .to_string();
     let key = prop_str(tls, "key")
         .ok_or_else(|| format!("listener {addr:?}: tls missing key"))?
@@ -500,7 +515,6 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
     if !Path::new(&key).exists() {
         return Err(format!("listener {addr:?}: key file not found: {key}"));
     }
-    let http2 = child_bool(node, "http2").unwrap_or(false);
     Ok(Listener { addr, kind: ListenerKind::Tls { cert, key, http2 } })
 }
 

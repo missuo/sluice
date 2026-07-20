@@ -354,8 +354,19 @@ benefit. Tracked as M5.
   metric, log-field enrichment. Grafana board/Geomap not shipped yet.
 - **M3 — controls — DONE (partial):** per-site rate limiting (token bucket) +
   `cloudflare-only` access. Cert hot-rotate not done.
+- **HTTPS upstreams + Host rewrite — DONE:** `upstream "https://host"` (TLS+SNI+
+  verify), Host rewritten to the upstream host; `upstream-host`/`upstream-verify`
+  overrides. Verified against a real public HTTPS API. SSE + WebSocket pass through
+  unbuffered (tested).
+- **M5 — auto-TLS:** dynamic SNI cert store + Pingora TLS callback **DONE** (certs
+  from a `cert-dir`, hot-swappable; multi-domain; the foundation). The ACME client
+  itself (instant-acme + challenge + renewal) is **not built**. **Note:** behind
+  Cloudflare, ACME is the wrong tool — HTTP-01 can't validate cleanly through the
+  orange cloud, and the origin should use a Cloudflare Origin CA cert (15yr, no
+  renewal) or DNS-01. Build the ACME client only for **direct-public** deployments;
+  HTTP-01 then needs port 80 reachable at the domain.
 - **M4 (later):** true zero-downtime binary upgrade (SIGQUIT fd-handoff), config
-  file-watch, upstream pools/load-balancing + health checks, ACME, Grafana board.
+  file-watch, upstream pools/load-balancing + health checks, Grafana board.
 
 "nginx-like general tool" is explicitly out of scope (months, not weeks). Known MVP
 gaps to revisit: rate-limiter map has no eviction (grows with distinct client IPs);

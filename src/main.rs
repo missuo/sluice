@@ -3,6 +3,7 @@
 //!   sluice -c /etc/sluice/sluice.kdl        # run
 //!   sluice --check -c sluice.kdl            # validate config and exit
 
+mod certs;
 mod config;
 mod metrics;
 mod proxy;
@@ -97,6 +98,18 @@ fn main() {
                 let mut tls = TlsSettings::intermediate(cert, key).unwrap_or_else(|e| {
                     fatal(&format!("TLS for {}: cert {cert} / key {key}: {e}", l.addr))
                 });
+                if *http2 {
+                    tls.enable_h2();
+                }
+                proxy.add_tls_with_settings(&l.addr, None, tls);
+                n_tls += 1;
+            }
+            ListenerKind::TlsDynamic { cert_dir, http2 } => {
+                let store = certs::CertStore::from_dir(cert_dir)
+                    .unwrap_or_else(|e| fatal(&format!("cert-dir {cert_dir}: {e}")));
+                let store = Arc::new(ArcSwap::from_pointee(store));
+                let mut tls = TlsSettings::with_callbacks(Box::new(certs::DynamicCert { store }))
+                    .unwrap_or_else(|e| fatal(&format!("dynamic TLS for {}: {e}", l.addr)));
                 if *http2 {
                     tls.enable_h2();
                 }
