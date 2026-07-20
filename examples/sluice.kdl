@@ -1,0 +1,55 @@
+// Example sluice config. Run:  sluice --check -c examples/sluice.kdl
+
+server {
+    threads 0                          // 0 = all cores
+    metrics-addr "127.0.0.1:9090"      // Prometheus, loopback only
+    grace-period-secs 30
+    graceful-shutdown-secs 300
+    upstream-keepalive-pool 256
+    upgrade-sock "/run/sluice/upgrade.sock"
+}
+
+client-ip {
+    trusted-header "cf-connecting-ip"  // trust CF, drop client XFF
+}
+
+geoip {
+    enabled true
+    country-header "cf-ipcountry"      // free country from Cloudflare, no DB
+    // mmdb-asn  "/etc/sluice/GeoLite2-ASN.mmdb"    // optional (asn + org)
+    // mmdb-city "/etc/sluice/GeoLite2-City.mmdb"   // optional (city/lat-lon)
+    log-fields "country"
+    metric-labels "country"
+}
+
+listener "0.0.0.0:443" {
+    http2 true
+    tls cert="/etc/sluice/fullchain.pem" key="/etc/sluice/privkey.pem"
+}
+listener "0.0.0.0:80" {
+    redirect-to-https true
+}
+
+alias prefix="staging"                 // staging-app.example.com == app.example.com
+
+defaults {
+    hsts "max-age=31536000"
+    unknown-host 404
+}
+
+site "app.example.com" {
+    upstream "127.0.0.1:31000"
+    websocket true
+}
+
+site "api.example.com" {
+    upstream "127.0.0.1:31100"
+    max-body "32MiB"
+    read-timeout-secs 300              // SSE
+}
+
+site "example.com" {
+    upstream "127.0.0.1:31000"
+    redirect match="^(?:/[a-z]{2})?/(login|register|dashboard)(?:/|$)" target="https://app.example.com{uri}" status=301
+    redirect match="^/api/auth(?:/|$)" target="https://app.example.com{uri}" status=301
+}

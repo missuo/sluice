@@ -1,0 +1,29 @@
+[package]
+name = "sluice"
+version = "0.1.0"
+edition = "2021"
+description = "A config-driven edge proxy on Pingora. Routes and regulates HTTP traffic from a KDL config, no recompile per change."
+license = "MIT"
+
+[dependencies]
+pingora = { version = "0.8", default-features = false, features = ["proxy"] }
+async-trait = "0.1"
+arc-swap = "1"
+kdl = { version = "6", features = ["v1"] }
+regex = "1"
+log = "0.4"
+env_logger = "0.11"
+prometheus = "0.13"
+
+[features]
+# Dev builds default to openssl; build prod with:
+#   cargo build --release --no-default-features --features boringssl
+# BoringSSL is Cloudflare's TLS stack — avoids the OpenSSL-3 → CF 525 issue.
+default = ["openssl"]
+openssl = ["pingora/openssl"]
+boringssl = ["pingora/boringssl"]
+rustls = ["pingora/rustls"]
+
+[profile.release]
+lto = true
+codegen-units = 1
