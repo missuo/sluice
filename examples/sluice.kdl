@@ -56,10 +56,17 @@ site "docs.example.com" {              // static file server, no upstream
 }
 
 site "api.example.com" {
-    upstream "127.0.0.1:31100"
+    upstream "127.0.0.1:31100"         // bare host:port = plaintext, client Host preserved
     max-body "32MiB"
     read-timeout-secs 300              // SSE
     rate-limit rps=50 burst=100        // token bucket per client IP
+}
+
+site "openai.example.com" {            // reverse-proxy an external HTTPS API
+    upstream "https://api.openai.com"  // TLS + SNI; Host rewritten to api.openai.com
+    read-timeout-secs 600              // streaming completions can idle between tokens
+    // upstream-host "..."             // override the Host sent upstream
+    // upstream-verify false           // disable upstream cert verification (testing)
 }
 
 site "grafana.example.com" {

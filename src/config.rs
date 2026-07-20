@@ -121,11 +121,23 @@ pub enum ListenerKind {
     RedirectHttps,
 }
 
-#[derive(Debug)]
+/// A proxy backend. `https://host[:port]` → TLS with SNI + Host rewrite;
+/// bare `host:port` → plaintext, client Host preserved (local-backend semantics).
+#[derive(Debug, Clone)]
+pub struct Upstream {
+    pub host: String,
+    pub port: u16,
+    pub tls: bool,
+    pub sni: String,
+    /// Host header to send upstream. None = preserve the client's Host.
+    pub host_header: Option<String>,
+    pub verify: bool,
+}
+
 pub struct Site {
     pub host: String,
     /// Proxy backend. None for a file-server site.
-    pub upstream: Option<(String, u16)>,
+    pub upstream: Option<Upstream>,
     /// Static file root. None for a proxy site. Exactly one of upstream/file_root is set.
     pub file_root: Option<String>,
     pub index: String,
@@ -240,14 +252,36 @@ fn open_mmdb(path: &str, label: &str, errs: &mut Vec<String>) -> Option<maxmindd
     }
 }
 
-fn split_hostport(s: &str) -> Result<(String, u16), String> {
-    let (h, p) = s
-        .rsplit_once(':')
-        .ok_or_else(|| format!("upstream {s:?} must be host:port"))?;
-    let port = p
-        .parse::<u16>()
-        .map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?;
-    Ok((h.to_string(), port))
+/// Parse an upstream: `https://host[:port]` (TLS+SNI, Host rewritten to host),
+/// `http://host[:port]`, or bare `host:port` (plaintext, client Host preserved).
+fn parse_upstream(s: &str) -> Result<Upstream, String> {
+    let (tls, rest, default_port, url_form) = if let Some(r) = s.strip_prefix("https://") {
+        (true, r, 443u16, true)
+    } else if let Some(r) = s.strip_prefix("http://") {
+        (false, r, 80u16, true)
+    } else {
+        (false, s, 0u16, false)
+    };
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (
+            h.to_string(),
+            p.parse::<u16>().map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
+        ),
+        None if default_port != 0 => (hostport.to_string(), default_port),
+        None => return Err(format!("upstream {s:?} must be host:port or a http(s):// URL")),
+    };
+    if host.is_empty() {
+        return Err(format!("upstream {s:?}: empty host"));
+    }
+    Ok(Upstream {
+        sni: host.clone(),
+        host_header: if url_form { Some(host.clone()) } else { None },
+        tls,
+        verify: tls,
+        host,
+        port,
+    })
 }
 
 const TOP_LEVEL: &[&str] = &[
@@ -477,7 +511,16 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
 
     // Backend: exactly one of `upstream` (proxy) or `file-server` (static).
     let upstream = match child_arg(node, "upstream") {
-        Some(u) => Some(split_hostport(u)?),
+        Some(u) => {
+            let mut up = parse_upstream(u).map_err(|e| format!("site `{host}`: {e}"))?;
+            if let Some(h) = child_arg(node, "upstream-host") {
+                up.host_header = Some(h.to_string());
+            }
+            if let Some(v) = child_bool(node, "upstream-verify") {
+                up.verify = v;
+            }
+            Some(up)
+        }
         None => None,
     };
     let (file_root, index) = match child(node, "file-server") {

@@ -357,13 +357,16 @@ impl ProxyHttp for SluiceProxy {
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         let idx = ctx.site.ok_or_else(|| Error::new_str("no site matched for request"))?;
         let site = &ctx.cfg.sites[idx];
-        let (uh, up) = site
+        let up = site
             .upstream
             .as_ref()
             .ok_or_else(|| Error::new_str("file-server site reached upstream_peer"))?;
-        ctx.upstream = *up;
+        ctx.upstream = up.port;
 
-        let mut peer = HttpPeer::new((uh.as_str(), *up), false, String::new());
+        // tls + sni for https upstreams (OpenAI/S3); plaintext for bare host:port.
+        let mut peer = HttpPeer::new((up.host.as_str(), up.port), up.tls, up.sni.clone());
+        peer.options.verify_cert = up.verify;
+        peer.options.verify_hostname = up.verify;
         peer.options.connection_timeout = Some(Duration::from_secs(5));
         // Default a read timeout for non-websocket sites (slowloris protection);
         // websockets and explicitly-configured sites keep their own value.
@@ -386,6 +389,15 @@ impl ProxyHttp for SluiceProxy {
         upstream_request.insert_header("X-Real-IP", &ctx.client_ip)?;
         upstream_request.insert_header("X-Forwarded-For", &ctx.client_ip)?;
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
+        // Rewrite Host for cross-host (https://) upstreams so OpenAI/S3 see their
+        // own hostname; bare host:port upstreams keep the client's Host.
+        if let Some(idx) = ctx.site {
+            if let Some(up) = &ctx.cfg.sites[idx].upstream {
+                if let Some(h) = &up.host_header {
+                    upstream_request.insert_header("Host", h.as_str())?;
+                }
+            }
+        }
         Ok(())
     }
 
