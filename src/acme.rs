@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use instant_acme::{
-    Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus, RetryPolicy,
+    Account, AccountCredentials, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt,
+    NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
 
 use crate::certs::{Cert, CertStore};
@@ -38,18 +38,34 @@ pub fn spawn(
                 return;
             }
         };
-        let _ = std::fs::create_dir_all(&cfg.cache_dir);
+        create_private_dir(&cfg.cache_dir);
         load_cached(&cfg, &domains, &cert_store);
         rt.block_on(async move {
+            // One ACME account, created once and reused for every domain and every
+            // renewal cycle. Registering a fresh account per provision would hit
+            // Let's Encrypt's new-account rate limit as soon as there are several
+            // domains. Credentials are cached per environment (staging vs prod).
+            let account = match get_account(&cfg).await {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("acme: cannot initialize account: {e}");
+                    return;
+                }
+            };
             loop {
                 for d in &domains {
                     if !needs_cert(&cfg, d) {
                         continue;
                     }
-                    match provision(&cfg, d, &challenges).await {
+                    match provision(&account, d, &challenges).await {
                         Ok((cert_pem, key_pem)) => {
                             let _ = std::fs::write(format!("{}/{}.crt", cfg.cache_dir, d), &cert_pem);
-                            let _ = std::fs::write(format!("{}/{}.key", cfg.cache_dir, d), &key_pem);
+                            // The private key must not be world-readable.
+                            if let Err(e) =
+                                write_private(&format!("{}/{}.key", cfg.cache_dir, d), key_pem.as_bytes())
+                            {
+                                log::warn!("acme: {d}: could not write private key: {e}");
+                            }
                             match Cert::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()) {
                                 Ok(c) => {
                                     let mut store = (**cert_store.load()).clone();
@@ -67,6 +83,35 @@ pub fn spawn(
             }
         });
     });
+}
+
+/// Create the cache dir with owner-only permissions (it holds private keys).
+fn create_private_dir(dir: &str) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+    }
+    #[cfg(not(unix))]
+    let _ = std::fs::create_dir_all(dir);
+}
+
+/// Write a file containing secret material with mode 0600 (owner read/write).
+fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(data)
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, data)
 }
 
 fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertStore>>) {
@@ -97,18 +142,34 @@ fn needs_cert(cfg: &AcmeCfg, domain: &str) -> bool {
     }
 }
 
-async fn provision(
-    cfg: &AcmeCfg,
-    domain: &str,
-    challenges: &ChallengeStore,
-) -> Result<(String, String), String> {
+/// Load the cached ACME account for this environment, or register a new one and
+/// persist its credentials. Cached per environment (staging and production are
+/// distinct accounts on distinct directory URLs).
+async fn get_account(cfg: &AcmeCfg) -> Result<Account, String> {
+    let env = if cfg.staging { "staging" } else { "production" };
+    let creds_path = format!("{}/account-{env}.json", cfg.cache_dir);
+
+    if let Ok(bytes) = std::fs::read(&creds_path) {
+        match serde_json::from_slice::<AccountCredentials>(&bytes) {
+            Ok(creds) => match Account::builder()
+                .map_err(|e| format!("account builder: {e}"))?
+                .from_credentials(creds)
+                .await
+            {
+                Ok(account) => return Ok(account),
+                Err(e) => log::warn!("acme: cached account unusable ({e}); registering a new one"),
+            },
+            Err(e) => log::warn!("acme: cached account creds corrupt ({e}); registering a new one"),
+        }
+    }
+
     let dir = if cfg.staging {
         LetsEncrypt::Staging.url()
     } else {
         LetsEncrypt::Production.url()
     };
     let contact = format!("mailto:{}", cfg.contact);
-    let (account, _creds) = Account::builder()
+    let (account, creds) = Account::builder()
         .map_err(|e| format!("account builder: {e}"))?
         .create(
             &NewAccount {
@@ -121,7 +182,23 @@ async fn provision(
         )
         .await
         .map_err(|e| format!("account: {e}"))?;
+    // Account credentials embed the account private key — write them 0600.
+    match serde_json::to_vec(&creds) {
+        Ok(json) => {
+            if let Err(e) = write_private(&creds_path, &json) {
+                log::warn!("acme: could not cache account credentials to {creds_path}: {e}");
+            }
+        }
+        Err(e) => log::warn!("acme: could not serialize account credentials: {e}"),
+    }
+    Ok(account)
+}
 
+async fn provision(
+    account: &Account,
+    domain: &str,
+    challenges: &ChallengeStore,
+) -> Result<(String, String), String> {
     let ids = [Identifier::Dns(domain.to_string())];
     let mut order = account
         .new_order(&NewOrder::new(&ids))
@@ -131,6 +208,7 @@ async fn provision(
     // Publish the HTTP-01 response for each pending authorization, then tell the
     // server it's ready. `authorizations()` borrows the order, so scope it so the
     // borrow is released before we poll the order below.
+    let mut published: Vec<String> = Vec::new();
     {
         let mut authzs = order.authorizations();
         while let Some(res) = authzs.next().await {
@@ -145,8 +223,9 @@ async fn provision(
             let token = challenge.token.clone();
             let keyauth = challenge.key_authorization().as_str().to_string();
             let mut map = (**challenges.load()).clone();
-            map.insert(token, keyauth);
+            map.insert(token.clone(), keyauth);
             challenges.store(Arc::new(map));
+            published.push(token);
             challenge
                 .set_ready()
                 .await
@@ -155,10 +234,17 @@ async fn provision(
     }
 
     // Back off until the order is validated (Ready) or fails.
-    let status = order
-        .poll_ready(&RetryPolicy::default())
-        .await
-        .map_err(|e| format!("poll ready: {e}"))?;
+    let poll = order.poll_ready(&RetryPolicy::default()).await;
+    // The tokens have served their purpose — stop answering them on :80 and keep
+    // the challenge map from growing across renewals (do this whatever the outcome).
+    if !published.is_empty() {
+        let mut map = (**challenges.load()).clone();
+        for t in &published {
+            map.remove(t);
+        }
+        challenges.store(Arc::new(map));
+    }
+    let status = poll.map_err(|e| format!("poll ready: {e}"))?;
     if status != OrderStatus::Ready {
         return Err(format!(
             "order {status:?} — HTTP-01 validation failed (is the domain resolving \

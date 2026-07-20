@@ -278,13 +278,29 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
         (false, s, 0u16, false)
     };
     let hostport = rest.split('/').next().unwrap_or(rest);
-    let (host, port) = match hostport.rsplit_once(':') {
-        Some((h, p)) => (
-            h.to_string(),
-            p.parse::<u16>().map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
-        ),
-        None if default_port != 0 => (hostport.to_string(), default_port),
-        None => return Err(format!("upstream {s:?} must be host:port or a http(s):// URL")),
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        // IPv6 literal: `[::1]` or `[::1]:8080`. Host keeps no brackets.
+        let (addr, after) = rest
+            .split_once(']')
+            .ok_or_else(|| format!("upstream {s:?}: unclosed IPv6 bracket"))?;
+        let port = match after.strip_prefix(':') {
+            Some(p) => p.parse::<u16>().map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
+            None if after.is_empty() && default_port != 0 => default_port,
+            None if after.is_empty() => {
+                return Err(format!("upstream {s:?}: IPv6 literal needs a :port"))
+            }
+            None => return Err(format!("upstream {s:?}: junk after IPv6 address: {after:?}")),
+        };
+        (addr.to_string(), port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (
+                h.to_string(),
+                p.parse::<u16>().map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
+            ),
+            None if default_port != 0 => (hostport.to_string(), default_port),
+            None => return Err(format!("upstream {s:?} must be host:port or a http(s):// URL")),
+        }
     };
     if host.is_empty() {
         return Err(format!("upstream {s:?}: empty host"));
@@ -468,10 +484,22 @@ impl Config {
         if listeners.is_empty() {
             errs.push("no `listener` defined".to_string());
         }
-        if acme.is_none()
-            && listeners.iter().any(|l| matches!(l.kind, ListenerKind::TlsAcme { .. }))
-        {
+        let has_acme_listener = listeners
+            .iter()
+            .any(|l| matches!(l.kind, ListenerKind::TlsAcme { .. }));
+        if acme.is_none() && has_acme_listener {
             errs.push("a listener uses `tls acme=true` but there is no `acme {}` block".to_string());
+        }
+        // HTTP-01 challenges are answered on the :80 redirect listener; without one
+        // ACME can never validate.
+        if has_acme_listener
+            && !listeners.iter().any(|l| matches!(l.kind, ListenerKind::RedirectHttps))
+        {
+            errs.push(
+                "`tls acme=true` needs a `listener \"0.0.0.0:80\" { redirect-to-https true }` \
+                 to answer HTTP-01 challenges"
+                    .to_string(),
+            );
         }
         if sites.is_empty() {
             errs.push("no `site` defined".to_string());

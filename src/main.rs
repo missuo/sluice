@@ -103,10 +103,10 @@ fn main() {
     // SIGHUP → hot reload (fail-safe: a bad edit keeps the old config).
     spawn_reload(cfg.clone(), config_path.clone());
 
-    let mut proxy = http_proxy_service(&server.configuration, SluiceProxy::new(cfg));
+    let mut proxy = http_proxy_service(&server.configuration, SluiceProxy::new(cfg.clone()));
     let mut redirector = http_proxy_service(
         &server.configuration,
-        RedirectProxy { challenges: acme_challenges.clone() },
+        RedirectProxy { cfg: cfg.clone(), challenges: acme_challenges.clone() },
     );
     let mut n_tls = 0;
     let mut n_redirect = 0;

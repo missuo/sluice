@@ -102,12 +102,23 @@ impl TlsAccept for DynamicCert {
     async fn certificate_callback(&self, ssl: &mut SslRef) {
         let store = self.store.load();
         let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_string();
-        if let Some(cert) = store.pick(&sni) {
-            let _ = ext::ssl_use_certificate(ssl, &cert.leaf);
-            let _ = ext::ssl_use_private_key(ssl, &cert.key);
-            for ch in &cert.chain {
-                let _ = ext::ssl_add_chain_cert(ssl, ch);
+        match store.pick(&sni) {
+            Some(cert) => {
+                if let Err(e) = ext::ssl_use_certificate(ssl, &cert.leaf) {
+                    log::error!("tls: set certificate for SNI {sni:?} failed: {e}");
+                }
+                if let Err(e) = ext::ssl_use_private_key(ssl, &cert.key) {
+                    log::error!("tls: set private key for SNI {sni:?} failed: {e}");
+                }
+                for ch in &cert.chain {
+                    if let Err(e) = ext::ssl_add_chain_cert(ssl, ch) {
+                        log::error!("tls: add chain cert for SNI {sni:?} failed: {e}");
+                    }
+                }
             }
+            // No cert and no fallback → the handshake will fail closed. Log it so a
+            // dead :443 (e.g. an ACME cert that never issued) is diagnosable.
+            None => log::warn!("tls: no certificate for SNI {sni:?} (and no fallback); handshake will fail"),
         }
     }
 }

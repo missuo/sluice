@@ -46,20 +46,20 @@ fn peer_ip(session: &Session) -> Option<IpAddr> {
 /// otherwise the peer IP is used, so a direct client cannot spoof its address.
 fn real_client_ip(session: &Session, trusted_header: &str, trusted_proxies: &[IpNet]) -> String {
     let peer = peer_ip(session);
-    let peer_trusted = peer.is_some_and(|p| trusted_proxies.iter().any(|n| n.contains(&p)));
-    if peer_trusted {
+    if is_trusted_peer(peer, trusted_proxies) {
         if let Some(v) = header_val(session, trusted_header).map(str::trim).filter(|s| !s.is_empty()) {
             return v.to_string();
         }
-        if let Some(v) = header_val(session, "x-forwarded-for")
-            .and_then(|v| v.split(',').next())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            return v.to_string();
-        }
+        // Deliberately no X-Forwarded-For fallback: its leftmost entry is
+        // client-controlled, so trusting it would let a client behind the proxy
+        // spoof its address (and evade the per-IP rate limiter). If the trusted
+        // header is absent, fall through to the peer IP.
     }
     peer.map(|p| p.to_string()).unwrap_or_default()
+}
+
+fn is_trusted_peer(peer: Option<IpAddr>, trusted_proxies: &[IpNet]) -> bool {
+    peer.is_some_and(|p| trusted_proxies.iter().any(|n| n.contains(&p)))
 }
 
 fn req_uri(session: &Session) -> String {
@@ -162,11 +162,15 @@ fn content_type(path: &std::path::Path) -> &'static str {
 fn geo_lookup(cfg: &Config, ctx: &mut Ctx, session: &Session) {
     let Some(g) = &cfg.geoip else { return };
     if let Some(h) = &g.country_header {
-        // Only accept a 2-letter code — the header is client-supplied, and it
-        // becomes a metric label, so reject anything that could inflate cardinality.
-        let c = header_val(session, h).unwrap_or("").to_ascii_uppercase();
-        if c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()) {
-            ctx.country = c;
+        // Only honor the country header from a trusted proxy (same anti-spoofing
+        // as the client-IP header) — otherwise a direct client could forge geo
+        // data in the access log and the country metric. And only accept a
+        // 2-letter code, so the metric label can't be inflated.
+        if is_trusted_peer(peer_ip(session), &cfg.trusted_proxies) {
+            let c = header_val(session, h).unwrap_or("").to_ascii_uppercase();
+            if c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()) {
+                ctx.country = c;
+            }
         }
     }
     let Ok(ip) = ctx.client_ip.parse::<IpAddr>() else { return };
@@ -255,6 +259,9 @@ pub struct Ctx {
     asn: String,
     asn_org: String,
     city: String,
+    /// Per-site body cap enforced while streaming (see `request_body_filter`).
+    body_limit: Option<u64>,
+    body_seen: u64,
 }
 
 #[async_trait]
@@ -273,6 +280,8 @@ impl ProxyHttp for SluiceProxy {
             asn: String::new(),
             asn_org: String::new(),
             city: String::new(),
+            body_limit: None,
+            body_seen: 0,
         }
     }
 
@@ -342,6 +351,7 @@ impl ProxyHttp for SluiceProxy {
         }
 
         if let Some(max) = site.max_body {
+            // Fast path: reject an over-size declared Content-Length up front.
             let too_big = header_val(session, "content-length")
                 .and_then(|v| v.parse::<u64>().ok())
                 .is_some_and(|l| l > max);
@@ -349,9 +359,30 @@ impl ProxyHttp for SluiceProxy {
                 send_status(session, 413, hsts).await?;
                 return Ok(true);
             }
+            // Slow path: a chunked / no-Content-Length body is still capped while
+            // streaming (see `request_body_filter`), so the limit can't be evaded.
+            ctx.body_limit = Some(max);
         }
 
         Ok(false)
+    }
+
+    /// Enforce `max-body` on the streamed request body, catching chunked or
+    /// HTTP/2 uploads that omit Content-Length (the header check alone misses them).
+    async fn request_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        _end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> Result<()> {
+        if let (Some(max), Some(chunk)) = (ctx.body_limit, body.as_ref()) {
+            ctx.body_seen = ctx.body_seen.saturating_add(chunk.len() as u64);
+            if ctx.body_seen > max {
+                return Err(Error::new_str("request body exceeds max-body"));
+            }
+        }
+        Ok(())
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
@@ -483,6 +514,9 @@ impl ProxyHttp for SluiceProxy {
 // ---- redirect-only proxy (:80 → https) ----
 
 pub struct RedirectProxy {
+    /// Config handle, used to validate the Host before redirecting (so :80 can't
+    /// be turned into an open redirect to an arbitrary host).
+    pub cfg: Arc<ArcSwap<Config>>,
     /// When ACME is enabled, HTTP-01 challenge tokens are answered here on :80.
     pub challenges: Option<crate::acme::ChallengeStore>,
 }
@@ -508,7 +542,17 @@ impl ProxyHttp for RedirectProxy {
                 }
             }
         }
+        // Redirect to https, but only for a Host we actually serve (or a known
+        // alias). An unrecognized Host gets 400 rather than a 301 to an arbitrary
+        // location, so :80 can't be used as an open redirector.
         let host = host_of(session).unwrap_or_default();
+        let cfg = self.cfg.load();
+        let known = !host.is_empty()
+            && (cfg.index.contains_key(&host) || cfg.index.contains_key(&cfg.canonical(&host)));
+        if !known {
+            send_status(session, 400, None).await?;
+            return Ok(true);
+        }
         let uri = req_uri(session);
         redirect(session, 301, format!("https://{host}{uri}"), None).await?;
         Ok(true)
