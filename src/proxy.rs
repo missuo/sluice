@@ -268,11 +268,16 @@ fn fast_rand() -> u64 {
     x ^ (x >> 31)
 }
 
+/// How long a backend stays marked down after a connect failure.
+const HEALTH_COOLDOWN: Duration = Duration::from_secs(10);
+
 pub struct SluiceProxy {
     cfg: Arc<ArcSwap<Config>>,
     limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
     /// Round-robin cursor per (host, location index).
     rr: Arc<DashMap<(String, usize), u64>>,
+    /// Passive health: "host:port" → instant until which it's considered down.
+    health: Arc<DashMap<String, Instant>>,
 }
 
 impl SluiceProxy {
@@ -285,7 +290,22 @@ impl SluiceProxy {
             std::thread::sleep(Duration::from_secs(60));
             sweep.retain(|_, b: &mut Bucket| b.last.elapsed() < Duration::from_secs(600));
         });
-        SluiceProxy { cfg, limiter, rr: Arc::new(DashMap::new()) }
+        SluiceProxy {
+            cfg,
+            limiter,
+            rr: Arc::new(DashMap::new()),
+            health: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Is this backend currently marked down (within its cooldown)?
+    fn is_down(&self, addr: &str) -> bool {
+        self.health.get(addr).is_some_and(|until| Instant::now() < *until)
+    }
+
+    /// Mark a backend down for the cooldown after a connect failure.
+    fn mark_down(&self, addr: &str) {
+        self.health.insert(addr.to_string(), Instant::now() + HEALTH_COOLDOWN);
     }
 
     /// Base index into the pool for this request (before failover offset).
@@ -343,6 +363,8 @@ pub struct Ctx {
     tries: usize,
     /// The upstream address actually dialed, for the access log.
     up_addr: String,
+    /// Host header to send to the chosen upstream (None = preserve client Host).
+    up_host_header: Option<String>,
     client_ip: String,
     country: String,
     asn: String,
@@ -369,6 +391,7 @@ impl ProxyHttp for SluiceProxy {
             lb_base: 0,
             tries: 0,
             up_addr: String::new(),
+            up_host_header: None,
             client_ip: String::new(),
             country: String::new(),
             asn: String::new(),
@@ -615,9 +638,23 @@ impl ProxyHttp for SluiceProxy {
         let Handler::Proxy(group) = &loc.handler else {
             return Err(Error::new_str("file-server location reached upstream_peer"));
         };
-        // (lb_base picked once in request_filter) + tries (advanced on failover).
-        let up = &group.servers[(ctx.lb_base + ctx.tries) % group.servers.len()];
+        // Start at (lb_base picked once in request_filter) + tries (failover
+        // offset), then skip past any backend currently marked down. If every
+        // member is down, fall back to the start so we still attempt one.
+        let n = group.servers.len();
+        let start = (ctx.lb_base + ctx.tries) % n;
+        let mut chosen = start;
+        for k in 0..n {
+            let cand = (start + k) % n;
+            let s = &group.servers[cand];
+            if !self.is_down(&format!("{}:{}", s.host, s.port)) {
+                chosen = cand;
+                break;
+            }
+        }
+        let up = &group.servers[chosen];
         ctx.up_addr = format!("{}:{}", up.host, up.port);
+        ctx.up_host_header = up.host_header.clone();
 
         // tls + sni for https upstreams (OpenAI/S3); plaintext for bare host:port.
         let mut peer = HttpPeer::new((up.host.as_str(), up.port), up.tls, up.sni.clone());
@@ -645,6 +682,11 @@ impl ProxyHttp for SluiceProxy {
         ctx: &mut Ctx,
         mut e: Box<Error>,
     ) -> Box<Error> {
+        // The backend we just tried is unreachable — mark it down so subsequent
+        // requests skip it during the cooldown.
+        if !ctx.up_addr.is_empty() {
+            self.mark_down(&ctx.up_addr);
+        }
         let cfg = ctx.cfg.clone();
         if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
             if let Handler::Proxy(group) = &cfg.sites[si].locations[li].handler {
@@ -667,15 +709,10 @@ impl ProxyHttp for SluiceProxy {
         upstream_request.insert_header("X-Forwarded-For", &ctx.client_ip)?;
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
         // Rewrite Host for cross-host (https://) upstreams so OpenAI/S3 see their
-        // own hostname; bare host:port upstreams keep the client's Host.
-        let cfg = ctx.cfg.clone();
-        if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
-            if let Handler::Proxy(group) = &cfg.sites[si].locations[li].handler {
-                let up = &group.servers[(ctx.lb_base + ctx.tries) % group.servers.len()];
-                if let Some(h) = &up.host_header {
-                    upstream_request.insert_header("Host", h.as_str())?;
-                }
-            }
+        // own hostname; bare host:port upstreams keep the client's Host. Uses the
+        // exact server chosen in upstream_peer (health-aware), not a re-derivation.
+        if let Some(h) = &ctx.up_host_header {
+            upstream_request.insert_header("Host", h.as_str())?;
         }
         Ok(())
     }
