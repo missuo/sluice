@@ -380,8 +380,19 @@ benefit. Tracked as M5.
   currently attempts *every* site host (a CF-fronted host will fail HTTP-01
   forever), and `tls acme=true` needs a `:80 redirect-to-https` listener present
   to answer challenges.
+- **M6 — Caddy/nginx parity — DONE:** **path routing** (`location` blocks, prefix
+  or `~regex`, first-match; a bare site-level backend is an implicit `/`),
+  **multi-upstream load balancing** (`upstream { server…; balance round-robin|
+  random|ip-hash }` + connect-failure failover), **response cache** (`pingora-cache`
+  in-memory LRU + cache-lock, per-location `cache { ttl-secs }`, honors origin
+  Cache-Control), and a config-driven **WAF** (`waf { block field=… match=… }` on
+  path/query/method/header). Static files now stream off the async runtime. All
+  verified live on the test box (routing, RR distribution, failover, cache HIT vs
+  no-store, WAF blocks).
 - **M4 (later):** true zero-downtime binary upgrade (SIGQUIT fd-handoff), config
-  file-watch, upstream pools/load-balancing + health checks, Grafana board.
+  file-watch, **upstream health checks** (passive down-marking / active probes),
+  **per-location header add/remove**, disk-backed cache, Grafana board. Full
+  Lua/Rhai **scripting** remains out of scope (a compiled-in plugin seam instead).
 
 "nginx-like general tool" is explicitly out of scope (months, not weeks). Known MVP
 gaps to revisit: rate-limiter map has no eviction (grows with distinct client IPs);

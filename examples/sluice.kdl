@@ -1,5 +1,8 @@
 // Example sluice config. Validate:  sluice --check -c examples/sluice.kdl
 // KDL v1 grammar: bare true/false, brace blocks, // comments.
+//
+// NOTE ON REGEXES: a KDL string treats `\` as an escape, so a regex with a
+// backslash must use a KDL *raw string*: match=r"\.php$"  (not "\.php$").
 
 server {
     threads 0                          // 0 = all cores
@@ -36,9 +39,9 @@ listener "0.0.0.0:80" {
     redirect-to-https true              // also answers ACME HTTP-01 challenges
 }
 
-// Automatic Let's Encrypt certs (like Caddy) — only if you don't already have a
-// cert. Each site host must resolve DIRECTLY to this server with :80 reachable
-// (NOT behind a proxying CDN — behind Cloudflare use an Origin CA cert instead).
+// Automatic Let's Encrypt certs (like Caddy) — for a host that resolves DIRECTLY
+// to this server with :80 reachable (NOT behind a proxying CDN; behind Cloudflare
+// use an Origin CA cert instead). Opt in per site with `acme true`.
 // acme {
 //     contact "you@example.com"
 //     staging false                    // true = Let's Encrypt staging (testing)
@@ -52,25 +55,52 @@ defaults {
     unknown-host 404
 }
 
+// A simple single-upstream site (bare `upstream` = an implicit "/" location).
 site "app.example.com" {
     upstream "127.0.0.1:31000"
     websocket true
-    deny "^/\.git"                      // 403 these paths (nginx `deny`)
-    deny "^/internal/"
+    deny r"^/\.git"                     // 403 these paths (nginx `deny`)
 }
 
-site "docs.example.com" {              // static file server, no upstream
+// Path routing (nginx `location`) + a load-balanced pool + response cache + WAF.
+site "api.example.com" {
+    // Site-wide request firewall, checked first.
+    waf {
+        block field="path" match=r"^/\.\./"          // path traversal
+        block field="user-agent" match="(?i)sqlmap|nikto"
+        block field="query" match=r"(?i)union\s+select"
+    }
+
+    // Locations match in order; first match wins (put specific paths first).
+    location "/static/" {
+        file-server {
+            root "/var/www/api-static"
+        }
+    }
+    location "/v1/" {
+        // A pool of backends with a balancing policy + connect-failure failover.
+        upstream {
+            server "10.0.0.1:8080"
+            server "10.0.0.2:8080"
+            balance "round-robin"        // round-robin | random | ip-hash
+        }
+        read-timeout-secs 300            // SSE / streaming
+        max-body "32MiB"
+    }
+    location "/" {                       // catch-all, cached
+        upstream "127.0.0.1:31100"
+        cache {
+            ttl-secs 60                  // fallback TTL; origin Cache-Control wins
+        }
+        rate-limit rps=50 burst=100      // token bucket per client IP
+    }
+}
+
+site "docs.example.com" {              // pure static file server
     file-server {
         root "/var/www/docs"
         index "index.html"
     }
-}
-
-site "api.example.com" {
-    upstream "127.0.0.1:31100"         // bare host:port = plaintext, client Host preserved
-    max-body "32MiB"
-    read-timeout-secs 300              // SSE
-    rate-limit rps=50 burst=100        // token bucket per client IP
 }
 
 site "openai.example.com" {            // reverse-proxy an external HTTPS API
@@ -88,6 +118,6 @@ site "grafana.example.com" {
 
 site "example.com" {                   // apex with auth-path redirects
     upstream "127.0.0.1:31000"
-    redirect match="^(?:/[a-z]{2})?/(login|register|dashboard)(?:/|$)" target="https://app.example.com{uri}" status=301
-    redirect match="^/api/auth(?:/|$)" target="https://app.example.com{uri}" status=301
+    redirect match=r"^(?:/[a-z]{2})?/(login|register|dashboard)(?:/|$)" target="https://app.example.com{uri}" status=301
+    redirect match=r"^/api/auth(?:/|$)" target="https://app.example.com{uri}" status=301
 }

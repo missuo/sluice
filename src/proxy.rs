@@ -401,39 +401,62 @@ impl ProxyHttp for SluiceProxy {
         Ok(())
     }
 
-    /// Cache key: host + method + full request URI.
+    /// Cache key: host + method + a coarse Accept-Encoding bucket + full URI.
+    /// The encoding bucket keeps a gzip/br body from being served to a client
+    /// that only accepts identity (we don't implement full `Vary` yet).
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<CacheKey> {
         let req = session.req_header();
         let uri = req.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        let ae = req
+            .headers
+            .get("accept-encoding")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let enc = if ae.contains("br") {
+            "br"
+        } else if ae.contains("gzip") {
+            "gzip"
+        } else {
+            "id"
+        };
         Ok(CacheKey::new(
             ctx.host.clone(),
-            format!("{}:{}", req.method.as_str(), uri),
+            format!("{}:{}:{}", req.method.as_str(), enc, uri),
             "",
         ))
     }
 
     /// Decide cacheability: honor the origin's `Cache-Control` first, then fall
     /// back to the location's TTL for a plain 200 the origin didn't mark.
+    /// Never caches an authenticated or per-user response.
     fn response_cache_filter(
         &self,
-        _session: &Session,
+        session: &Session,
         resp: &ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<RespCacheable> {
         let Some(ttl) = ctx.cache_ttl else {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom("cache off")));
         };
-        // Never cache a per-user (cookie-setting) response.
+        // A response that sets a cookie is per-user — never cache it.
         if resp.headers.contains_key("set-cookie") {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
         }
+        let has_auth = session.req_header().headers.contains_key("authorization");
         let cc = CacheControl::from_resp_headers(resp);
         // Honor explicit origin freshness (max-age/Expires) and no-store first.
-        let via_headers = cache_filters::resp_cacheable(cc.as_ref(), resp.clone(), false, &CACHE_DEFAULTS);
+        // `authorization_present` makes resp_cacheable apply the stricter RFC 7234
+        // rule: an authenticated response is only cacheable if the origin says so.
+        let via_headers =
+            cache_filters::resp_cacheable(cc.as_ref(), resp.clone(), has_auth, &CACHE_DEFAULTS);
         if via_headers.is_cacheable() {
             return Ok(via_headers);
         }
-        // Origin gave no freshness — apply our TTL unless it forbade caching.
+        // No explicit origin freshness. Do NOT invent a TTL for an authenticated
+        // request, or when the origin forbade caching.
+        if has_auth {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+        }
         if let Some(cc) = &cc {
             if cc.no_store() || cc.no_cache() || cc.private() {
                 return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));

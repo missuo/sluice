@@ -16,11 +16,25 @@ against live Let's Encrypt (staging + production).
   directives, missing/duplicate fields, bad regex, missing cert/mmdb files).
 - **Hot reload on SIGHUP** — re-parses the file and atomically swaps; a bad edit
   is rejected and the running config is kept (never takes the proxy down).
-- Host-routed **sites** → upstreams; **regex redirects** with `{uri}`/`{host}`;
-  per-site **body limits**, **read timeouts**, **websocket** passthrough, **HSTS**.
-- **Static file server** per site (`file-server { root … }`, index files,
-  content-type by extension, path-traversal protection) — an alternative to `upstream`.
+- Host-routed **sites**, then **path-routed `location` blocks** (prefix or
+  `~regex`, first match wins) — nginx-style routing to different backends per path.
+- **Load-balanced upstream pools**: `upstream { server …; server …; balance … }`
+  with **round-robin / random / ip-hash** selection and connect-failure
+  **failover** to the next member.
+- **Response cache** (`cache { ttl-secs … }`, backed by `pingora-cache`): in-memory
+  LRU with a thundering-herd lock; honors the origin's `Cache-Control` (never
+  caches `no-store`/`private`/`Set-Cookie`) and applies the location TTL otherwise.
+- **WAF**: `waf { block field=… match=… }` blocks requests by regex on
+  path / query / method / any header (e.g. bad user-agents, injection patterns).
+- **regex redirects** with `{uri}`/`{host}`; per-location **body limits**
+  (enforced while streaming), **read timeouts**, **websocket** passthrough, **HSTS**.
+- **Static file server** (`file-server { root … }`, index files, content-type by
+  extension, path-traversal protection, **streamed** off the async runtime) —
+  as a whole site or a single `location`.
 - **Path `deny`** rules (regex → 403), like nginx `deny`.
+
+> Regexes go in KDL **raw strings** when they contain a backslash:
+> `match=r"\.php$"` (a plain `"\.php$"` is an invalid KDL escape).
 - **TLS** listeners (BoringSSL) + **:80 → https** redirect, all from config.
   A single `cert`/`key`, **dynamic SNI certs** (`tls cert-dir="…"`), or
   **auto-TLS via ACME/Let's Encrypt** (`tls acme=true` + an `acme {}` block,
