@@ -51,8 +51,8 @@ wrong, Caddy is the fallback.
 **Non-goals (v1)**
 - **Not** a general nginx replacement. We support the directives *we* need, not a
   universal config language. Scope discipline is the #1 risk (see §9).
-- No automatic ACME/TLS issuance in v1 (we terminate with a provided Origin CA cert;
-  Cloudflare handles public certs). Consider later.
+- ~~No automatic ACME/TLS issuance in v1~~ — **now implemented (M5)** and
+  live-verified; behind Cloudflare an Origin CA cert is still the recommended path.
 - No Lua/JS scripting layer. Programmable behaviour = Rust plugins compiled in, not runtime scripts.
 - No built-in WAF, no load-balancing across many upstream replicas in v1 (single upstream per route; add pools later).
 
@@ -363,15 +363,23 @@ benefit. Tracked as M5.
   verify), Host rewritten to the upstream host; `upstream-host`/`upstream-verify`
   overrides. Verified against a real public HTTPS API. SSE + WebSocket pass through
   unbuffered (tested).
-- **M5 — auto-TLS — DONE:** dynamic SNI cert store + Pingora TLS callback (certs
-  from a `cert-dir`, hot-swappable, multi-domain) AND the ACME client
-  (`instant-acme` + HTTP-01, `tls acme=true` + `acme {}`): a background thread
-  provisions/renews a cert per site host, the `:80` listener answers the HTTP-01
-  challenge, certs land in the hot-swappable store. Compiles + config validates;
-  **live Let's Encrypt issuance needs a domain resolving directly to the server
-  with :80 open** (a DNS-only name). **Note:** behind a proxying CDN (orange-cloud
-  Cloudflare) HTTP-01 won't validate — use a Cloudflare Origin CA cert (15yr) or
-  DNS-01 there. ACME is for direct-public deployments.
+- **M5 — auto-TLS — DONE + LIVE-VERIFIED:** dynamic SNI cert store + Pingora TLS
+  callback (certs from a `cert-dir`, hot-swappable, multi-domain) AND the ACME
+  client (`instant-acme` 0.8 + HTTP-01, `tls acme=true` + `acme {}`): a background
+  thread provisions/renews a cert per site host, the `:80` listener answers the
+  HTTP-01 challenge, certs land in the hot-swappable store. **Verified end-to-end
+  against live Let's Encrypt** (2026-07-20, staging + production): pointed a
+  DNS-only `acme-test.stormcrew.me` at the box and issued a real browser-trusted
+  cert over HTTP-01 with zero manual steps (`curl` without `-k` → HTTP 200, TLS
+  verify 0), served by the SNI callback. Required upgrading `instant-acme 0.7→0.8`:
+  Let's Encrypt now offers a token-less `dns-persist-01` challenge that 0.7.2
+  couldn't deserialize (`token` was a required field), breaking issuance entirely.
+  **Note:** behind a proxying CDN (orange-cloud Cloudflare) HTTP-01 won't validate
+  — use a Cloudflare Origin CA cert (15yr) or DNS-01 there. ACME is for
+  direct-public deployments. **Known limitations (see review):** the ACME loop
+  currently attempts *every* site host (a CF-fronted host will fail HTTP-01
+  forever), and `tls acme=true` needs a `:80 redirect-to-https` listener present
+  to answer challenges.
 - **M4 (later):** true zero-downtime binary upgrade (SIGQUIT fd-handoff), config
   file-watch, upstream pools/load-balancing + health checks, Grafana board.
 

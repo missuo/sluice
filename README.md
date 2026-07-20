@@ -5,7 +5,9 @@ Routes and regulates HTTP traffic from a KDL config file — no recompile per ch
 
 > A *sluice* is a gated channel that routes and regulates water flow.
 
-See [DESIGN.md](DESIGN.md) for the full design. Milestones M0–M3 are implemented.
+See [DESIGN.md](DESIGN.md) for the full design. Milestones M0–M3 plus HTTPS
+upstreams and auto-TLS are implemented; ACME issuance is verified end-to-end
+against live Let's Encrypt (staging + production).
 
 ## What works
 
@@ -24,7 +26,9 @@ See [DESIGN.md](DESIGN.md) for the full design. Milestones M0–M3 are implement
   **auto-TLS via ACME/Let's Encrypt** (`tls acme=true` + an `acme {}` block,
   HTTP-01, like Caddy — for domains that resolve directly to the server with :80
   open; behind Cloudflare use an Origin CA cert instead). Certs hot-swap at
-  runtime via the TLS callback — no restart.
+  runtime via the TLS callback — no restart. Auto-TLS is **verified end-to-end
+  against live Let's Encrypt** (staging and production): a browser-trusted cert
+  issues over HTTP-01 with zero manual steps and is served by SNI at runtime.
 - **HTTPS upstreams** (`upstream "https://api.openai.com"`): TLS + SNI + cert
   verification, and Host rewritten to the upstream host — reverse-proxy external
   APIs (OpenAI/S3). SSE streaming and WebSocket upgrades pass through unbuffered.
