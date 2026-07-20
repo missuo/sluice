@@ -458,9 +458,11 @@ impl ProxyHttp for SluiceProxy {
         let method = session.req_header().method.as_str().to_owned();
         let path = session.req_header().uri.path().to_owned();
         let err = e.map(|e| format!(" err={e}")).unwrap_or_default();
+        // Sub-millisecond precision: static/short-circuit responses are < 1ms,
+        // which as_millis() truncates to a misleading "0ms".
         log::info!(
-            "{client}{geo} {method} {host}{path} -> {status} {}ms up=:{}{err}",
-            elapsed.as_millis(),
+            "{client}{geo} {method} {host}{path} -> {status} {:.3}ms up=:{}{err}",
+            elapsed.as_secs_f64() * 1000.0,
             ctx.upstream
         );
     }
