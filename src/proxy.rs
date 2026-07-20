@@ -1,17 +1,38 @@
 //! The config-driven proxy. Every request reads a per-request snapshot of the
 //! `Config` (via `ArcSwap`), so a hot reload never changes behaviour mid-request.
 
-use std::sync::Arc;
+use std::net::IpAddr;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
+use dashmap::DashMap;
+use ipnet::IpNet;
+use maxminddb::geoip2;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 
-use crate::config::Config;
+use crate::config::{Config, RateLimit};
 use crate::metrics::*;
+
+// Cloudflare origin IP ranges (https://www.cloudflare.com/ips). Used by
+// `access cloudflare-only`. Refreshed with the crate on a real update.
+const CF_CIDRS: &[&str] = &[
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22", "2400:cb00::/32",
+    "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+    "2a06:98c0::/29", "2c0f:f248::/32",
+];
+static CF_RANGES: LazyLock<Vec<IpNet>> =
+    LazyLock::new(|| CF_CIDRS.iter().filter_map(|s| s.parse().ok()).collect());
+
+fn in_cloudflare(ip: IpAddr) -> bool {
+    CF_RANGES.iter().any(|net| net.contains(&ip))
+}
 
 // ---- shared helpers ----
 
@@ -29,12 +50,8 @@ fn header_val<'a>(session: &'a Session, name: &str) -> Option<&'a str> {
     session.req_header().headers.get(name).and_then(|v| v.to_str().ok())
 }
 
-fn peer_ip(session: &Session) -> String {
-    session
-        .client_addr()
-        .and_then(|a| a.as_inet())
-        .map(|i| i.ip().to_string())
-        .unwrap_or_default()
+fn peer_ip(session: &Session) -> Option<IpAddr> {
+    session.client_addr().and_then(|a| a.as_inet()).map(|i| i.ip())
 }
 
 /// Trusted client IP: the configured header (e.g. CF-Connecting-IP), else
@@ -50,7 +67,7 @@ fn real_client_ip(session: &Session, trusted_header: &str) -> String {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(str::to_owned)
-                .unwrap_or_else(|| peer_ip(session))
+                .unwrap_or_else(|| peer_ip(session).map(|i| i.to_string()).unwrap_or_default())
         })
 }
 
@@ -78,10 +95,77 @@ async fn send_status(session: &mut Session, status: u16) -> Result<()> {
     Ok(())
 }
 
+/// Populate ctx geo fields (country from header; asn/city from MaxMind).
+fn geo_lookup(cfg: &Config, ctx: &mut Ctx, session: &Session) {
+    let Some(g) = &cfg.geoip else { return };
+    if let Some(h) = &g.country_header {
+        ctx.country = header_val(session, h).unwrap_or("").to_ascii_uppercase();
+    }
+    let Ok(ip) = ctx.client_ip.parse::<IpAddr>() else { return };
+    if let Some(r) = &g.asn_reader {
+        if let Ok(res) = r.lookup(ip) {
+            if let Ok(Some(asn)) = res.decode::<geoip2::Asn>() {
+                if let Some(n) = asn.autonomous_system_number {
+                    ctx.asn = format!("AS{n}");
+                }
+                if let Some(o) = asn.autonomous_system_organization {
+                    ctx.asn_org = o.replace(' ', "_");
+                }
+            }
+        }
+    }
+    if let Some(r) = &g.city_reader {
+        if let Ok(res) = r.lookup(ip) {
+            if let Ok(Some(city)) = res.decode::<geoip2::City>() {
+                if let Some(name) = city.city.names.english {
+                    ctx.city = name.replace(' ', "_");
+                }
+                if ctx.country.is_empty() {
+                    if let Some(iso) = city.country.iso_code {
+                        ctx.country = iso.to_ascii_uppercase();
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---- rate limiter (state lives in the proxy, survives config reload) ----
+
+struct Bucket {
+    tokens: f64,
+    last: Instant,
+}
+
 // ---- main proxy (TLS listeners) ----
 
 pub struct SluiceProxy {
-    pub cfg: Arc<ArcSwap<Config>>,
+    cfg: Arc<ArcSwap<Config>>,
+    limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
+}
+
+impl SluiceProxy {
+    pub fn new(cfg: Arc<ArcSwap<Config>>) -> Self {
+        SluiceProxy { cfg, limiter: Arc::new(DashMap::new()) }
+    }
+
+    /// Token bucket per (host, client-ip). Returns true if allowed.
+    fn allow(&self, host: &str, ip: IpAddr, rl: RateLimit) -> bool {
+        let now = Instant::now();
+        let mut b = self
+            .limiter
+            .entry((host.to_string(), ip))
+            .or_insert(Bucket { tokens: rl.burst, last: now });
+        let elapsed = now.duration_since(b.last).as_secs_f64();
+        b.tokens = (b.tokens + elapsed * rl.rps).min(rl.burst);
+        b.last = now;
+        if b.tokens >= 1.0 {
+            b.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
 }
 
 pub struct Ctx {
@@ -90,7 +174,11 @@ pub struct Ctx {
     host: String,
     site: Option<usize>,
     upstream: u16,
+    client_ip: String,
     country: String,
+    asn: String,
+    asn_org: String,
+    city: String,
 }
 
 #[async_trait]
@@ -104,13 +192,18 @@ impl ProxyHttp for SluiceProxy {
             host: String::new(),
             site: None,
             upstream: 0,
+            client_ip: String::new(),
             country: String::new(),
+            asn: String::new(),
+            asn_org: String::new(),
+            city: String::new(),
         }
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         INFLIGHT.inc();
         let cfg = ctx.cfg.clone();
+        ctx.client_ip = real_client_ip(session, &cfg.client_ip_header);
 
         let Some(raw_host) = host_of(session) else {
             send_status(session, 400).await?;
@@ -118,12 +211,7 @@ impl ProxyHttp for SluiceProxy {
         };
         let (host, _is_test) = cfg.canonical(&raw_host);
         ctx.host = host.clone();
-
-        if let Some(g) = &cfg.geoip {
-            if let Some(h) = &g.country_header {
-                ctx.country = header_val(session, h).unwrap_or("").to_string();
-            }
-        }
+        geo_lookup(&cfg, ctx, session);
 
         let Some(&idx) = cfg.index.get(&host) else {
             send_status(session, cfg.unknown_host).await?;
@@ -131,6 +219,25 @@ impl ProxyHttp for SluiceProxy {
         };
         ctx.site = Some(idx);
         let site = &cfg.sites[idx];
+
+        // access: cloudflare-only (peer must be a CF edge IP)
+        if site.cloudflare_only {
+            let ok = peer_ip(session).map(in_cloudflare).unwrap_or(false);
+            if !ok {
+                send_status(session, 403).await?;
+                return Ok(true);
+            }
+        }
+
+        // rate limit (per host + client IP)
+        if let Some(rl) = site.rate_limit {
+            if let Ok(ip) = ctx.client_ip.parse::<IpAddr>() {
+                if !self.allow(&host, ip, rl) {
+                    send_status(session, 429).await?;
+                    return Ok(true);
+                }
+            }
+        }
 
         let path = session.req_header().uri.path().to_owned();
         for r in &site.redirects {
@@ -160,11 +267,8 @@ impl ProxyHttp for SluiceProxy {
         let site = &ctx.cfg.sites[idx];
         ctx.upstream = site.upstream_port;
 
-        let mut peer = HttpPeer::new(
-            (site.upstream_host.as_str(), site.upstream_port),
-            false,
-            String::new(),
-        );
+        let mut peer =
+            HttpPeer::new((site.upstream_host.as_str(), site.upstream_port), false, String::new());
         peer.options.connection_timeout = Some(Duration::from_secs(5));
         peer.options.read_timeout = if site.websocket { None } else { site.read_timeout };
         peer.options.write_timeout = Some(Duration::from_secs(300));
@@ -174,13 +278,12 @@ impl ProxyHttp for SluiceProxy {
 
     async fn upstream_request_filter(
         &self,
-        session: &mut Session,
+        _session: &mut Session,
         upstream_request: &mut RequestHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
-        let ip = real_client_ip(session, &ctx.cfg.client_ip_header);
-        upstream_request.insert_header("X-Real-IP", &ip)?;
-        upstream_request.insert_header("X-Forwarded-For", &ip)?;
+        upstream_request.insert_header("X-Real-IP", &ctx.client_ip)?;
+        upstream_request.insert_header("X-Forwarded-For", &ctx.client_ip)?;
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
         Ok(())
     }
@@ -213,20 +316,44 @@ impl ProxyHttp for SluiceProxy {
         if e.is_some() || matches!(status, 502 | 503 | 504) {
             UPSTREAM_ERRORS.with_label_values(&[host]).inc();
         }
-
-        let geoip_on = ctx.cfg.geoip.is_some();
-        if geoip_on && !ctx.country.is_empty() {
+        let country_metric = ctx
+            .cfg
+            .geoip
+            .as_ref()
+            .is_some_and(|g| g.metric_labels.iter().any(|l| l == "country"));
+        if country_metric && !ctx.country.is_empty() {
             REQUESTS_BY_COUNTRY.with_label_values(&[ctx.country.as_str()]).inc();
         }
 
-        let client = real_client_ip(session, &ctx.cfg.client_ip_header);
+        // geo fields for the access log, per configured log-fields
+        let geo = ctx
+            .cfg
+            .geoip
+            .as_ref()
+            .map(|g| {
+                let parts: Vec<&str> = g
+                    .log_fields
+                    .iter()
+                    .filter_map(|f| match f.as_str() {
+                        "country" => Some(ctx.country.as_str()),
+                        "asn" => Some(ctx.asn.as_str()),
+                        "asn-org" => Some(ctx.asn_org.as_str()),
+                        "city" => Some(ctx.city.as_str()),
+                        _ => None,
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", parts.join(" "))
+                }
+            })
+            .unwrap_or_default();
+
+        let client = if ctx.client_ip.is_empty() { "-" } else { ctx.client_ip.as_str() };
         let method = session.req_header().method.as_str().to_owned();
         let path = session.req_header().uri.path().to_owned();
-        let geo = if geoip_on && !ctx.country.is_empty() {
-            format!(" {}", ctx.country)
-        } else {
-            String::new()
-        };
         let err = e.map(|e| format!(" err={e}")).unwrap_or_default();
         log::info!(
             "{client}{geo} {method} {host}{path} -> {status} {}ms up=:{}{err}",

@@ -83,7 +83,10 @@ fn main() {
     let metrics_addr = config.server.metrics_addr.clone();
     let cfg = Arc::new(ArcSwap::from_pointee(config));
 
-    let mut proxy = http_proxy_service(&server.configuration, SluiceProxy { cfg });
+    // SIGHUP → hot reload (fail-safe: a bad edit keeps the old config).
+    spawn_reload(cfg.clone(), config_path.clone());
+
+    let mut proxy = http_proxy_service(&server.configuration, SluiceProxy::new(cfg));
     let mut redirector = http_proxy_service(&server.configuration, RedirectProxy);
     let mut n_tls = 0;
     let mut n_redirect = 0;
@@ -127,4 +130,30 @@ fn main() {
 fn fatal(msg: &str) -> ! {
     eprintln!("sluice: {msg}");
     std::process::exit(2);
+}
+
+/// Reload the config on SIGHUP. On parse/validation failure the running config
+/// is kept untouched, so a bad edit never takes the proxy down.
+fn spawn_reload(cfg: Arc<ArcSwap<Config>>, path: String) {
+    use signal_hook::consts::SIGHUP;
+    use signal_hook::iterator::Signals;
+    std::thread::spawn(move || {
+        let mut signals = match Signals::new([SIGHUP]) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("cannot install SIGHUP handler: {e}");
+                return;
+            }
+        };
+        for _ in signals.forever() {
+            match Config::load(&path) {
+                Ok(new) => {
+                    let n = new.sites.len();
+                    cfg.store(Arc::new(new));
+                    log::info!("SIGHUP: reloaded {path} ({n} site(s))");
+                }
+                Err(e) => log::error!("SIGHUP: reload FAILED, keeping old config:\n{e}"),
+            }
+        }
+    });
 }

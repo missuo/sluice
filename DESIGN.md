@@ -316,16 +316,21 @@ once you're shipping logs anywhere.
 
 ## 8. Milestones
 
-- **M0 — core (1–2 wk):** KDL `Config` loader + `--check`; config-driven `ProxyHttp`
+- **M0 — core — DONE:** KDL `Config` loader + `--check`; config-driven `ProxyHttp`
   (host routing, redirects, timeouts, body limits, client-IP, HSTS, alias); listeners
-  from config; Prometheus + access log. A real vhost deployment is the first user.
-- **M1 — reload:** ArcSwap + SIGHUP/file-watch + fail-safe (bad config keeps old).
-- **M2 — geo + metrics polish:** CF-IPCountry label, optional MaxMind, country metric,
-  Grafana board + Geomap.
-- **M3 — controls:** per-site rate limiting, `cloudflare_only` access, cert hot-rotate.
-- **M4 (maybe):** upstream pools/load-balancing, health checks, ACME.
+  from config; Prometheus + access log.
+- **M1 — reload — DONE:** ArcSwap + SIGHUP + fail-safe (bad config keeps old). File-watch
+  not done (SIGHUP only).
+- **M2 — geo — DONE:** country from `CF-IPCountry`, optional MaxMind ASN/city, country
+  metric, log-field enrichment. Grafana board/Geomap not shipped yet.
+- **M3 — controls — DONE (partial):** per-site rate limiting (token bucket) +
+  `cloudflare-only` access. Cert hot-rotate not done.
+- **M4 (later):** true zero-downtime binary upgrade (SIGQUIT fd-handoff), config
+  file-watch, upstream pools/load-balancing + health checks, ACME, Grafana board.
 
-MVP = M0+M1. "nginx-like general tool" is explicitly out of scope (months, not weeks).
+"nginx-like general tool" is explicitly out of scope (months, not weeks). Known MVP
+gaps to revisit: rate-limiter map has no eviction (grows with distinct client IPs);
+reload does not re-read `server{}`/listeners (by design — those need a restart).
 
 ## 9. Risks
 

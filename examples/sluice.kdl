@@ -1,4 +1,5 @@
-// Example sluice config. Run:  sluice --check -c examples/sluice.kdl
+// Example sluice config. Validate:  sluice --check -c examples/sluice.kdl
+// KDL v1 grammar: bare true/false, brace blocks, // comments.
 
 server {
     threads 0                          // 0 = all cores
@@ -16,10 +17,10 @@ client-ip {
 geoip {
     enabled true
     country-header "cf-ipcountry"      // free country from Cloudflare, no DB
-    // mmdb-asn  "/etc/sluice/GeoLite2-ASN.mmdb"    // optional (asn + org)
-    // mmdb-city "/etc/sluice/GeoLite2-City.mmdb"   // optional (city/lat-lon)
-    log-fields "country"
-    metric-labels "country"
+    // mmdb-asn  "/etc/sluice/GeoLite2-ASN.mmdb"    // → asn + asn-org in the log
+    // mmdb-city "/etc/sluice/GeoLite2-City.mmdb"   // → city in the log
+    log-fields "country" "asn" "asn-org"
+    metric-labels "country"            // low-cardinality only
 }
 
 listener "0.0.0.0:443" {
@@ -46,9 +47,16 @@ site "api.example.com" {
     upstream "127.0.0.1:31100"
     max-body "32MiB"
     read-timeout-secs 300              // SSE
+    rate-limit rps=50 burst=100        // token bucket per client IP
 }
 
-site "example.com" {
+site "grafana.example.com" {
+    upstream "127.0.0.1:3001"
+    websocket true
+    access cloudflare-only=true        // 403 unless the peer is a CF edge IP
+}
+
+site "example.com" {                   // apex with auth-path redirects
     upstream "127.0.0.1:31000"
     redirect match="^(?:/[a-z]{2})?/(login|register|dashboard)(?:/|$)" target="https://app.example.com{uri}" status=301
     redirect match="^/api/auth(?:/|$)" target="https://app.example.com{uri}" status=301

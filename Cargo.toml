@@ -14,6 +14,10 @@ regex = "1"
 log = "0.4"
 env_logger = "0.11"
 prometheus = "0.13"
+signal-hook = "0.3"
+maxminddb = "0.28"
+ipnet = "2"
+dashmap = "6"
 
 [features]
 # Dev builds default to openssl; build prod with:

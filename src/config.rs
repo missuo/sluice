@@ -45,14 +45,12 @@ fn line_col(src: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-#[derive(Debug)]
 pub struct Config {
     pub server: ServerCfg,
     pub client_ip_header: String,
     pub geoip: Option<GeoipCfg>,
     pub listeners: Vec<Listener>,
     pub alias_prefix: Option<String>,
-    pub default_hsts: Option<String>,
     pub unknown_host: u16,
     pub sites: Vec<Site>,
     /// host -> index into `sites`
@@ -82,11 +80,13 @@ impl Default for ServerCfg {
     }
 }
 
-#[derive(Debug)]
 pub struct GeoipCfg {
     pub country_header: Option<String>,
     pub log_fields: Vec<String>,
     pub metric_labels: Vec<String>,
+    /// Opened MaxMind readers (re-opened on each reload). None = feature off.
+    pub asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
+    pub city_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,7 +111,14 @@ pub struct Site {
     pub read_timeout: Option<Duration>,
     pub hsts: Option<String>,
     pub cloudflare_only: bool,
+    pub rate_limit: Option<RateLimit>,
     pub redirects: Vec<Redirect>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RateLimit {
+    pub rps: f64,
+    pub burst: f64,
 }
 
 #[derive(Debug)]
@@ -194,6 +201,20 @@ fn parse_size(s: &str) -> Result<u64, String> {
         .parse::<u64>()
         .map(|v| v * mult)
         .map_err(|_| format!("invalid size {s:?}"))
+}
+
+fn open_mmdb(path: &str, label: &str, errs: &mut Vec<String>) -> Option<maxminddb::Reader<Vec<u8>>> {
+    if !Path::new(path).exists() {
+        errs.push(format!("geoip {label} not found: {path}"));
+        return None;
+    }
+    match maxminddb::Reader::open_readfile(path) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            errs.push(format!("geoip {label} {path}: {e}"));
+            None
+        }
+    }
 }
 
 fn split_hostport(s: &str) -> Result<(String, u16), String> {
@@ -290,7 +311,17 @@ impl Config {
                                 ));
                             }
                         }
-                        geoip = Some(GeoipCfg { country_header, log_fields, metric_labels });
+                        let asn_reader =
+                            child_arg(node, "mmdb-asn").and_then(|p| open_mmdb(p, "mmdb-asn", &mut errs));
+                        let city_reader =
+                            child_arg(node, "mmdb-city").and_then(|p| open_mmdb(p, "mmdb-city", &mut errs));
+                        geoip = Some(GeoipCfg {
+                            country_header,
+                            log_fields,
+                            metric_labels,
+                            asn_reader,
+                            city_reader,
+                        });
                     }
                 }
                 "listener" => match parse_listener(node) {
@@ -345,7 +376,6 @@ impl Config {
                 geoip,
                 listeners,
                 alias_prefix,
-                default_hsts,
                 unknown_host,
                 sites,
                 index,
@@ -423,6 +453,18 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         .and_then(|a| prop_bool(a, "cloudflare-only"))
         .unwrap_or(false);
 
+    let rate_limit = match child(node, "rate-limit") {
+        Some(r) => {
+            let rps = prop_int(r, "rps").unwrap_or(0) as f64;
+            let burst = prop_int(r, "burst").map(|b| b as f64).unwrap_or(rps);
+            if rps <= 0.0 {
+                return Err(format!("site `{host}`: rate-limit needs rps > 0"));
+            }
+            Some(RateLimit { rps, burst: burst.max(rps) })
+        }
+        None => None,
+    };
+
     let mut redirects = Vec::new();
     if let Some(children) = node.children() {
         for r in children.nodes().iter().filter(|n| n.name().value() == "redirect") {
@@ -450,6 +492,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         read_timeout,
         hsts,
         cloudflare_only,
+        rate_limit,
         redirects,
     })
 }
