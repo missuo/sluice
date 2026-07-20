@@ -178,7 +178,17 @@ pub enum Matcher {
 impl Matcher {
     pub fn matches(&self, path: &str) -> bool {
         match self {
-            Matcher::Prefix(p) => path.starts_with(p.as_str()),
+            // Segment-aware prefix: "/api" matches "/api" and "/api/…" but NOT
+            // "/api-internal", so a broad location can't silently shadow a
+            // restricted sibling. A prefix ending in "/" matches at that boundary.
+            Matcher::Prefix(p) => {
+                if !path.starts_with(p.as_str()) {
+                    return false;
+                }
+                path.len() == p.len()
+                    || p.ends_with('/')
+                    || path.as_bytes().get(p.len()) == Some(&b'/')
+            }
             Matcher::Regex(re) => re.is_match(path),
         }
     }

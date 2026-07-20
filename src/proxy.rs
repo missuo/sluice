@@ -76,6 +76,58 @@ fn req_uri(session: &Session) -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Normalize a request path the way backends do, so WAF / `deny` / location
+/// matching can't be bypassed by encoding: percent-decode, collapse `//` and
+/// `.`, resolve `..`, and reject control/NUL bytes or non-UTF-8. Returns None
+/// for a malformed path (caller responds 400). Preserves a trailing slash.
+fn normalize_path(raw: &str) -> Option<String> {
+    let b = raw.as_bytes();
+    let mut dec = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let (h, l) = (hex_val(*b.get(i + 1)?)?, hex_val(*b.get(i + 2)?)?);
+            dec.push(h * 16 + l);
+            i += 3;
+        } else {
+            dec.push(b[i]);
+            i += 1;
+        }
+    }
+    // Reject NUL and control bytes (0x00–0x1F, 0x7F) — never valid in a path and
+    // a classic filter-evasion / smuggling vector.
+    if dec.iter().any(|&c| c < 0x20 || c == 0x7f) {
+        return None;
+    }
+    let s = std::str::from_utf8(&dec).ok()?;
+    let trailing = s.len() > 1 && s.ends_with('/');
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in s.split('/') {
+        match seg {
+            "" | "." => {}          // collapse `//` and `.`
+            ".." => {
+                segs.pop();
+            }
+            other => segs.push(other),
+        }
+    }
+    let mut out = String::from("/");
+    out.push_str(&segs.join("/"));
+    if trailing && !out.ends_with('/') {
+        out.push('/');
+    }
+    Some(out)
+}
+
 async fn redirect(session: &mut Session, status: u16, location: String, hsts: Option<&str>) -> Result<()> {
     let mut resp = ResponseHeader::build(status, Some(3))?;
     resp.insert_header("Location", location)?;
@@ -375,6 +427,8 @@ pub struct Ctx {
     body_seen: u64,
     /// Fallback cache TTL for this request (Some = caching enabled for it).
     cache_ttl: Option<Duration>,
+    /// Max cacheable object size for this request's location (bytes).
+    cache_max_object: usize,
 }
 
 #[async_trait]
@@ -400,6 +454,7 @@ impl ProxyHttp for SluiceProxy {
             body_limit: None,
             body_seen: 0,
             cache_ttl: None,
+            cache_max_object: 0,
         }
     }
 
@@ -411,6 +466,7 @@ impl ProxyHttp for SluiceProxy {
             if let Some(cc) = &cfg.sites[si].locations[li].cache {
                 if cache_filters::request_cacheable(session.req_header()) {
                     ctx.cache_ttl = Some(cc.ttl);
+                    ctx.cache_max_object = cc.max_object;
                     session.cache.enable(
                         &*CACHE_STORAGE,
                         Some(&*CACHE_EVICTION),
@@ -458,38 +514,76 @@ impl ProxyHttp for SluiceProxy {
         resp: &ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<RespCacheable> {
+        let uncacheable = || RespCacheable::Uncacheable(NoCacheReason::OriginNotCache);
         let Some(ttl) = ctx.cache_ttl else {
             return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom("cache off")));
         };
         // A response that sets a cookie is per-user — never cache it.
         if resp.headers.contains_key("set-cookie") {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+            return Ok(uncacheable());
         }
-        let has_auth = session.req_header().headers.contains_key("authorization");
+        // We don't implement full Vary. Only cache when the response varies on
+        // nothing beyond Accept-Encoding (which is already in the key); reject
+        // `Vary: *`, `Vary: Cookie`, `Vary: Authorization`, etc. — otherwise one
+        // client's variant would be served to everyone.
+        if let Some(vary) = resp.headers.get("vary") {
+            let ok = vary
+                .to_str()
+                .map(|v| v.split(',').all(|s| s.trim().eq_ignore_ascii_case("accept-encoding")))
+                .unwrap_or(false);
+            if !ok {
+                return Ok(uncacheable());
+            }
+        }
+        // Object-size cap (bytes) from the location.
+        if ctx.cache_max_object > 0 {
+            if let Some(len) = resp
+                .headers
+                .get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                if len > ctx.cache_max_object {
+                    return Ok(RespCacheable::Uncacheable(NoCacheReason::ResponseTooLarge));
+                }
+            }
+        }
+
+        let req = session.req_header();
+        let has_auth = req.headers.contains_key("authorization");
+        let has_cookie = req.headers.contains_key("cookie");
         let cc = CacheControl::from_resp_headers(resp);
-        // Honor explicit origin freshness (max-age/Expires) and no-store first.
-        // `authorization_present` makes resp_cacheable apply the stricter RFC 7234
-        // rule: an authenticated response is only cacheable if the origin says so.
+        let public = cc.as_ref().is_some_and(|c| c.public());
+
+        // A request carrying credentials (Authorization or a Cookie) may get a
+        // per-user response. Only cache it if the origin *explicitly* marks it
+        // shareable (`Cache-Control: public`) — never via our fallback TTL. This
+        // is what stops cache-deception (e.g. /account/statement.css) from
+        // leaking one user's data to another.
+        if (has_auth || has_cookie) && !public {
+            return Ok(uncacheable());
+        }
+
+        // Honor explicit origin freshness (max-age/Expires); resp_cacheable also
+        // applies the stricter RFC 7234 rule when Authorization is present.
         let via_headers =
             cache_filters::resp_cacheable(cc.as_ref(), resp.clone(), has_auth, &CACHE_DEFAULTS);
         if via_headers.is_cacheable() {
             return Ok(via_headers);
         }
-        // No explicit origin freshness. Do NOT invent a TTL for an authenticated
-        // request, or when the origin forbade caching.
-        if has_auth {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
-        }
+        // No explicit origin freshness → apply our TTL, unless the origin forbade
+        // caching. (Authenticated/cookie requests already returned above unless
+        // the origin said `public`.)
         if let Some(cc) = &cc {
             if cc.no_store() || cc.no_cache() || cc.private() {
-                return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+                return Ok(uncacheable());
             }
         }
         if resp.status.as_u16() == 200 {
             let now = SystemTime::now();
             Ok(RespCacheable::Cacheable(CacheMeta::new(now + ttl, now, 0, 0, resp.clone())))
         } else {
-            Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache))
+            Ok(uncacheable())
         }
     }
 
@@ -533,17 +627,32 @@ impl ProxyHttp for SluiceProxy {
             }
         }
 
-        let path = session.req_header().uri.path().to_owned();
+        // Normalize the path so matching sees what the backend will (defeats
+        // %2e/%2f/`//`/`.`/`..` evasion of WAF, deny, and location routing).
+        let raw_path = session.req_header().uri.path();
+        let Some(path) = normalize_path(raw_path) else {
+            send_status(session, 400, hsts).await?;
+            return Ok(true);
+        };
 
         // WAF (site-wide) → block matching requests.
         for rule in &site.waf {
-            let hay = match &rule.field {
-                WafField::Path => path.as_str(),
-                WafField::Query => session.req_header().uri.query().unwrap_or(""),
-                WafField::Method => session.req_header().method.as_str(),
-                WafField::Header(name) => header_val(session, name).unwrap_or(""),
+            let blocked = match &rule.field {
+                WafField::Path => rule.re.is_match(&path),
+                WafField::Query => {
+                    rule.re.is_match(session.req_header().uri.query().unwrap_or(""))
+                }
+                WafField::Method => rule.re.is_match(session.req_header().method.as_str()),
+                // Every value (duplicate-header smuggling), lossily decoded so a
+                // non-UTF-8 byte can't hide the payload from the regex.
+                WafField::Header(name) => session
+                    .req_header()
+                    .headers
+                    .get_all(name.as_str())
+                    .iter()
+                    .any(|v| rule.re.is_match(&String::from_utf8_lossy(v.as_bytes()))),
             };
-            if rule.re.is_match(hay) {
+            if blocked {
                 send_status(session, rule.status, hsts).await?;
                 return Ok(true);
             }
@@ -705,6 +814,24 @@ impl ProxyHttp for SluiceProxy {
         upstream_request: &mut RequestHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
+        // Strip client-supplied forwarding / URL-override headers so a client
+        // can't poison the origin's absolute-URL generation (→ cached XSS via
+        // X-Forwarded-Host) or smuggle a different path. We set the trusted ones
+        // ourselves below.
+        for h in [
+            "x-forwarded-host",
+            "x-forwarded-server",
+            "x-forwarded-scheme",
+            "x-forwarded-port",
+            "forwarded",
+            "x-original-url",
+            "x-rewrite-url",
+            "x-real-ip",
+            "x-forwarded-for",
+            "x-forwarded-proto",
+        ] {
+            upstream_request.remove_header(h);
+        }
         upstream_request.insert_header("X-Real-IP", &ctx.client_ip)?;
         upstream_request.insert_header("X-Forwarded-For", &ctx.client_ip)?;
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
