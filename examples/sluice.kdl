@@ -44,6 +44,15 @@ defaults {
 site "app.example.com" {
     upstream "127.0.0.1:31000"
     websocket true
+    deny "^/\.git"                      // 403 these paths (nginx `deny`)
+    deny "^/internal/"
+}
+
+site "docs.example.com" {              // static file server, no upstream
+    file-server {
+        root "/var/www/docs"
+        index "index.html"
+    }
 }
 
 site "api.example.com" {

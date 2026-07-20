@@ -124,8 +124,13 @@ pub enum ListenerKind {
 #[derive(Debug)]
 pub struct Site {
     pub host: String,
-    pub upstream_host: String,
-    pub upstream_port: u16,
+    /// Proxy backend. None for a file-server site.
+    pub upstream: Option<(String, u16)>,
+    /// Static file root. None for a proxy site. Exactly one of upstream/file_root is set.
+    pub file_root: Option<String>,
+    pub index: String,
+    /// Paths matching any of these regexes get 403 (nginx `deny`).
+    pub deny: Vec<Regex>,
     pub websocket: bool,
     pub max_body: Option<u64>,
     pub read_timeout: Option<Duration>,
@@ -469,9 +474,38 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
     let host = first_arg(node)
         .ok_or("site needs a host, e.g. site \"app.example.com\"")?
         .to_string();
-    let upstream = child_arg(node, "upstream")
-        .ok_or_else(|| format!("site `{host}`: missing upstream"))?;
-    let (upstream_host, upstream_port) = split_hostport(upstream)?;
+
+    // Backend: exactly one of `upstream` (proxy) or `file-server` (static).
+    let upstream = match child_arg(node, "upstream") {
+        Some(u) => Some(split_hostport(u)?),
+        None => None,
+    };
+    let (file_root, index) = match child(node, "file-server") {
+        Some(fs) => {
+            let root = child_arg(fs, "root")
+                .ok_or_else(|| format!("site `{host}`: file-server missing root"))?
+                .to_string();
+            if !Path::new(&root).is_dir() {
+                return Err(format!("site `{host}`: file-server root not a directory: {root}"));
+            }
+            let index = child_arg(fs, "index").unwrap_or("index.html").to_string();
+            (Some(root), index)
+        }
+        None => (None, "index.html".to_string()),
+    };
+    match (&upstream, &file_root) {
+        (Some(_), Some(_)) => return Err(format!("site `{host}`: set either upstream or file-server, not both")),
+        (None, None) => return Err(format!("site `{host}`: needs an upstream or a file-server")),
+        _ => {}
+    }
+
+    let mut deny = Vec::new();
+    if let Some(children) = node.children() {
+        for d in children.nodes().iter().filter(|n| n.name().value() == "deny") {
+            let pat = first_arg(d).ok_or_else(|| format!("site `{host}`: deny needs a path regex"))?;
+            deny.push(Regex::new(pat).map_err(|e| format!("site `{host}`: deny regex {pat:?}: {e}"))?);
+        }
+    }
 
     let websocket = child_bool(node, "websocket").unwrap_or(false);
     let max_body = match child_arg(node, "max-body") {
@@ -517,8 +551,10 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
 
     Ok(Site {
         host,
-        upstream_host,
-        upstream_port,
+        upstream,
+        file_root,
+        index,
+        deny,
         websocket,
         max_body,
         read_timeout,

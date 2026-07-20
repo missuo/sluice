@@ -16,6 +16,9 @@ See [DESIGN.md](DESIGN.md) for the full design. Milestones M0–M3 are implement
   is rejected and the running config is kept (never takes the proxy down).
 - Host-routed **sites** → upstreams; **regex redirects** with `{uri}`/`{host}`;
   per-site **body limits**, **read timeouts**, **websocket** passthrough, **HSTS**.
+- **Static file server** per site (`file-server { root … }`, index files,
+  content-type by extension, path-traversal protection) — an alternative to `upstream`.
+- **Path `deny`** rules (regex → 403), like nginx `deny`.
 - **TLS** listeners (BoringSSL) + **:80 → https** redirect, all from config.
 - Trusted **client IP** from a configurable header (e.g. `CF-Connecting-IP`),
   dropping the spoofable client XFF chain.

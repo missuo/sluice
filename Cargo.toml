@@ -18,6 +18,7 @@ signal-hook = "0.3"
 maxminddb = "0.28"
 ipnet = "2"
 dashmap = "6"
+bytes = "1"
 
 [features]
 # Dev builds default to openssl; build prod with:

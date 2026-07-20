@@ -86,6 +86,59 @@ async fn send_status(session: &mut Session, status: u16) -> Result<()> {
     Ok(())
 }
 
+/// Serve a static file from `root`. Blocks on file I/O (fine for small assets;
+/// stream large files later). Path traversal is rejected two ways: `..`
+/// components up front, and a canonicalized-under-root check.
+async fn serve_file(session: &mut Session, root: &str, index: &str, req_path: &str) -> Result<()> {
+    let rel = req_path.trim_start_matches('/');
+    if rel.split('/').any(|c| c == "..") {
+        return send_status(session, 403).await;
+    }
+    let mut fpath = std::path::PathBuf::from(root);
+    if !rel.is_empty() {
+        fpath.push(rel);
+    }
+    if req_path.ends_with('/') || rel.is_empty() {
+        fpath.push(index);
+    }
+    match (fpath.canonicalize(), std::path::Path::new(root).canonicalize()) {
+        (Ok(real), Ok(base)) if real.starts_with(&base) => match std::fs::read(&real) {
+            Ok(body) => {
+                let mut resp = ResponseHeader::build(200, Some(3))?;
+                resp.insert_header("Content-Type", content_type(&real))?;
+                resp.insert_header("Content-Length", body.len().to_string())?;
+                session.write_response_header(Box::new(resp), false).await?;
+                session.write_response_body(Some(bytes::Bytes::from(body)), true).await?;
+                Ok(())
+            }
+            Err(_) => send_status(session, 404).await,
+        },
+        (Ok(_), Ok(_)) => send_status(session, 403).await, // resolved outside root
+        _ => send_status(session, 404).await,
+    }
+}
+
+fn content_type(path: &std::path::Path) -> &'static str {
+    match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff2" => "font/woff2",
+        "woff" => "font/woff",
+        "txt" => "text/plain; charset=utf-8",
+        "pdf" => "application/pdf",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
 /// Populate ctx geo fields (country from header; asn/city from MaxMind).
 fn geo_lookup(cfg: &Config, ctx: &mut Ctx, session: &Session) {
     let Some(g) = &cfg.geoip else { return };
@@ -244,6 +297,15 @@ impl ProxyHttp for SluiceProxy {
         }
 
         let path = session.req_header().uri.path().to_owned();
+
+        // deny paths (nginx `deny`) → 403
+        for re in &site.deny {
+            if re.is_match(&path) {
+                send_status(session, 403).await?;
+                return Ok(true);
+            }
+        }
+
         for r in &site.redirects {
             if r.re.is_match(&path) {
                 let uri = req_uri(session);
@@ -251,6 +313,12 @@ impl ProxyHttp for SluiceProxy {
                 redirect(session, r.status, loc).await?;
                 return Ok(true);
             }
+        }
+
+        // static file server (site has no upstream)
+        if let Some(root) = &site.file_root {
+            serve_file(session, root, &site.index, &path).await?;
+            return Ok(true);
         }
 
         if let Some(max) = site.max_body {
@@ -269,10 +337,13 @@ impl ProxyHttp for SluiceProxy {
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         let idx = ctx.site.ok_or_else(|| Error::new_str("no site matched for request"))?;
         let site = &ctx.cfg.sites[idx];
-        ctx.upstream = site.upstream_port;
+        let (uh, up) = site
+            .upstream
+            .as_ref()
+            .ok_or_else(|| Error::new_str("file-server site reached upstream_peer"))?;
+        ctx.upstream = *up;
 
-        let mut peer =
-            HttpPeer::new((site.upstream_host.as_str(), site.upstream_port), false, String::new());
+        let mut peer = HttpPeer::new((uh.as_str(), *up), false, String::new());
         peer.options.connection_timeout = Some(Duration::from_secs(5));
         // Default a read timeout for non-websocket sites (slowloris protection);
         // websockets and explicitly-configured sites keep their own value.
