@@ -102,6 +102,7 @@ async fn serve_file(
     req_path: &str,
     hsts: Option<&str>,
 ) -> Result<()> {
+    let is_head = session.req_header().method.as_str() == "HEAD";
     let rel = req_path.trim_start_matches('/');
     if rel.split('/').any(|c| c == "..") {
         return send_status(session, 403, hsts).await;
@@ -122,8 +123,11 @@ async fn serve_file(
                 if let Some(h) = hsts {
                     resp.insert_header("Strict-Transport-Security", h)?;
                 }
-                session.write_response_header(Box::new(resp), false).await?;
-                session.write_response_body(Some(bytes::Bytes::from(body)), true).await?;
+                // HEAD: send headers (incl. the GET Content-Length) but no body.
+                session.write_response_header(Box::new(resp), is_head).await?;
+                if !is_head {
+                    session.write_response_body(Some(bytes::Bytes::from(body)), true).await?;
+                }
                 Ok(())
             }
             Err(_) => send_status(session, 404, hsts).await,
