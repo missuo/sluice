@@ -19,11 +19,17 @@ maxminddb = "0.28"
 ipnet = "2"
 dashmap = "6"
 bytes = "1"
+instant-acme = "0.7"
+rcgen = "0.13"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [features]
-# Dev builds default to openssl; build prod with:
+# Default is OpenSSL — verified working behind Cloudflare (OpenSSL 3.5.x origin,
+# no 525). BoringSSL is an OPTIONAL alternative (Cloudflare's own stack, static
+# binary) for those who want it, not a requirement:
 #   cargo build --release --no-default-features --features boringssl
-# BoringSSL is Cloudflare's TLS stack — avoids the OpenSSL-3 → CF 525 issue.
+# Note: rustls is NOT usable here — pingora's rustls backend has no TLS cert
+# callback, so dynamic/SNI certs (cert-dir, ACME) don't work with it.
 default = ["openssl"]
 openssl = ["pingora/openssl"]
 boringssl = ["pingora/boringssl"]

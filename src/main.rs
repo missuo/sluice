@@ -3,6 +3,7 @@
 //!   sluice -c /etc/sluice/sluice.kdl        # run
 //!   sluice --check -c sluice.kdl            # validate config and exit
 
+mod acme;
 mod certs;
 mod config;
 mod metrics;
@@ -82,13 +83,31 @@ fn main() {
     // Clone what we need to build listeners, then move Config into the ArcSwap.
     let listeners = config.listeners.clone();
     let metrics_addr = config.server.metrics_addr.clone();
+    let acme_cfg = config.acme.clone();
+    let acme_domains: Vec<String> = config.sites.iter().map(|s| s.host.clone()).collect();
     let cfg = Arc::new(ArcSwap::from_pointee(config));
+
+    // ACME auto-TLS: a shared cert store (served by SNI) + a challenge map
+    // (served on :80). The ACME thread fills both.
+    let mut acme_certs: Option<Arc<ArcSwap<certs::CertStore>>> = None;
+    let mut acme_challenges: Option<acme::ChallengeStore> = None;
+    if let Some(acfg) = acme_cfg {
+        let cs = Arc::new(ArcSwap::from_pointee(certs::CertStore::default()));
+        let chs: acme::ChallengeStore =
+            Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new()));
+        acme::spawn(acfg, acme_domains, cs.clone(), chs.clone());
+        acme_certs = Some(cs);
+        acme_challenges = Some(chs);
+    }
 
     // SIGHUP → hot reload (fail-safe: a bad edit keeps the old config).
     spawn_reload(cfg.clone(), config_path.clone());
 
     let mut proxy = http_proxy_service(&server.configuration, SluiceProxy::new(cfg));
-    let mut redirector = http_proxy_service(&server.configuration, RedirectProxy);
+    let mut redirector = http_proxy_service(
+        &server.configuration,
+        RedirectProxy { challenges: acme_challenges.clone() },
+    );
     let mut n_tls = 0;
     let mut n_redirect = 0;
 
@@ -110,6 +129,18 @@ fn main() {
                 let store = Arc::new(ArcSwap::from_pointee(store));
                 let mut tls = TlsSettings::with_callbacks(Box::new(certs::DynamicCert { store }))
                     .unwrap_or_else(|e| fatal(&format!("dynamic TLS for {}: {e}", l.addr)));
+                if *http2 {
+                    tls.enable_h2();
+                }
+                proxy.add_tls_with_settings(&l.addr, None, tls);
+                n_tls += 1;
+            }
+            ListenerKind::TlsAcme { http2 } => {
+                let store = acme_certs
+                    .clone()
+                    .unwrap_or_else(|| fatal("listener tls acme=true but no `acme {}` block"));
+                let mut tls = TlsSettings::with_callbacks(Box::new(certs::DynamicCert { store }))
+                    .unwrap_or_else(|e| fatal(&format!("acme TLS for {}: {e}", l.addr)));
                 if *http2 {
                     tls.enable_h2();
                 }

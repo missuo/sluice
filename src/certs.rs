@@ -43,7 +43,7 @@ impl Cert {
 }
 
 /// SNI hostname → cert. The first-inserted cert is the fallback for an unknown SNI.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct CertStore {
     map: HashMap<String, Arc<Cert>>,
     fallback: Option<Arc<Cert>>,

@@ -29,10 +29,21 @@ geoip {
 listener "0.0.0.0:443" {
     http2 true
     tls cert="/etc/sluice/fullchain.pem" key="/etc/sluice/privkey.pem"
+    // or dynamic SNI certs:   tls cert-dir="/etc/sluice/certs"
+    // or auto-TLS via ACME:   tls acme=true   (needs the `acme {}` block below)
 }
 listener "0.0.0.0:80" {
-    redirect-to-https true
+    redirect-to-https true              // also answers ACME HTTP-01 challenges
 }
+
+// Automatic Let's Encrypt certs (like Caddy) — only if you don't already have a
+// cert. Each site host must resolve DIRECTLY to this server with :80 reachable
+// (NOT behind a proxying CDN — behind Cloudflare use an Origin CA cert instead).
+// acme {
+//     contact "you@example.com"
+//     staging false                    // true = Let's Encrypt staging (testing)
+//     cache-dir "/var/lib/sluice/acme"
+// }
 
 alias prefix="staging"                 // staging-app.example.com == app.example.com
 

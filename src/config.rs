@@ -71,6 +71,7 @@ pub struct Config {
     pub geoip: Option<GeoipCfg>,
     pub listeners: Vec<Listener>,
     pub alias_prefix: Option<String>,
+    pub acme: Option<AcmeCfg>,
     pub unknown_host: u16,
     pub sites: Vec<Site>,
     /// host -> index into `sites`
@@ -121,7 +122,18 @@ pub enum ListenerKind {
     /// SNI-based certs loaded from a directory (`<host>.crt`/`<host>.key`),
     /// served via Pingora's TLS callback and hot-swappable.
     TlsDynamic { cert_dir: String, http2: bool },
+    /// Certs auto-provisioned via ACME (needs a top-level `acme {}` block).
+    TlsAcme { http2: bool },
     RedirectHttps,
+}
+
+/// Automatic TLS via ACME (Let's Encrypt). Provisions a cert per `site` host
+/// over HTTP-01 — requires each domain to resolve to this server with :80 open.
+#[derive(Debug, Clone)]
+pub struct AcmeCfg {
+    pub contact: String,
+    pub staging: bool,
+    pub cache_dir: String,
 }
 
 /// A proxy backend. `https://host[:port]` → TLS with SNI + Host rewrite;
@@ -291,6 +303,7 @@ const TOP_LEVEL: &[&str] = &[
     "server",
     "client-ip",
     "geoip",
+    "acme",
     "listener",
     "alias",
     "defaults",
@@ -318,6 +331,7 @@ impl Config {
         let mut geoip = None;
         let mut listeners = Vec::new();
         let mut alias_prefix = None;
+        let mut acme: Option<AcmeCfg> = None;
         let mut default_hsts = None;
         let mut unknown_host = 404u16;
         let mut sites: Vec<Site> = Vec::new();
@@ -400,6 +414,23 @@ impl Config {
                 "alias" => {
                     alias_prefix = prop_str(node, "prefix").map(str::to_owned);
                 }
+                "acme" => {
+                    let enabled = child_bool(node, "enabled").unwrap_or(true);
+                    if enabled {
+                        match child_arg(node, "contact") {
+                            Some(c) => {
+                                acme = Some(AcmeCfg {
+                                    contact: c.to_string(),
+                                    staging: child_bool(node, "staging").unwrap_or(false),
+                                    cache_dir: child_arg(node, "cache-dir")
+                                        .unwrap_or("/var/lib/sluice/acme")
+                                        .to_string(),
+                                });
+                            }
+                            None => errs.push("acme: `contact` (an email) is required".to_string()),
+                        }
+                    }
+                }
                 "defaults" => {
                     if let Some(v) = child_arg(node, "hsts") {
                         default_hsts = Some(v.to_string());
@@ -437,6 +468,11 @@ impl Config {
         if listeners.is_empty() {
             errs.push("no `listener` defined".to_string());
         }
+        if acme.is_none()
+            && listeners.iter().any(|l| matches!(l.kind, ListenerKind::TlsAcme { .. }))
+        {
+            errs.push("a listener uses `tls acme=true` but there is no `acme {}` block".to_string());
+        }
         if sites.is_empty() {
             errs.push("no `site` defined".to_string());
         }
@@ -453,6 +489,7 @@ impl Config {
                 geoip,
                 listeners,
                 alias_prefix,
+                acme,
                 unknown_host,
                 sites,
                 index,
@@ -493,6 +530,10 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
         .ok_or_else(|| format!("listener {addr:?}: needs a `tls` block or `redirect-to-https true`"))?;
     let http2 = child_bool(node, "http2").unwrap_or(false);
 
+    // ACME-managed certs (needs a top-level `acme {}` block).
+    if prop_bool(tls, "acme").unwrap_or(false) {
+        return Ok(Listener { addr, kind: ListenerKind::TlsAcme { http2 } });
+    }
     // Dynamic SNI certs from a directory, or a single cert/key pair.
     if let Some(dir) = prop_str(tls, "cert-dir") {
         if !Path::new(dir).is_dir() {

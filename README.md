@@ -20,9 +20,11 @@ See [DESIGN.md](DESIGN.md) for the full design. Milestones M0–M3 are implement
   content-type by extension, path-traversal protection) — an alternative to `upstream`.
 - **Path `deny`** rules (regex → 403), like nginx `deny`.
 - **TLS** listeners (BoringSSL) + **:80 → https** redirect, all from config.
-  A single `cert`/`key`, or **dynamic SNI certs** (`tls cert-dir="…"` with
-  `<host>.crt`/`<host>.key`) served via a runtime callback (multi-domain +
-  hot-rotatable, the foundation for auto-TLS).
+  A single `cert`/`key`, **dynamic SNI certs** (`tls cert-dir="…"`), or
+  **auto-TLS via ACME/Let's Encrypt** (`tls acme=true` + an `acme {}` block,
+  HTTP-01, like Caddy — for domains that resolve directly to the server with :80
+  open; behind Cloudflare use an Origin CA cert instead). Certs hot-swap at
+  runtime via the TLS callback — no restart.
 - **HTTPS upstreams** (`upstream "https://api.openai.com"`): TLS + SNI + cert
   verification, and Host rewritten to the upstream host — reverse-proxy external
   APIs (OpenAI/S3). SSE streaming and WebSocket upgrades pass through unbuffered.

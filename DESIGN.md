@@ -307,8 +307,13 @@ once you're shipping logs anywhere.
   HTTP/2 memory-exhaustion security fix + Rust 1.84 support) — there is no 0.9+.
   Depend on `pingora = "0.8"`. If we need an unreleased fix, pin to the git `main`
   branch instead of a published tag, but prefer released versions for prod.
-- Single binary, built `--features boringssl` (Cloudflare's TLS stack; avoids the
-  OpenSSL-3 → CF 525 issue we hit with nginx).
+- **TLS backend:** default **OpenSSL** — empirically verified working behind
+  Cloudflare (OpenSSL 3.5.x origin on Debian 13, 5/5 requests 200, no 525).
+  BoringSSL is an optional alternative (Cloudflare's own stack, statically linked)
+  built with `--features boringssl` — not required. (The OpenSSL-3 → CF 525
+  incident recorded in owo-router's infra docs was **nginx-specific** and its fix
+  was OpenSSL 1.1.1w, not BoringSSL; it does not reproduce with Pingora/Sluice.)
+  rustls is unusable — pingora's rustls backend lacks the cert callback.
 - systemd unit: non-root + `CAP_NET_BIND_SERVICE`, `KillSignal=SIGTERM`
   graceful drain, `RuntimeDirectory` for the upgrade socket.
 - Config at `/etc/sluice/sluice.kdl`; certs + mmdb alongside.
@@ -358,13 +363,15 @@ benefit. Tracked as M5.
   verify), Host rewritten to the upstream host; `upstream-host`/`upstream-verify`
   overrides. Verified against a real public HTTPS API. SSE + WebSocket pass through
   unbuffered (tested).
-- **M5 — auto-TLS:** dynamic SNI cert store + Pingora TLS callback **DONE** (certs
-  from a `cert-dir`, hot-swappable; multi-domain; the foundation). The ACME client
-  itself (instant-acme + challenge + renewal) is **not built**. **Note:** behind
-  Cloudflare, ACME is the wrong tool — HTTP-01 can't validate cleanly through the
-  orange cloud, and the origin should use a Cloudflare Origin CA cert (15yr, no
-  renewal) or DNS-01. Build the ACME client only for **direct-public** deployments;
-  HTTP-01 then needs port 80 reachable at the domain.
+- **M5 — auto-TLS — DONE:** dynamic SNI cert store + Pingora TLS callback (certs
+  from a `cert-dir`, hot-swappable, multi-domain) AND the ACME client
+  (`instant-acme` + HTTP-01, `tls acme=true` + `acme {}`): a background thread
+  provisions/renews a cert per site host, the `:80` listener answers the HTTP-01
+  challenge, certs land in the hot-swappable store. Compiles + config validates;
+  **live Let's Encrypt issuance needs a domain resolving directly to the server
+  with :80 open** (a DNS-only name). **Note:** behind a proxying CDN (orange-cloud
+  Cloudflare) HTTP-01 won't validate — use a Cloudflare Origin CA cert (15yr) or
+  DNS-01 there. ACME is for direct-public deployments.
 - **M4 (later):** true zero-downtime binary upgrade (SIGQUIT fd-handoff), config
   file-watch, upstream pools/load-balancing + health checks, Grafana board.
 

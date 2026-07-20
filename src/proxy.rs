@@ -482,7 +482,10 @@ impl ProxyHttp for SluiceProxy {
 
 // ---- redirect-only proxy (:80 → https) ----
 
-pub struct RedirectProxy;
+pub struct RedirectProxy {
+    /// When ACME is enabled, HTTP-01 challenge tokens are answered here on :80.
+    pub challenges: Option<crate::acme::ChallengeStore>,
+}
 
 #[async_trait]
 impl ProxyHttp for RedirectProxy {
@@ -490,6 +493,21 @@ impl ProxyHttp for RedirectProxy {
     fn new_ctx(&self) -> Self::CTX {}
 
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
+        let path = session.req_header().uri.path().to_owned();
+        if let Some(ch) = &self.challenges {
+            if let Some(token) = path.strip_prefix("/.well-known/acme-challenge/") {
+                if let Some(keyauth) = ch.load().get(token).cloned() {
+                    let mut resp = ResponseHeader::build(200, Some(2))?;
+                    resp.insert_header("Content-Type", "text/plain")?;
+                    resp.insert_header("Content-Length", keyauth.len().to_string())?;
+                    session.write_response_header(Box::new(resp), false).await?;
+                    session
+                        .write_response_body(Some(bytes::Bytes::from(keyauth)), true)
+                        .await?;
+                    return Ok(true);
+                }
+            }
+        }
         let host = host_of(session).unwrap_or_default();
         let uri = req_uri(session);
         redirect(session, 301, format!("https://{host}{uri}"), None).await?;
