@@ -41,6 +41,16 @@ cargo build                                              # dev (openssl)
 cargo build --release --no-default-features --features boringssl   # prod
 ```
 
+The BoringSSL build (`boring-sys`) needs a few tools beyond a C toolchain — on a
+fresh Debian:
+
+```bash
+apt-get install -y build-essential cmake clang libclang-dev pkg-config \
+                   git golang-go nasm ninja-build
+```
+
+(`git` is used to apply BoringSSL patches; `go`/`nasm`/`ninja` build it.)
+
 ## Run
 
 ```bash
