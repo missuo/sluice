@@ -15,7 +15,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use instant_acme::{
     Account, AuthorizationStatus, ChallengeType, Identifier, LetsEncrypt, NewAccount, NewOrder,
-    OrderStatus,
+    OrderStatus, RetryPolicy,
 };
 
 use crate::certs::{Cert, CertStore};
@@ -108,87 +108,70 @@ async fn provision(
         LetsEncrypt::Production.url()
     };
     let contact = format!("mailto:{}", cfg.contact);
-    let (account, _creds) = Account::create(
-        &NewAccount {
-            contact: &[&contact],
-            terms_of_service_agreed: true,
-            only_return_existing: false,
-        },
-        dir,
-        None,
-    )
-    .await
-    .map_err(|e| format!("account: {e}"))?;
+    let (account, _creds) = Account::builder()
+        .map_err(|e| format!("account builder: {e}"))?
+        .create(
+            &NewAccount {
+                contact: &[&contact],
+                terms_of_service_agreed: true,
+                only_return_existing: false,
+            },
+            dir.to_owned(),
+            None,
+        )
+        .await
+        .map_err(|e| format!("account: {e}"))?;
 
     let ids = [Identifier::Dns(domain.to_string())];
     let mut order = account
-        .new_order(&NewOrder { identifiers: &ids })
+        .new_order(&NewOrder::new(&ids))
         .await
         .map_err(|e| format!("new order: {e}"))?;
 
-    let auths = order.authorizations().await.map_err(|e| format!("authz: {e}"))?;
-    for auth in &auths {
-        if auth.status != AuthorizationStatus::Pending {
-            continue;
-        }
-        let challenge = auth
-            .challenges
-            .iter()
-            .find(|c| c.r#type == ChallengeType::Http01)
-            .ok_or("no HTTP-01 challenge offered")?;
-        let keyauth = order.key_authorization(challenge);
-        let mut map = (**challenges.load()).clone();
-        map.insert(challenge.token.clone(), keyauth.as_str().to_string());
-        challenges.store(Arc::new(map));
-        order
-            .set_challenge_ready(&challenge.url)
-            .await
-            .map_err(|e| format!("challenge ready: {e}"))?;
-    }
-
-    // Poll until the order is ready (validated) or invalid.
-    let mut tries = 0;
-    loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let state = order.refresh().await.map_err(|e| format!("refresh: {e}"))?;
-        match state.status {
-            OrderStatus::Ready => break,
-            OrderStatus::Invalid => {
-                return Err("order invalid — HTTP-01 validation failed (is the domain \
-                            resolving to this server with :80 open, not behind a proxy?)"
-                    .to_string())
+    // Publish the HTTP-01 response for each pending authorization, then tell the
+    // server it's ready. `authorizations()` borrows the order, so scope it so the
+    // borrow is released before we poll the order below.
+    {
+        let mut authzs = order.authorizations();
+        while let Some(res) = authzs.next().await {
+            let mut authz = res.map_err(|e| format!("authz: {e}"))?;
+            match authz.status {
+                AuthorizationStatus::Pending => {}
+                _ => continue,
             }
-            _ => {}
-        }
-        tries += 1;
-        if tries > 45 {
-            return Err("order not ready after 90s".to_string());
+            let mut challenge = authz
+                .challenge(ChallengeType::Http01)
+                .ok_or("no HTTP-01 challenge offered")?;
+            let token = challenge.token.clone();
+            let keyauth = challenge.key_authorization().as_str().to_string();
+            let mut map = (**challenges.load()).clone();
+            map.insert(token, keyauth);
+            challenges.store(Arc::new(map));
+            challenge
+                .set_ready()
+                .await
+                .map_err(|e| format!("challenge ready: {e}"))?;
         }
     }
 
-    // Generate the cert keypair + CSR, finalize, fetch the chain.
-    let key_pair = rcgen::KeyPair::generate().map_err(|e| format!("keygen: {e}"))?;
-    let params =
-        rcgen::CertificateParams::new(vec![domain.to_string()]).map_err(|e| format!("csr params: {e}"))?;
-    let csr = params
-        .serialize_request(&key_pair)
-        .map_err(|e| format!("csr: {e}"))?;
-    order
-        .finalize(csr.der())
+    // Back off until the order is validated (Ready) or fails.
+    let status = order
+        .poll_ready(&RetryPolicy::default())
         .await
-        .map_err(|e| format!("finalize: {e}"))?;
+        .map_err(|e| format!("poll ready: {e}"))?;
+    if status != OrderStatus::Ready {
+        return Err(format!(
+            "order {status:?} — HTTP-01 validation failed (is the domain resolving \
+             to this server with :80 open, not behind a proxy?)"
+        ));
+    }
 
-    let mut tries = 0;
-    let cert_pem = loop {
-        if let Some(pem) = order.certificate().await.map_err(|e| format!("certificate: {e}"))? {
-            break pem;
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        tries += 1;
-        if tries > 30 {
-            return Err("certificate not issued after 60s".to_string());
-        }
-    };
+    // finalize() generates the cert key pair internally and returns its PEM.
+    let key_pem = order.finalize().await.map_err(|e| format!("finalize: {e}"))?;
+    let cert_pem = order
+        .poll_certificate(&RetryPolicy::default())
+        .await
+        .map_err(|e| format!("certificate: {e}"))?;
 
-    Ok((cert_pem, key_pair.serialize_pem()))
+    Ok((cert_pem, key_pem))
 }

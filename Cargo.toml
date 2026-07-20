@@ -19,8 +19,7 @@ maxminddb = "0.28"
 ipnet = "2"
 dashmap = "6"
 bytes = "1"
-instant-acme = "0.7"
-rcgen = "0.13"
+instant-acme = "0.8"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
 
 [features]
