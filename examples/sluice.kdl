@@ -11,7 +11,10 @@ server {
 }
 
 client-ip {
-    trusted-header "cf-connecting-ip"  // trust CF, drop client XFF
+    trusted-header "cf-connecting-ip"  // honored only from a trusted proxy peer
+    // trusted-proxies default to Cloudflare's ranges; a direct client cannot
+    // spoof its IP. Override for a different front (e.g. an internal LB):
+    // trusted-proxies "10.0.0.0/8" "192.168.0.0/16"
 }
 
 geoip {

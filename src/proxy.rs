@@ -2,7 +2,7 @@
 //! `Config` (via `ArcSwap`), so a hot reload never changes behaviour mid-request.
 
 use std::net::IpAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -14,21 +14,8 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 
-use crate::config::{Config, RateLimit};
+use crate::config::{Config, RateLimit, CF_RANGES};
 use crate::metrics::*;
-
-// Cloudflare origin IP ranges (https://www.cloudflare.com/ips). Used by
-// `access cloudflare-only`. Refreshed with the crate on a real update.
-const CF_CIDRS: &[&str] = &[
-    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
-    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22", "2400:cb00::/32",
-    "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
-    "2a06:98c0::/29", "2c0f:f248::/32",
-];
-static CF_RANGES: LazyLock<Vec<IpNet>> =
-    LazyLock::new(|| CF_CIDRS.iter().filter_map(|s| s.parse().ok()).collect());
 
 fn in_cloudflare(ip: IpAddr) -> bool {
     CF_RANGES.iter().any(|net| net.contains(&ip))
@@ -54,21 +41,25 @@ fn peer_ip(session: &Session) -> Option<IpAddr> {
     session.client_addr().and_then(|a| a.as_inet()).map(|i| i.ip())
 }
 
-/// Trusted client IP: the configured header (e.g. CF-Connecting-IP), else
-/// XFF-left, else the TCP peer.
-fn real_client_ip(session: &Session, trusted_header: &str) -> String {
-    header_val(session, trusted_header)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            header_val(session, "x-forwarded-for")
-                .and_then(|v| v.split(',').next())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_owned)
-                .unwrap_or_else(|| peer_ip(session).map(|i| i.to_string()).unwrap_or_default())
-        })
+/// Trusted client IP. The configured header (e.g. CF-Connecting-IP) is honored
+/// ONLY when the TCP peer is a trusted proxy (default: Cloudflare ranges);
+/// otherwise the peer IP is used, so a direct client cannot spoof its address.
+fn real_client_ip(session: &Session, trusted_header: &str, trusted_proxies: &[IpNet]) -> String {
+    let peer = peer_ip(session);
+    let peer_trusted = peer.is_some_and(|p| trusted_proxies.iter().any(|n| n.contains(&p)));
+    if peer_trusted {
+        if let Some(v) = header_val(session, trusted_header).map(str::trim).filter(|s| !s.is_empty()) {
+            return v.to_string();
+        }
+        if let Some(v) = header_val(session, "x-forwarded-for")
+            .and_then(|v| v.split(',').next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return v.to_string();
+        }
+    }
+    peer.map(|p| p.to_string()).unwrap_or_default()
 }
 
 fn req_uri(session: &Session) -> String {
@@ -99,7 +90,12 @@ async fn send_status(session: &mut Session, status: u16) -> Result<()> {
 fn geo_lookup(cfg: &Config, ctx: &mut Ctx, session: &Session) {
     let Some(g) = &cfg.geoip else { return };
     if let Some(h) = &g.country_header {
-        ctx.country = header_val(session, h).unwrap_or("").to_ascii_uppercase();
+        // Only accept a 2-letter code — the header is client-supplied, and it
+        // becomes a metric label, so reject anything that could inflate cardinality.
+        let c = header_val(session, h).unwrap_or("").to_ascii_uppercase();
+        if c.len() == 2 && c.bytes().all(|b| b.is_ascii_uppercase()) {
+            ctx.country = c;
+        }
     }
     let Ok(ip) = ctx.client_ip.parse::<IpAddr>() else { return };
     if let Some(r) = &g.asn_reader {
@@ -146,7 +142,15 @@ pub struct SluiceProxy {
 
 impl SluiceProxy {
     pub fn new(cfg: Arc<ArcSwap<Config>>) -> Self {
-        SluiceProxy { cfg, limiter: Arc::new(DashMap::new()) }
+        let limiter: Arc<DashMap<(String, IpAddr), Bucket>> = Arc::new(DashMap::new());
+        // Sweep idle buckets so the map can't grow without bound (one entry per
+        // distinct client IP otherwise lives forever).
+        let sweep = limiter.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(60));
+            sweep.retain(|_, b: &mut Bucket| b.last.elapsed() < Duration::from_secs(600));
+        });
+        SluiceProxy { cfg, limiter }
     }
 
     /// Token bucket per (host, client-ip). Returns true if allowed.
@@ -203,13 +207,13 @@ impl ProxyHttp for SluiceProxy {
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
         INFLIGHT.inc();
         let cfg = ctx.cfg.clone();
-        ctx.client_ip = real_client_ip(session, &cfg.client_ip_header);
+        ctx.client_ip = real_client_ip(session, &cfg.client_ip_header, &cfg.trusted_proxies);
 
         let Some(raw_host) = host_of(session) else {
             send_status(session, 400).await?;
             return Ok(true);
         };
-        let (host, _is_test) = cfg.canonical(&raw_host);
+        let host = cfg.canonical(&raw_host);
         ctx.host = host.clone();
         geo_lookup(&cfg, ctx, session);
 
@@ -270,7 +274,13 @@ impl ProxyHttp for SluiceProxy {
         let mut peer =
             HttpPeer::new((site.upstream_host.as_str(), site.upstream_port), false, String::new());
         peer.options.connection_timeout = Some(Duration::from_secs(5));
-        peer.options.read_timeout = if site.websocket { None } else { site.read_timeout };
+        // Default a read timeout for non-websocket sites (slowloris protection);
+        // websockets and explicitly-configured sites keep their own value.
+        peer.options.read_timeout = if site.websocket {
+            None
+        } else {
+            site.read_timeout.or(Some(Duration::from_secs(60)))
+        };
         peer.options.write_timeout = Some(Duration::from_secs(300));
         peer.options.idle_timeout = Some(Duration::from_secs(60));
         Ok(Box::new(peer))
@@ -305,7 +315,9 @@ impl ProxyHttp for SluiceProxy {
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Ctx) {
         INFLIGHT.dec();
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
-        let host = if ctx.host.is_empty() { "-" } else { ctx.host.as_str() };
+        // Only a matched site becomes a metric label; an unmatched (attacker-
+        // controlled) Host is collapsed to "-" so it can't inflate cardinality.
+        let host = if ctx.site.is_some() { ctx.host.as_str() } else { "-" };
         let elapsed = ctx.start.elapsed();
 
         REQUESTS.with_label_values(&[host, &format!("{}xx", status / 100)]).inc();

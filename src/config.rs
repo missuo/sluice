@@ -7,10 +7,27 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
+use ipnet::IpNet;
 use kdl::{KdlDocument, KdlError, KdlNode};
 use regex::Regex;
+
+/// Cloudflare origin IP ranges (https://www.cloudflare.com/ips). Default set of
+/// trusted proxies (for honoring the client-IP header) and the allow-list for
+/// `access cloudflare-only`.
+pub static CF_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
+    const CIDRS: &[&str] = &[
+        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+        "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+        "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+        "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22", "2400:cb00::/32",
+        "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
+        "2a06:98c0::/29", "2c0f:f248::/32",
+    ];
+    CIDRS.iter().filter_map(|s| s.parse().ok()).collect()
+});
 
 /// Render KDL syntax errors as `line:col: message` (kdl's own Display is terse).
 fn fmt_kdl_error(e: KdlError) -> String {
@@ -48,6 +65,9 @@ fn line_col(src: &str, offset: usize) -> (usize, usize) {
 pub struct Config {
     pub server: ServerCfg,
     pub client_ip_header: String,
+    /// Only honor `client_ip_header` when the TCP peer is in this set (defaults
+    /// to Cloudflare ranges). Prevents a direct client from spoofing their IP.
+    pub trusted_proxies: Vec<IpNet>,
     pub geoip: Option<GeoipCfg>,
     pub listeners: Vec<Listener>,
     pub alias_prefix: Option<String>,
@@ -197,10 +217,8 @@ fn parse_size(s: &str) -> Result<u64, String> {
     } else {
         (s, 1)
     };
-    num.trim()
-        .parse::<u64>()
-        .map(|v| v * mult)
-        .map_err(|_| format!("invalid size {s:?}"))
+    let v: u64 = num.trim().parse().map_err(|_| format!("invalid size {s:?}"))?;
+    v.checked_mul(mult).ok_or_else(|| format!("size {s:?} overflows u64"))
 }
 
 fn open_mmdb(path: &str, label: &str, errs: &mut Vec<String>) -> Option<maxminddb::Reader<Vec<u8>>> {
@@ -254,6 +272,7 @@ impl Config {
         let mut errs: Vec<String> = Vec::new();
         let mut server = ServerCfg::default();
         let mut client_ip_header = "cf-connecting-ip".to_string();
+        let mut trusted_proxies: Vec<IpNet> = Vec::new();
         let mut geoip = None;
         let mut listeners = Vec::new();
         let mut alias_prefix = None;
@@ -291,6 +310,14 @@ impl Config {
                 "client-ip" => {
                     if let Some(v) = child_arg(node, "trusted-header") {
                         client_ip_header = v.to_ascii_lowercase();
+                    }
+                    if let Some(tp) = child(node, "trusted-proxies") {
+                        for a in all_args(tp) {
+                            match a.parse::<IpNet>() {
+                                Ok(net) => trusted_proxies.push(net),
+                                Err(_) => errs.push(format!("client-ip trusted-proxies: bad CIDR {a:?}")),
+                            }
+                        }
                     }
                 }
                 "geoip" => {
@@ -336,7 +363,10 @@ impl Config {
                         default_hsts = Some(v.to_string());
                     }
                     if let Some(v) = child_int(node, "unknown-host") {
-                        unknown_host = v as u16;
+                        match u16::try_from(v) {
+                            Ok(c) if (100..=599).contains(&c) => unknown_host = c,
+                            _ => errs.push(format!("defaults unknown-host: {v} is not a valid HTTP status")),
+                        }
                     }
                 }
                 "site" => match parse_site(node) {
@@ -369,10 +399,15 @@ impl Config {
             errs.push("no `site` defined".to_string());
         }
 
+        if trusted_proxies.is_empty() {
+            trusted_proxies = CF_RANGES.clone();
+        }
+
         if errs.is_empty() {
             Ok(Config {
                 server,
                 client_ip_header,
+                trusted_proxies,
                 geoip,
                 listeners,
                 alias_prefix,
@@ -385,23 +420,19 @@ impl Config {
         }
     }
 
-    /// Resolve a request Host to a canonical site host, reporting if it arrived
-    /// on the migration test alias (so apex redirects can stay on the alias).
-    pub fn canonical<'a>(&self, host: &'a str) -> (String, bool) {
+    /// Resolve a request Host to a canonical site host. The migration alias
+    /// `<prefix>-<sub>` maps to `<sub>` ONLY when `<sub>` is a configured site —
+    /// otherwise the host is returned unchanged, so a genuinely separate
+    /// `staging-foo` host is never silently hijacked.
+    pub fn canonical(&self, host: &str) -> String {
         if let Some(prefix) = &self.alias_prefix {
-            if host == format!("{prefix}.{}", self.apex_suffix()) {
-                // bare alias apex -> apex (best-effort; requires a site named apex)
-            }
             if let Some(rest) = host.strip_prefix(&format!("{prefix}-")) {
-                return (rest.to_string(), true);
+                if self.index.contains_key(rest) {
+                    return rest.to_string();
+                }
             }
         }
-        (host.to_string(), false)
-    }
-
-    fn apex_suffix(&self) -> &str {
-        // not strictly needed for MVP; alias is `<prefix>-<sub>` form.
-        ""
+        host.to_string()
     }
 }
 
@@ -475,10 +506,11 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
             let target = prop_str(r, "target")
                 .ok_or_else(|| format!("site `{host}`: redirect missing target"))?
                 .to_string();
-            let status = prop_int(r, "status").unwrap_or(301) as u16;
-            if !(300..=399).contains(&status) {
-                return Err(format!("site `{host}`: redirect status {status} not in 300..=399"));
-            }
+            let raw_status = prop_int(r, "status").unwrap_or(301);
+            let status = u16::try_from(raw_status)
+                .ok()
+                .filter(|s| (300..=399).contains(s))
+                .ok_or_else(|| format!("site `{host}`: redirect status {raw_status} not in 300..=399"))?;
             redirects.push(Redirect { re, target, status });
         }
     }
