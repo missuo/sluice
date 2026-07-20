@@ -2,14 +2,19 @@
 //! `Config` (via `ArcSwap`), so a hot reload never changes behaviour mid-request.
 
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use ipnet::IpNet;
 use maxminddb::geoip2;
+use pingora_cache::cache_control::CacheControl;
+use pingora_cache::eviction::simple_lru::Manager as LruEviction;
+use pingora_cache::filters as cache_filters;
+use pingora_cache::lock::CacheLock;
+use pingora_cache::{CacheKey, CacheMeta, CacheMetaDefaults, MemCache, NoCacheReason, RespCacheable};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
@@ -243,6 +248,16 @@ struct Bucket {
 
 // ---- main proxy (TLS listeners) ----
 
+// ---- shared response cache (in-memory, LRU, with thundering-herd lock) ----
+static CACHE_STORAGE: LazyLock<MemCache> = LazyLock::new(MemCache::new);
+static CACHE_EVICTION: LazyLock<LruEviction> =
+    LazyLock::new(|| LruEviction::new(256 * 1024 * 1024)); // 256 MiB
+static CACHE_LOCK: LazyLock<CacheLock> = LazyLock::new(|| CacheLock::new(Duration::from_secs(2)));
+/// Origin-only freshness: we never invent a TTL here (returns None); the
+/// per-location TTL is applied explicitly in `response_cache_filter`, while the
+/// origin's own `Cache-Control` is still honored via `resp_cacheable`.
+static CACHE_DEFAULTS: CacheMetaDefaults = CacheMetaDefaults::new(|_| None, 0, 0);
+
 /// splitmix64 — a cheap, lock-free PRNG step for `balance "random"`.
 fn fast_rand() -> u64 {
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -336,6 +351,8 @@ pub struct Ctx {
     /// Per-location body cap enforced while streaming (see `request_body_filter`).
     body_limit: Option<u64>,
     body_seen: u64,
+    /// Fallback cache TTL for this request (Some = caching enabled for it).
+    cache_ttl: Option<Duration>,
 }
 
 #[async_trait]
@@ -359,6 +376,74 @@ impl ProxyHttp for SluiceProxy {
             city: String::new(),
             body_limit: None,
             body_seen: 0,
+            cache_ttl: None,
+        }
+    }
+
+    /// Enable the response cache for this request when its location configures it
+    /// and the method is cacheable (GET/HEAD).
+    fn request_cache_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<()> {
+        let cfg = ctx.cfg.clone();
+        if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
+            if let Some(cc) = &cfg.sites[si].locations[li].cache {
+                if cache_filters::request_cacheable(session.req_header()) {
+                    ctx.cache_ttl = Some(cc.ttl);
+                    session.cache.enable(
+                        &*CACHE_STORAGE,
+                        Some(&*CACHE_EVICTION),
+                        None,
+                        Some(&*CACHE_LOCK),
+                        None,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Cache key: host + method + full request URI.
+    fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<CacheKey> {
+        let req = session.req_header();
+        let uri = req.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        Ok(CacheKey::new(
+            ctx.host.clone(),
+            format!("{}:{}", req.method.as_str(), uri),
+            "",
+        ))
+    }
+
+    /// Decide cacheability: honor the origin's `Cache-Control` first, then fall
+    /// back to the location's TTL for a plain 200 the origin didn't mark.
+    fn response_cache_filter(
+        &self,
+        _session: &Session,
+        resp: &ResponseHeader,
+        ctx: &mut Ctx,
+    ) -> Result<RespCacheable> {
+        let Some(ttl) = ctx.cache_ttl else {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom("cache off")));
+        };
+        // Never cache a per-user (cookie-setting) response.
+        if resp.headers.contains_key("set-cookie") {
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+        }
+        let cc = CacheControl::from_resp_headers(resp);
+        // Honor explicit origin freshness (max-age/Expires) and no-store first.
+        let via_headers = cache_filters::resp_cacheable(cc.as_ref(), resp.clone(), false, &CACHE_DEFAULTS);
+        if via_headers.is_cacheable() {
+            return Ok(via_headers);
+        }
+        // Origin gave no freshness — apply our TTL unless it forbade caching.
+        if let Some(cc) = &cc {
+            if cc.no_store() || cc.no_cache() || cc.private() {
+                return Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache));
+            }
+        }
+        if resp.status.as_u16() == 200 {
+            let now = SystemTime::now();
+            Ok(RespCacheable::Cacheable(CacheMeta::new(now + ttl, now, 0, 0, resp.clone())))
+        } else {
+            Ok(RespCacheable::Uncacheable(NoCacheReason::OriginNotCache))
         }
     }
 

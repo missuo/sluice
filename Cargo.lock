@@ -2797,6 +2797,7 @@ dependencies = [
  "log",
  "maxminddb",
  "pingora",
+ "pingora-cache",
  "prometheus",
  "regex",
  "serde_json",
