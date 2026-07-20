@@ -71,17 +71,23 @@ fn req_uri(session: &Session) -> String {
         .unwrap_or_else(|| "/".to_string())
 }
 
-async fn redirect(session: &mut Session, status: u16, location: String) -> Result<()> {
-    let mut resp = ResponseHeader::build(status, Some(2))?;
+async fn redirect(session: &mut Session, status: u16, location: String, hsts: Option<&str>) -> Result<()> {
+    let mut resp = ResponseHeader::build(status, Some(3))?;
     resp.insert_header("Location", location)?;
     resp.insert_header("Content-Length", "0")?;
+    if let Some(h) = hsts {
+        resp.insert_header("Strict-Transport-Security", h)?;
+    }
     session.write_response_header(Box::new(resp), true).await?;
     Ok(())
 }
 
-async fn send_status(session: &mut Session, status: u16) -> Result<()> {
-    let mut resp = ResponseHeader::build(status, Some(1))?;
+async fn send_status(session: &mut Session, status: u16, hsts: Option<&str>) -> Result<()> {
+    let mut resp = ResponseHeader::build(status, Some(2))?;
     resp.insert_header("Content-Length", "0")?;
+    if let Some(h) = hsts {
+        resp.insert_header("Strict-Transport-Security", h)?;
+    }
     session.write_response_header(Box::new(resp), true).await?;
     Ok(())
 }
@@ -89,10 +95,16 @@ async fn send_status(session: &mut Session, status: u16) -> Result<()> {
 /// Serve a static file from `root`. Blocks on file I/O (fine for small assets;
 /// stream large files later). Path traversal is rejected two ways: `..`
 /// components up front, and a canonicalized-under-root check.
-async fn serve_file(session: &mut Session, root: &str, index: &str, req_path: &str) -> Result<()> {
+async fn serve_file(
+    session: &mut Session,
+    root: &str,
+    index: &str,
+    req_path: &str,
+    hsts: Option<&str>,
+) -> Result<()> {
     let rel = req_path.trim_start_matches('/');
     if rel.split('/').any(|c| c == "..") {
-        return send_status(session, 403).await;
+        return send_status(session, 403, hsts).await;
     }
     let mut fpath = std::path::PathBuf::from(root);
     if !rel.is_empty() {
@@ -104,17 +116,20 @@ async fn serve_file(session: &mut Session, root: &str, index: &str, req_path: &s
     match (fpath.canonicalize(), std::path::Path::new(root).canonicalize()) {
         (Ok(real), Ok(base)) if real.starts_with(&base) => match std::fs::read(&real) {
             Ok(body) => {
-                let mut resp = ResponseHeader::build(200, Some(3))?;
+                let mut resp = ResponseHeader::build(200, Some(4))?;
                 resp.insert_header("Content-Type", content_type(&real))?;
                 resp.insert_header("Content-Length", body.len().to_string())?;
+                if let Some(h) = hsts {
+                    resp.insert_header("Strict-Transport-Security", h)?;
+                }
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(Some(bytes::Bytes::from(body)), true).await?;
                 Ok(())
             }
-            Err(_) => send_status(session, 404).await,
+            Err(_) => send_status(session, 404, hsts).await,
         },
-        (Ok(_), Ok(_)) => send_status(session, 403).await, // resolved outside root
-        _ => send_status(session, 404).await,
+        (Ok(_), Ok(_)) => send_status(session, 403, hsts).await, // resolved outside root
+        _ => send_status(session, 404, hsts).await,
     }
 }
 
@@ -263,7 +278,7 @@ impl ProxyHttp for SluiceProxy {
         ctx.client_ip = real_client_ip(session, &cfg.client_ip_header, &cfg.trusted_proxies);
 
         let Some(raw_host) = host_of(session) else {
-            send_status(session, 400).await?;
+            send_status(session, 400, None).await?;
             return Ok(true);
         };
         let host = cfg.canonical(&raw_host);
@@ -271,17 +286,18 @@ impl ProxyHttp for SluiceProxy {
         geo_lookup(&cfg, ctx, session);
 
         let Some(&idx) = cfg.index.get(&host) else {
-            send_status(session, cfg.unknown_host).await?;
+            send_status(session, cfg.unknown_host, None).await?;
             return Ok(true);
         };
         ctx.site = Some(idx);
         let site = &cfg.sites[idx];
+        let hsts = site.hsts.as_deref(); // added to every short-circuit response too
 
         // access: cloudflare-only (peer must be a CF edge IP)
         if site.cloudflare_only {
             let ok = peer_ip(session).map(in_cloudflare).unwrap_or(false);
             if !ok {
-                send_status(session, 403).await?;
+                send_status(session, 403, hsts).await?;
                 return Ok(true);
             }
         }
@@ -290,7 +306,7 @@ impl ProxyHttp for SluiceProxy {
         if let Some(rl) = site.rate_limit {
             if let Ok(ip) = ctx.client_ip.parse::<IpAddr>() {
                 if !self.allow(&host, ip, rl) {
-                    send_status(session, 429).await?;
+                    send_status(session, 429, hsts).await?;
                     return Ok(true);
                 }
             }
@@ -301,7 +317,7 @@ impl ProxyHttp for SluiceProxy {
         // deny paths (nginx `deny`) → 403
         for re in &site.deny {
             if re.is_match(&path) {
-                send_status(session, 403).await?;
+                send_status(session, 403, hsts).await?;
                 return Ok(true);
             }
         }
@@ -310,14 +326,14 @@ impl ProxyHttp for SluiceProxy {
             if r.re.is_match(&path) {
                 let uri = req_uri(session);
                 let loc = r.target.replace("{uri}", &uri).replace("{host}", &host);
-                redirect(session, r.status, loc).await?;
+                redirect(session, r.status, loc, hsts).await?;
                 return Ok(true);
             }
         }
 
         // static file server (site has no upstream)
         if let Some(root) = &site.file_root {
-            serve_file(session, root, &site.index, &path).await?;
+            serve_file(session, root, &site.index, &path, hsts).await?;
             return Ok(true);
         }
 
@@ -326,7 +342,7 @@ impl ProxyHttp for SluiceProxy {
                 .and_then(|v| v.parse::<u64>().ok())
                 .is_some_and(|l| l > max);
             if too_big {
-                send_status(session, 413).await?;
+                send_status(session, 413, hsts).await?;
                 return Ok(true);
             }
         }
@@ -458,7 +474,7 @@ impl ProxyHttp for RedirectProxy {
     async fn request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<bool> {
         let host = host_of(session).unwrap_or_default();
         let uri = req_uri(session);
-        redirect(session, 301, format!("https://{host}{uri}")).await?;
+        redirect(session, 301, format!("https://{host}{uri}"), None).await?;
         Ok(true)
     }
 
