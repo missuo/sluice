@@ -14,7 +14,7 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 
-use crate::config::{Config, RateLimit, CF_RANGES};
+use crate::config::{Balance, Config, Handler, RateLimit, UpstreamGroup, WafField, CF_RANGES};
 use crate::metrics::*;
 
 fn in_cloudflare(ip: IpAddr) -> bool {
@@ -243,9 +243,21 @@ struct Bucket {
 
 // ---- main proxy (TLS listeners) ----
 
+/// splitmix64 — a cheap, lock-free PRNG step for `balance "random"`.
+fn fast_rand() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEED: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut x = SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
 pub struct SluiceProxy {
     cfg: Arc<ArcSwap<Config>>,
     limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
+    /// Round-robin cursor per (host, location index).
+    rr: Arc<DashMap<(String, usize), u64>>,
 }
 
 impl SluiceProxy {
@@ -258,7 +270,30 @@ impl SluiceProxy {
             std::thread::sleep(Duration::from_secs(60));
             sweep.retain(|_, b: &mut Bucket| b.last.elapsed() < Duration::from_secs(600));
         });
-        SluiceProxy { cfg, limiter }
+        SluiceProxy { cfg, limiter, rr: Arc::new(DashMap::new()) }
+    }
+
+    /// Base index into the pool for this request (before failover offset).
+    fn lb_base(&self, host: &str, loc_idx: usize, group: &UpstreamGroup, client_ip: &str) -> usize {
+        let n = group.servers.len();
+        if n <= 1 {
+            return 0;
+        }
+        match group.balance {
+            Balance::RoundRobin => {
+                let mut c = self.rr.entry((host.to_string(), loc_idx)).or_insert(0);
+                let v = *c;
+                *c = c.wrapping_add(1);
+                (v % n as u64) as usize
+            }
+            Balance::Random => (fast_rand() % n as u64) as usize,
+            Balance::IpHash => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                client_ip.hash(&mut h);
+                (h.finish() % n as u64) as usize
+            }
+        }
     }
 
     /// Token bucket per (host, client-ip). Returns true if allowed.
@@ -285,13 +320,20 @@ pub struct Ctx {
     start: Instant,
     host: String,
     site: Option<usize>,
-    upstream: u16,
+    /// Index into the site's `locations` chosen for this request.
+    location: Option<usize>,
+    /// Pool base index (before failover offset) for the chosen location.
+    lb_base: usize,
+    /// Connect-failure retries so far (failover offset into the pool).
+    tries: usize,
+    /// The upstream address actually dialed, for the access log.
+    up_addr: String,
     client_ip: String,
     country: String,
     asn: String,
     asn_org: String,
     city: String,
-    /// Per-site body cap enforced while streaming (see `request_body_filter`).
+    /// Per-location body cap enforced while streaming (see `request_body_filter`).
     body_limit: Option<u64>,
     body_seen: u64,
 }
@@ -306,7 +348,10 @@ impl ProxyHttp for SluiceProxy {
             start: Instant::now(),
             host: String::new(),
             site: None,
-            upstream: 0,
+            location: None,
+            lb_base: 0,
+            tries: 0,
+            up_addr: String::new(),
             client_ip: String::new(),
             country: String::new(),
             asn: String::new(),
@@ -359,7 +404,21 @@ impl ProxyHttp for SluiceProxy {
 
         let path = session.req_header().uri.path().to_owned();
 
-        // deny paths (nginx `deny`) → 403
+        // WAF (site-wide) → block matching requests.
+        for rule in &site.waf {
+            let hay = match &rule.field {
+                WafField::Path => path.as_str(),
+                WafField::Query => session.req_header().uri.query().unwrap_or(""),
+                WafField::Method => session.req_header().method.as_str(),
+                WafField::Header(name) => header_val(session, name).unwrap_or(""),
+            };
+            if rule.re.is_match(hay) {
+                send_status(session, rule.status, hsts).await?;
+                return Ok(true);
+            }
+        }
+
+        // site-wide deny (nginx `deny`) → 403
         for re in &site.deny {
             if re.is_match(&path) {
                 send_status(session, 403, hsts).await?;
@@ -367,6 +426,7 @@ impl ProxyHttp for SluiceProxy {
             }
         }
 
+        // site-level redirects
         for r in &site.redirects {
             if r.re.is_match(&path) {
                 let uri = req_uri(session);
@@ -376,13 +436,35 @@ impl ProxyHttp for SluiceProxy {
             }
         }
 
-        // static file server (site has no upstream)
-        if let Some(root) = &site.file_root {
-            serve_file(session, root, &site.index, &path, hsts).await?;
+        // route to a location by path (first matching location, declaration order)
+        let Some(loc_idx) = site.locations.iter().position(|l| l.matcher.matches(&path)) else {
+            send_status(session, 404, hsts).await?;
             return Ok(true);
+        };
+        ctx.location = Some(loc_idx);
+        let loc = &site.locations[loc_idx];
+
+        // per-location deny
+        for re in &loc.deny {
+            if re.is_match(&path) {
+                send_status(session, 403, hsts).await?;
+                return Ok(true);
+            }
         }
 
-        if let Some(max) = site.max_body {
+        match &loc.handler {
+            // static file server → serve here and short-circuit
+            Handler::File { root, index } => {
+                serve_file(session, root, index, &path, hsts).await?;
+                return Ok(true);
+            }
+            // proxy → choose the pool member now (round-robin cursor advances once)
+            Handler::Proxy(group) => {
+                ctx.lb_base = self.lb_base(&host, loc_idx, group, &ctx.client_ip);
+            }
+        }
+
+        if let Some(max) = loc.max_body {
             // Fast path: reject an over-size declared Content-Length up front.
             let too_big = header_val(session, "content-length")
                 .and_then(|v| v.parse::<u64>().ok())
@@ -418,29 +500,53 @@ impl ProxyHttp for SluiceProxy {
     }
 
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
-        let idx = ctx.site.ok_or_else(|| Error::new_str("no site matched for request"))?;
-        let site = &ctx.cfg.sites[idx];
-        let up = site
-            .upstream
-            .as_ref()
-            .ok_or_else(|| Error::new_str("file-server site reached upstream_peer"))?;
-        ctx.upstream = up.port;
+        let cfg = ctx.cfg.clone();
+        let si = ctx.site.ok_or_else(|| Error::new_str("no site matched"))?;
+        let li = ctx.location.ok_or_else(|| Error::new_str("no location matched"))?;
+        let loc = &cfg.sites[si].locations[li];
+        let Handler::Proxy(group) = &loc.handler else {
+            return Err(Error::new_str("file-server location reached upstream_peer"));
+        };
+        // (lb_base picked once in request_filter) + tries (advanced on failover).
+        let up = &group.servers[(ctx.lb_base + ctx.tries) % group.servers.len()];
+        ctx.up_addr = format!("{}:{}", up.host, up.port);
 
         // tls + sni for https upstreams (OpenAI/S3); plaintext for bare host:port.
         let mut peer = HttpPeer::new((up.host.as_str(), up.port), up.tls, up.sni.clone());
         peer.options.verify_cert = up.verify;
         peer.options.verify_hostname = up.verify;
         peer.options.connection_timeout = Some(Duration::from_secs(5));
-        // Default a read timeout for non-websocket sites (slowloris protection);
-        // websockets and explicitly-configured sites keep their own value.
-        peer.options.read_timeout = if site.websocket {
+        // Default a read timeout for non-websocket locations (slowloris protection);
+        // websockets and explicitly-configured locations keep their own value.
+        peer.options.read_timeout = if loc.websocket {
             None
         } else {
-            site.read_timeout.or(Some(Duration::from_secs(60)))
+            loc.read_timeout.or(Some(Duration::from_secs(60)))
         };
         peer.options.write_timeout = Some(Duration::from_secs(300));
         peer.options.idle_timeout = Some(Duration::from_secs(60));
         Ok(Box::new(peer))
+    }
+
+    /// On a connect failure, retry the next server in the pool (failover) until
+    /// every member has been tried once.
+    fn fail_to_connect(
+        &self,
+        _session: &mut Session,
+        _peer: &HttpPeer,
+        ctx: &mut Ctx,
+        mut e: Box<Error>,
+    ) -> Box<Error> {
+        let cfg = ctx.cfg.clone();
+        if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
+            if let Handler::Proxy(group) = &cfg.sites[si].locations[li].handler {
+                if ctx.tries + 1 < group.servers.len() {
+                    ctx.tries += 1;
+                    e.set_retry(true);
+                }
+            }
+        }
+        e
     }
 
     async fn upstream_request_filter(
@@ -454,8 +560,10 @@ impl ProxyHttp for SluiceProxy {
         upstream_request.insert_header("X-Forwarded-Proto", "https")?;
         // Rewrite Host for cross-host (https://) upstreams so OpenAI/S3 see their
         // own hostname; bare host:port upstreams keep the client's Host.
-        if let Some(idx) = ctx.site {
-            if let Some(up) = &ctx.cfg.sites[idx].upstream {
+        let cfg = ctx.cfg.clone();
+        if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
+            if let Handler::Proxy(group) = &cfg.sites[si].locations[li].handler {
+                let up = &group.servers[(ctx.lb_base + ctx.tries) % group.servers.len()];
                 if let Some(h) = &up.host_header {
                     upstream_request.insert_header("Host", h.as_str())?;
                 }
@@ -533,12 +641,12 @@ impl ProxyHttp for SluiceProxy {
         let method = session.req_header().method.as_str().to_owned();
         let path = session.req_header().uri.path().to_owned();
         let err = e.map(|e| format!(" err={e}")).unwrap_or_default();
+        let up = if ctx.up_addr.is_empty() { "-" } else { ctx.up_addr.as_str() };
         // Sub-millisecond precision: static/short-circuit responses are < 1ms,
         // which as_millis() truncates to a misleading "0ms".
         log::info!(
-            "{client}{geo} {method} {host}{path} -> {status} {:.3}ms up=:{}{err}",
+            "{client}{geo} {method} {host}{path} -> {status} {:.3}ms up={up}{err}",
             elapsed.as_secs_f64() * 1000.0,
-            ctx.upstream
         );
     }
 }

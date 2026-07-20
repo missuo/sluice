@@ -149,18 +149,95 @@ pub struct Upstream {
     pub verify: bool,
 }
 
-pub struct Site {
-    pub host: String,
-    /// Proxy backend. None for a file-server site.
-    pub upstream: Option<Upstream>,
-    /// Static file root. None for a proxy site. Exactly one of upstream/file_root is set.
-    pub file_root: Option<String>,
-    pub index: String,
-    /// Paths matching any of these regexes get 403 (nginx `deny`).
-    pub deny: Vec<Regex>,
+/// Load-balancing policy across a pool of backends.
+#[derive(Debug, Clone, Copy)]
+pub enum Balance {
+    RoundRobin,
+    Random,
+    /// Sticky by client IP (same client → same backend while the pool is stable).
+    IpHash,
+}
+
+/// One or more backends selected by a `Balance` policy, with connect-failure
+/// failover to the next server in the pool.
+#[derive(Debug, Clone)]
+pub struct UpstreamGroup {
+    pub servers: Vec<Upstream>,
+    pub balance: Balance,
+}
+
+/// How a `location` matches the request path.
+#[derive(Debug, Clone)]
+pub enum Matcher {
+    /// `location "/api/"` — path starts with this.
+    Prefix(String),
+    /// `location "~\.php$"` — path matches this regex.
+    Regex(Regex),
+}
+
+impl Matcher {
+    pub fn matches(&self, path: &str) -> bool {
+        match self {
+            Matcher::Prefix(p) => path.starts_with(p.as_str()),
+            Matcher::Regex(re) => re.is_match(path),
+        }
+    }
+}
+
+/// What a matched location does with the request.
+pub enum Handler {
+    Proxy(UpstreamGroup),
+    File { root: String, index: String },
+}
+
+/// A path-routed block inside a `site`. Locations are matched in declaration
+/// order; the first whose matcher matches wins (put specific paths before `/`).
+pub struct Location {
+    pub matcher: Matcher,
+    pub handler: Handler,
     pub websocket: bool,
     pub max_body: Option<u64>,
     pub read_timeout: Option<Duration>,
+    /// Paths matching any of these regexes get 403 (nginx `deny`).
+    pub deny: Vec<Regex>,
+    /// Response caching for this location (None = pass-through).
+    pub cache: Option<CacheCfg>,
+}
+
+/// Response-cache settings for a location.
+#[derive(Debug, Clone)]
+pub struct CacheCfg {
+    /// Fallback TTL when the upstream sends no explicit freshness.
+    pub ttl: Duration,
+    /// Max object size to cache (bytes); larger responses stream uncached.
+    pub max_object: usize,
+}
+
+/// A WAF rule: if the chosen request field matches `re`, the request is blocked.
+#[derive(Debug)]
+pub struct WafRule {
+    pub field: WafField,
+    pub re: Regex,
+    pub status: u16,
+}
+
+#[derive(Debug)]
+pub enum WafField {
+    Path,
+    Query,
+    Method,
+    /// A named request header (lowercased), e.g. `user-agent`.
+    Header(String),
+}
+
+pub struct Site {
+    pub host: String,
+    /// Path-routed handlers, matched in order. Always non-empty after parsing.
+    pub locations: Vec<Location>,
+    /// Site-wide deny (checked before location routing).
+    pub deny: Vec<Regex>,
+    /// Site-wide WAF rules (checked first of all).
+    pub waf: Vec<WafRule>,
     pub hsts: Option<String>,
     pub cloudflare_only: bool,
     pub rate_limit: Option<RateLimit>,
@@ -601,44 +678,8 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
     Ok(Listener { addr, kind: ListenerKind::Tls { cert, key, http2 } })
 }
 
-fn parse_site(node: &KdlNode) -> Result<Site, String> {
-    let host = first_arg(node)
-        .ok_or("site needs a host, e.g. site \"app.example.com\"")?
-        .to_string();
-
-    // Backend: exactly one of `upstream` (proxy) or `file-server` (static).
-    let upstream = match child_arg(node, "upstream") {
-        Some(u) => {
-            let mut up = parse_upstream(u).map_err(|e| format!("site `{host}`: {e}"))?;
-            if let Some(h) = child_arg(node, "upstream-host") {
-                up.host_header = Some(h.to_string());
-            }
-            if let Some(v) = child_bool(node, "upstream-verify") {
-                up.verify = v;
-            }
-            Some(up)
-        }
-        None => None,
-    };
-    let (file_root, index) = match child(node, "file-server") {
-        Some(fs) => {
-            let root = child_arg(fs, "root")
-                .ok_or_else(|| format!("site `{host}`: file-server missing root"))?
-                .to_string();
-            if !Path::new(&root).is_dir() {
-                return Err(format!("site `{host}`: file-server root not a directory: {root}"));
-            }
-            let index = child_arg(fs, "index").unwrap_or("index.html").to_string();
-            (Some(root), index)
-        }
-        None => (None, "index.html".to_string()),
-    };
-    match (&upstream, &file_root) {
-        (Some(_), Some(_)) => return Err(format!("site `{host}`: set either upstream or file-server, not both")),
-        (None, None) => return Err(format!("site `{host}`: needs an upstream or a file-server")),
-        _ => {}
-    }
-
+/// Collect `deny "<regex>"` children into compiled regexes.
+fn parse_deny(node: &KdlNode, host: &str) -> Result<Vec<Regex>, String> {
     let mut deny = Vec::new();
     if let Some(children) = node.children() {
         for d in children.nodes().iter().filter(|n| n.name().value() == "deny") {
@@ -646,14 +687,195 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
             deny.push(Regex::new(pat).map_err(|e| format!("site `{host}`: deny regex {pat:?}: {e}"))?);
         }
     }
+    Ok(deny)
+}
 
-    let acme = child_bool(node, "acme").unwrap_or(false);
-    let websocket = child_bool(node, "websocket").unwrap_or(false);
-    let max_body = match child_arg(node, "max-body") {
-        Some(s) => Some(parse_size(s).map_err(|e| format!("site `{host}`: {e}"))?),
-        None => None,
+fn parse_max_body(node: &KdlNode, host: &str) -> Result<Option<u64>, String> {
+    match child_arg(node, "max-body") {
+        Some(s) => Ok(Some(parse_size(s).map_err(|e| format!("site `{host}`: {e}"))?)),
+        None => Ok(None),
+    }
+}
+
+fn parse_cache(node: &KdlNode, host: &str) -> Result<Option<CacheCfg>, String> {
+    match child(node, "cache") {
+        Some(c) => {
+            let ttl = child_int(c, "ttl-secs").unwrap_or(60).max(0) as u64;
+            let max_object = match child_arg(c, "max-object") {
+                Some(s) => parse_size(s).map_err(|e| format!("site `{host}`: cache {e}"))? as usize,
+                None => 8 * 1024 * 1024,
+            };
+            Ok(Some(CacheCfg { ttl: Duration::from_secs(ttl), max_object }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Parse an `upstream` node — either `upstream "host:port"` (single) or a block
+/// with several `server "..."` lines and an optional `balance` policy.
+fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, String> {
+    let mut servers = Vec::new();
+    if let Some(single) = first_arg(node) {
+        servers.push(parse_upstream(single).map_err(|e| format!("site `{host}`: {e}"))?);
+    }
+    let mut balance = Balance::RoundRobin;
+    if let Some(children) = node.children() {
+        for s in children.nodes().iter().filter(|n| n.name().value() == "server") {
+            let a = first_arg(s)
+                .ok_or_else(|| format!("site `{host}`: upstream server needs an address"))?;
+            servers.push(parse_upstream(a).map_err(|e| format!("site `{host}`: {e}"))?);
+        }
+        if let Some(b) = child_arg(node, "balance") {
+            balance = match b {
+                "round-robin" => Balance::RoundRobin,
+                "random" => Balance::Random,
+                "ip-hash" => Balance::IpHash,
+                other => {
+                    return Err(format!(
+                        "site `{host}`: unknown balance {other:?} (round-robin|random|ip-hash)"
+                    ))
+                }
+            };
+        }
+    }
+    if servers.is_empty() {
+        return Err(format!("site `{host}`: upstream has no servers"));
+    }
+    Ok(UpstreamGroup { servers, balance })
+}
+
+/// The backend of a site or location: exactly one of `upstream` / `file-server`.
+fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
+    match (child(node, "upstream"), child(node, "file-server")) {
+        (Some(_), Some(_)) => {
+            Err(format!("site `{host}`: set either upstream or file-server, not both"))
+        }
+        (Some(u), None) => {
+            let mut group = parse_upstream_group(u, host)?;
+            if let Some(h) = child_arg(node, "upstream-host") {
+                for s in &mut group.servers {
+                    s.host_header = Some(h.to_string());
+                }
+            }
+            if let Some(v) = child_bool(node, "upstream-verify") {
+                for s in &mut group.servers {
+                    s.verify = v;
+                }
+            }
+            Ok(Handler::Proxy(group))
+        }
+        (None, Some(f)) => {
+            let root = child_arg(f, "root")
+                .ok_or_else(|| format!("site `{host}`: file-server missing root"))?
+                .to_string();
+            if !Path::new(&root).is_dir() {
+                return Err(format!("site `{host}`: file-server root not a directory: {root}"));
+            }
+            let index = child_arg(f, "index").unwrap_or("index.html").to_string();
+            Ok(Handler::File { root, index })
+        }
+        (None, None) => Err(format!("site `{host}`: needs an upstream or a file-server")),
+    }
+}
+
+fn parse_read_timeout(node: &KdlNode) -> Option<Duration> {
+    child_int(node, "read-timeout-secs").map(|v| Duration::from_secs(v.max(0) as u64))
+}
+
+/// A `location "<matcher>" { ... }` block. `~` prefix on the matcher = regex,
+/// otherwise a path prefix.
+fn parse_location(node: &KdlNode, host: &str) -> Result<Location, String> {
+    let m = first_arg(node)
+        .ok_or_else(|| format!("site `{host}`: location needs a path matcher"))?;
+    let matcher = if let Some(rx) = m.strip_prefix('~') {
+        Matcher::Regex(
+            Regex::new(rx.trim())
+                .map_err(|e| format!("site `{host}`: location regex {:?}: {e}", rx.trim()))?,
+        )
+    } else {
+        Matcher::Prefix(m.to_string())
     };
-    let read_timeout = child_int(node, "read-timeout-secs").map(|v| Duration::from_secs(v.max(0) as u64));
+    Ok(Location {
+        matcher,
+        handler: parse_handler(node, host)?,
+        websocket: child_bool(node, "websocket").unwrap_or(false),
+        max_body: parse_max_body(node, host)?,
+        read_timeout: parse_read_timeout(node),
+        deny: parse_deny(node, host)?,
+        cache: parse_cache(node, host)?,
+    })
+}
+
+/// A `waf { block field=".." match=".." }` block (site-wide request filtering).
+fn parse_waf(node: &KdlNode, host: &str) -> Result<Vec<WafRule>, String> {
+    let mut rules = Vec::new();
+    let Some(w) = child(node, "waf") else { return Ok(rules) };
+    let Some(children) = w.children() else { return Ok(rules) };
+    for b in children.nodes().iter().filter(|n| n.name().value() == "block") {
+        let field_s = prop_str(b, "field")
+            .ok_or_else(|| format!("site `{host}`: waf block needs field=\"...\""))?;
+        let field = if let Some(h) = field_s.strip_prefix("header:") {
+            WafField::Header(h.to_ascii_lowercase())
+        } else {
+            match field_s {
+                "path" => WafField::Path,
+                "query" => WafField::Query,
+                "method" => WafField::Method,
+                "user-agent" => WafField::Header("user-agent".to_string()),
+                other => {
+                    return Err(format!(
+                        "site `{host}`: waf unknown field {other:?} (path|query|method|user-agent|header:NAME)"
+                    ))
+                }
+            }
+        };
+        let pat = prop_str(b, "match")
+            .ok_or_else(|| format!("site `{host}`: waf block needs match=\"...\""))?;
+        let re =
+            Regex::new(pat).map_err(|e| format!("site `{host}`: waf regex {pat:?}: {e}"))?;
+        let raw = prop_int(b, "status").unwrap_or(403);
+        let status = u16::try_from(raw)
+            .ok()
+            .filter(|s| (400..=599).contains(s))
+            .ok_or_else(|| format!("site `{host}`: waf status {raw} not in 400..=599"))?;
+        rules.push(WafRule { field, re, status });
+    }
+    Ok(rules)
+}
+
+fn parse_site(node: &KdlNode) -> Result<Site, String> {
+    let host = first_arg(node)
+        .ok_or("site needs a host, e.g. site \"app.example.com\"")?
+        .to_string();
+
+    // Locations: explicit `location` blocks first (matched in order), then any
+    // site-level bare `upstream`/`file-server` as an implicit catch-all "/".
+    let mut locations = Vec::new();
+    if let Some(children) = node.children() {
+        for l in children.nodes().iter().filter(|n| n.name().value() == "location") {
+            locations.push(parse_location(l, &host)?);
+        }
+    }
+    if child(node, "upstream").is_some() || child(node, "file-server").is_some() {
+        locations.push(Location {
+            matcher: Matcher::Prefix("/".to_string()),
+            handler: parse_handler(node, &host)?,
+            websocket: child_bool(node, "websocket").unwrap_or(false),
+            max_body: parse_max_body(node, &host)?,
+            read_timeout: parse_read_timeout(node),
+            deny: Vec::new(), // site-wide deny is handled at the site level
+            cache: parse_cache(node, &host)?,
+        });
+    }
+    if locations.is_empty() {
+        return Err(format!(
+            "site `{host}`: needs an upstream, a file-server, or at least one location"
+        ));
+    }
+
+    let deny = parse_deny(node, &host)?;
+    let waf = parse_waf(node, &host)?;
+    let acme = child_bool(node, "acme").unwrap_or(false);
     let hsts = child_arg(node, "hsts").map(str::to_owned);
     let cloudflare_only = child(node, "access")
         .and_then(|a| prop_bool(a, "cloudflare-only"))
@@ -692,13 +914,9 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
 
     Ok(Site {
         host,
-        upstream,
-        file_root,
-        index,
+        locations,
         deny,
-        websocket,
-        max_body,
-        read_timeout,
+        waf,
         hsts,
         cloudflare_only,
         rate_limit,
