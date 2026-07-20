@@ -84,7 +84,18 @@ fn main() {
     let listeners = config.listeners.clone();
     let metrics_addr = config.server.metrics_addr.clone();
     let acme_cfg = config.acme.clone();
-    let acme_domains: Vec<String> = config.sites.iter().map(|s| s.host.clone()).collect();
+    // Only provision hosts that opted in with `acme true` — a CF-fronted host
+    // can't pass HTTP-01, so enrolling every site would fail forever.
+    let acme_domains: Vec<String> =
+        config.sites.iter().filter(|s| s.acme).map(|s| s.host.clone()).collect();
+    if config
+        .listeners
+        .iter()
+        .any(|l| matches!(l.kind, ListenerKind::TlsAcme { .. }))
+        && acme_domains.is_empty()
+    {
+        log::warn!("sluice: a listener uses `tls acme=true` but no site sets `acme true` — no certs will be provisioned");
+    }
     let cfg = Arc::new(ArcSwap::from_pointee(config));
 
     // ACME auto-TLS: a shared cert store (served by SNI) + a challenge map

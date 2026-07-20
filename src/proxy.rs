@@ -92,9 +92,10 @@ async fn send_status(session: &mut Session, status: u16, hsts: Option<&str>) -> 
     Ok(())
 }
 
-/// Serve a static file from `root`. Blocks on file I/O (fine for small assets;
-/// stream large files later). Path traversal is rejected two ways: `..`
-/// components up front, and a canonicalized-under-root check.
+/// Serve a static file from `root`, streamed in chunks off the async runtime so
+/// a large file (or slow FS) never blocks the worker or buffers the whole body
+/// in memory. Path traversal is rejected two ways: `..` components up front, and
+/// a canonicalized-under-root check.
 async fn serve_file(
     session: &mut Session,
     root: &str,
@@ -102,6 +103,8 @@ async fn serve_file(
     req_path: &str,
     hsts: Option<&str>,
 ) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
     let is_head = session.req_header().method.as_str() == "HEAD";
     let rel = req_path.trim_start_matches('/');
     if rel.split('/').any(|c| c == "..") {
@@ -114,27 +117,56 @@ async fn serve_file(
     if req_path.ends_with('/') || rel.is_empty() {
         fpath.push(index);
     }
-    match (fpath.canonicalize(), std::path::Path::new(root).canonicalize()) {
-        (Ok(real), Ok(base)) if real.starts_with(&base) => match std::fs::read(&real) {
-            Ok(body) => {
-                let mut resp = ResponseHeader::build(200, Some(4))?;
-                resp.insert_header("Content-Type", content_type(&real))?;
-                resp.insert_header("Content-Length", body.len().to_string())?;
-                if let Some(h) = hsts {
-                    resp.insert_header("Strict-Transport-Security", h)?;
-                }
-                // HEAD: send headers (incl. the GET Content-Length) but no body.
-                session.write_response_header(Box::new(resp), is_head).await?;
-                if !is_head {
-                    session.write_response_body(Some(bytes::Bytes::from(body)), true).await?;
-                }
-                Ok(())
-            }
-            Err(_) => send_status(session, 404, hsts).await,
-        },
-        (Ok(_), Ok(_)) => send_status(session, 403, hsts).await, // resolved outside root
-        _ => send_status(session, 404, hsts).await,
+
+    // Resolve symlinks and confirm the target stays under root (async, non-blocking).
+    let (real, base) = match (
+        tokio::fs::canonicalize(&fpath).await,
+        tokio::fs::canonicalize(root).await,
+    ) {
+        (Ok(real), Ok(base)) => (real, base),
+        _ => return send_status(session, 404, hsts).await,
+    };
+    if !real.starts_with(&base) {
+        return send_status(session, 403, hsts).await; // resolved outside root
     }
+    let meta = match tokio::fs::metadata(&real).await {
+        Ok(m) if m.is_file() => m,
+        _ => return send_status(session, 404, hsts).await, // missing or a directory
+    };
+
+    let mut file = match tokio::fs::File::open(&real).await {
+        Ok(f) => f,
+        Err(_) => return send_status(session, 404, hsts).await,
+    };
+
+    let mut resp = ResponseHeader::build(200, Some(4))?;
+    resp.insert_header("Content-Type", content_type(&real))?;
+    resp.insert_header("Content-Length", meta.len().to_string())?;
+    if let Some(h) = hsts {
+        resp.insert_header("Strict-Transport-Security", h)?;
+    }
+    // HEAD: send headers (incl. the GET Content-Length) but no body.
+    session.write_response_header(Box::new(resp), is_head).await?;
+    if is_head {
+        return Ok(());
+    }
+
+    // Stream the body in 64 KiB chunks.
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = match file.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => n,
+            // Header (with Content-Length) is already sent; a mid-file read error
+            // can only be surfaced by dropping the connection.
+            Err(_) => return Err(Error::new_str("static file read error")),
+        };
+        session
+            .write_response_body(Some(bytes::Bytes::copy_from_slice(&buf[..n])), false)
+            .await?;
+    }
+    session.write_response_body(None, true).await?;
+    Ok(())
 }
 
 fn content_type(path: &std::path::Path) -> &'static str {

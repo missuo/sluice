@@ -165,6 +165,10 @@ pub struct Site {
     pub cloudflare_only: bool,
     pub rate_limit: Option<RateLimit>,
     pub redirects: Vec<Redirect>,
+    /// Provision an ACME cert for this host (opt-in; needs an `acme {}` block and
+    /// a `tls acme=true` listener). Off by default so CF-fronted hosts, which
+    /// can't pass HTTP-01, don't trigger endless failed validations.
+    pub acme: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -501,6 +505,16 @@ impl Config {
                     .to_string(),
             );
         }
+        // ACME is opt-in per site (`acme true`). Tie the flag to the machinery.
+        let any_acme_site = sites.iter().any(|s| s.acme);
+        if any_acme_site && acme.is_none() {
+            errs.push("a site sets `acme true` but there is no `acme {}` block".to_string());
+        }
+        if any_acme_site && !has_acme_listener {
+            errs.push(
+                "a site sets `acme true` but no listener uses `tls acme=true`".to_string(),
+            );
+        }
         if sites.is_empty() {
             errs.push("no `site` defined".to_string());
         }
@@ -633,6 +647,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         }
     }
 
+    let acme = child_bool(node, "acme").unwrap_or(false);
     let websocket = child_bool(node, "websocket").unwrap_or(false);
     let max_body = match child_arg(node, "max-body") {
         Some(s) => Some(parse_size(s).map_err(|e| format!("site `{host}`: {e}"))?),
@@ -688,5 +703,6 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         cloudflare_only,
         rate_limit,
         redirects,
+        acme,
     })
 }
