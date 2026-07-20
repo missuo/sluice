@@ -314,6 +314,35 @@ once you're shipping logs anywhere.
 - Config at `/etc/sluice/sluice.kdl`; certs + mmdb alongside.
 - `sluice --check -c sluice.kdl` validates config without starting (CI + pre-reload gate).
 
+## 7b. Automatic TLS (ACME) — assessment
+
+Feasible, but it is the **single largest feature** (auto-TLS is Caddy's whole
+identity). What it takes on Pingora:
+
+- **ACME client:** `instant-acme` (async, RFC 8555, Let's Encrypt/ZeroSSL).
+- **Challenge:** HTTP-01 is the pragmatic path — serve `/.well-known/acme-
+  challenge/<token>` on the existing `:80` listener (which today only redirects),
+  then fall through to the redirect. (TLS-ALPN-01 needs a challenge cert swapped
+  onto `:443` mid-handshake — harder with Pingora.)
+- **Cert store + renewal:** persist account key + issued certs to disk; a
+  background task renews ~30 days before expiry.
+- **The hard part — dynamic certs:** Pingora binds certs at listener creation
+  (`add_tls_with_settings`). Serving a cert obtained *after* startup, and rotating
+  on renewal, needs Pingora's **dynamic certificate callback**
+  (`TlsSettings::with_callbacks` + an SNI cert resolver reading an
+  `ArcSwap<CertStore>` the renewal loop updates). This is advanced Pingora usage
+  and the main implementation risk.
+
+Effort: a few days, most of it the dynamic-cert callback + challenge plumbing.
+
+**Recommendation — probably don't build it for the current deployment.** Sluice's
+real user runs **behind Cloudflare**: clients see Cloudflare's edge cert (CF owns
+public TLS), and the origin uses a **Cloudflare Origin CA cert** — free, valid
+**15 years**, zero renewal. ACME buys *nothing* there. It only matters if Sluice is
+deployed **directly public** (no CDN in front), as a standalone Caddy-style server.
+So: build it when/if there's a non-CF deployment; until then it's cost with no
+benefit. Tracked as M5.
+
 ## 8. Milestones
 
 - **M0 — core — DONE:** KDL `Config` loader + `--check`; config-driven `ProxyHttp`
