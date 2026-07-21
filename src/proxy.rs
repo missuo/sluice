@@ -20,7 +20,7 @@ use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 
 use crate::config::{
-    Balance, Config, Handler, RateLimit, Upstream, UpstreamGroup, WafField, CF_RANGES,
+    Balance, Config, Handler, RateLimit, SubFilter, Upstream, UpstreamGroup, WafField, CF_RANGES,
 };
 use crate::metrics::*;
 
@@ -320,6 +320,58 @@ fn fast_rand() -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     x ^ (x >> 31)
+}
+
+/// Whether a Content-Type is text we can safely find/replace in.
+fn rewritable_content_type(ct: &str) -> bool {
+    let base = ct.split(';').next().unwrap_or("").trim();
+    base.starts_with("text/")
+        || matches!(
+            base,
+            "application/json"
+                | "application/javascript"
+                | "application/xml"
+                | "application/xhtml+xml"
+                | "image/svg+xml"
+                | "application/rss+xml"
+        )
+}
+
+/// Streaming find/replace over a response body. `data` is the previous carry plus
+/// the new chunk; returns (bytes to emit now, carry to prepend to the next
+/// chunk). We hold back the last `max_from - 1` bytes (unless `flush`) so a
+/// pattern split across two chunks is still matched. Because every scan position
+/// `< limit` has at least `max_from` bytes available, a match is always decidable
+/// there — carried bytes are never re-scanned/re-replaced.
+fn rewrite_stream(
+    data: &[u8],
+    filters: &[SubFilter],
+    max_from: usize,
+    flush: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut out = Vec::with_capacity(data.len());
+    let limit = if flush {
+        data.len()
+    } else {
+        data.len().saturating_sub(max_from.saturating_sub(1))
+    };
+    let mut i = 0;
+    while i < limit {
+        let mut matched = false;
+        for f in filters {
+            if data[i..].starts_with(&f.from) {
+                out.extend_from_slice(&f.to);
+                i += f.from.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            out.push(data[i]);
+            i += 1;
+        }
+    }
+    (out, data[i..].to_vec())
 }
 
 /// Stable string hash (matches the Ketama ring builder in config.rs).
@@ -668,6 +720,10 @@ pub struct Ctx {
     cache_ttl: Option<Duration>,
     /// Max cacheable object size for this request's location (bytes).
     cache_max_object: usize,
+    /// Whether the response body is being find/replaced (sub-filter).
+    rewrite: bool,
+    /// Carry-over bytes held between body chunks for the sub-filter matcher.
+    rewrite_carry: Vec<u8>,
 }
 
 #[async_trait]
@@ -695,6 +751,8 @@ impl ProxyHttp for SluiceProxy {
             body_seen: 0,
             cache_ttl: None,
             cache_max_object: 0,
+            rewrite: false,
+            rewrite_carry: Vec::new(),
         }
     }
 
@@ -1085,6 +1143,13 @@ impl ProxyHttp for SluiceProxy {
         if let Some(h) = &ctx.up_host_header {
             upstream_request.insert_header("Host", h.as_str())?;
         }
+        // If this location rewrites the response body, ask the origin for an
+        // uncompressed response (we can't find/replace inside gzip/br).
+        if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
+            if !ctx.cfg.sites[si].locations[li].sub_filters.is_empty() {
+                upstream_request.remove_header("accept-encoding");
+            }
+        }
         Ok(())
     }
 
@@ -1094,12 +1159,72 @@ impl ProxyHttp for SluiceProxy {
         upstream_response: &mut ResponseHeader,
         ctx: &mut Ctx,
     ) -> Result<()> {
+        let cfg = ctx.cfg.clone();
         if let Some(idx) = ctx.site {
-            if let Some(hsts) = &ctx.cfg.sites[idx].hsts {
+            if let Some(hsts) = &cfg.sites[idx].hsts {
                 upstream_response.insert_header("Strict-Transport-Security", hsts.as_str())?;
             }
         }
+        // Enable response-body rewriting only for an uncompressed text response
+        // (the origin was asked not to compress above). The body length changes,
+        // so drop Content-Length and let it stream chunked.
+        if let (Some(si), Some(li)) = (ctx.site, ctx.location) {
+            let loc = &cfg.sites[si].locations[li];
+            if !loc.sub_filters.is_empty() {
+                let uncompressed = upstream_response
+                    .headers
+                    .get("content-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case("identity"))
+                    .unwrap_or(true);
+                let text = upstream_response
+                    .headers
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(rewritable_content_type)
+                    .unwrap_or(false);
+                if uncompressed && text {
+                    ctx.rewrite = true;
+                    upstream_response.remove_header("Content-Length");
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Streaming response-body find/replace (nginx `sub_filter`), with carry-over
+    /// so a pattern split across chunks still matches.
+    fn response_body_filter(
+        &self,
+        _session: &mut Session,
+        body: &mut Option<bytes::Bytes>,
+        end_of_stream: bool,
+        ctx: &mut Ctx,
+    ) -> Result<Option<Duration>> {
+        if !ctx.rewrite {
+            return Ok(None);
+        }
+        let cfg = ctx.cfg.clone();
+        let (Some(si), Some(li)) = (ctx.site, ctx.location) else {
+            return Ok(None);
+        };
+        let loc = &cfg.sites[si].locations[li];
+        if loc.sub_filters.is_empty() {
+            return Ok(None);
+        }
+        // input = held-over carry + this chunk
+        let mut data = std::mem::take(&mut ctx.rewrite_carry);
+        if let Some(chunk) = body.take() {
+            data.extend_from_slice(&chunk);
+        }
+        let (emit, carry) = rewrite_stream(&data, &loc.sub_filters, loc.sub_max_from, end_of_stream);
+        ctx.rewrite_carry = carry;
+        *body = if emit.is_empty() {
+            None
+        } else {
+            Some(bytes::Bytes::from(emit))
+        };
+        Ok(None)
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Ctx) {

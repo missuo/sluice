@@ -242,6 +242,17 @@ pub struct Location {
     pub deny: Vec<Regex>,
     /// Response caching for this location (None = pass-through).
     pub cache: Option<CacheCfg>,
+    /// Streaming response-body find/replace (nginx `sub_filter`).
+    pub sub_filters: Vec<SubFilter>,
+    /// Longest `from` across `sub_filters` (carry-over size for chunk matching).
+    pub sub_max_from: usize,
+}
+
+/// One response-body find/replace rule (bytes, so it works on any text encoding).
+#[derive(Debug, Clone)]
+pub struct SubFilter {
+    pub from: Vec<u8>,
+    pub to: Vec<u8>,
 }
 
 /// Response-cache settings for a location.
@@ -884,6 +895,24 @@ fn parse_read_timeout(node: &KdlNode) -> Option<Duration> {
     child_int(node, "read-timeout-secs").map(|v| Duration::from_secs(v.max(0) as u64))
 }
 
+/// Parse `sub-filter from="..." to="..."` children (response-body rewrites).
+fn parse_sub_filters(node: &KdlNode, host: &str) -> Result<(Vec<SubFilter>, usize), String> {
+    let mut fs = Vec::new();
+    if let Some(children) = node.children() {
+        for f in children.nodes().iter().filter(|n| n.name().value() == "sub-filter") {
+            let from = prop_str(f, "from")
+                .ok_or_else(|| format!("site `{host}`: sub-filter needs from=\"...\""))?;
+            if from.is_empty() {
+                return Err(format!("site `{host}`: sub-filter from must be non-empty"));
+            }
+            let to = prop_str(f, "to").unwrap_or("");
+            fs.push(SubFilter { from: from.as_bytes().to_vec(), to: to.as_bytes().to_vec() });
+        }
+    }
+    let max = fs.iter().map(|f| f.from.len()).max().unwrap_or(0);
+    Ok((fs, max))
+}
+
 /// A `location "<matcher>" { ... }` block. `~` prefix on the matcher = regex,
 /// otherwise a path prefix.
 fn parse_location(node: &KdlNode, host: &str) -> Result<Location, String> {
@@ -897,6 +926,7 @@ fn parse_location(node: &KdlNode, host: &str) -> Result<Location, String> {
     } else {
         Matcher::Prefix(m.to_string())
     };
+    let (sub_filters, sub_max_from) = parse_sub_filters(node, host)?;
     Ok(Location {
         matcher,
         handler: parse_handler(node, host)?,
@@ -905,6 +935,8 @@ fn parse_location(node: &KdlNode, host: &str) -> Result<Location, String> {
         read_timeout: parse_read_timeout(node),
         deny: parse_deny(node, host)?,
         cache: parse_cache(node, host)?,
+        sub_filters,
+        sub_max_from,
     })
 }
 
@@ -959,6 +991,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         }
     }
     if child(node, "upstream").is_some() || child(node, "file-server").is_some() {
+        let (sub_filters, sub_max_from) = parse_sub_filters(node, &host)?;
         locations.push(Location {
             matcher: Matcher::Prefix("/".to_string()),
             handler: parse_handler(node, &host)?,
@@ -967,6 +1000,8 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
             read_timeout: parse_read_timeout(node),
             deny: Vec::new(), // site-wide deny is handled at the site level
             cache: parse_cache(node, &host)?,
+            sub_filters,
+            sub_max_from,
         });
     }
     if locations.is_empty() {

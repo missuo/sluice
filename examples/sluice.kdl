@@ -108,6 +108,9 @@ site "api.example.com" {
             ttl-secs 60                  // fallback TTL; origin Cache-Control wins
         }
         rate-limit rps=50 burst=100      // token bucket per client IP
+        // Streaming response-body rewrite (nginx sub_filter). Text responses
+        // only; the origin is asked for an uncompressed body. Repeatable.
+        sub-filter from="http://internal.local" to="https://api.example.com"
     }
 }
 

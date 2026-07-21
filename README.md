@@ -51,6 +51,9 @@ against live Let's Encrypt (staging + production).
 - **HTTPS upstreams** (`upstream "https://api.openai.com"`): TLS + SNI + cert
   verification, and Host rewritten to the upstream host — reverse-proxy external
   APIs (OpenAI/S3). SSE streaming and WebSocket upgrades pass through unbuffered.
+- **Response-body rewrite** (`sub-filter from=… to=…`, like nginx `sub_filter`):
+  streaming find/replace on text responses (matches across chunk boundaries);
+  the origin is asked for an uncompressed response so the body can be rewritten.
 - Trusted **client IP** from a configurable header (e.g. `CF-Connecting-IP`),
   dropping the spoofable client XFF chain.
 - Migration **host aliasing** (`staging-<sub>` behaves like `<sub>`).
@@ -66,8 +69,8 @@ against live Let's Encrypt (staging + production).
   the running one), then `SIGQUIT` the old process to drain and exit — no dropped
   connections. Verified: 120 continuous requests across an upgrade, 0 failures.
 
-Roadmap (see DESIGN.md): config file-watch, response-body filters (rewrite),
-disk-backed cache, least-conn EWMA, scripting seam.
+Roadmap (see DESIGN.md): config file-watch, disk-backed cache, least-conn EWMA,
+a constrained request-routing expression language (not full scripting).
 
 ## Comparison with nginx and Caddy
 
@@ -104,7 +107,7 @@ Legend: ✅ built-in · 🔌 plugin/module · 💰 paid tier only · ❌ not ava
 | Prometheus metrics | ✅ built-in | ⚠️ basic `stub_status` / 🔌 exporter | ✅ built-in |
 | Trusted client-IP + anti-spoofing | ✅ | ⚠️ manual (`realip`) | ⚠️ manual |
 | Request-body size cap (streaming) | ✅ | ✅ | ✅ |
-| Response-body rewrite | ❌ (roadmap) | 🔌 (`sub_filter` for text) | 🔌 |
+| Response-body rewrite | ✅ (`sub-filter`) | ✅ (`sub_filter`) | 🔌 |
 | Scripting | ❌ (Rust plugins) | ✅ njs / 🔌 Lua | ❌ (Go plugins) |
 | TLS backends | OpenSSL / BoringSSL | OpenSSL | Go crypto / BoringSSL |
 
