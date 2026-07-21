@@ -52,7 +52,9 @@ listener "0.0.0.0:80" {
 // persist cached responses to disk (survives restarts, holds far more than RAM).
 // cache-store {
 //     dir "/var/cache/sluice"
-//     max-size "10GiB"                // a reaper evicts the oldest over this cap
+//     max-size "10GiB"                // reaper evicts oldest over this total size
+//     max-files 1000000               // …or over this file count (inode guard)
+//     min-free "1GiB"                 // …or when the filesystem drops below this
 // }
 
 alias prefix="staging"                 // staging-app.example.com == app.example.com

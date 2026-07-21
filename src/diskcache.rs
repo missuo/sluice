@@ -40,9 +40,12 @@ fn tmp_sibling(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// meta blob = [u32 internal-len][u32 header-len][internal][header].
-fn encode_meta(internal: &[u8], header: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(8 + internal.len() + header.len());
+/// meta blob = [u64 body-size][u32 internal-len][u32 header-len][internal][header].
+/// The body size lets `lookup` reject a meta whose body was replaced by a
+/// concurrent writer of a different length (a length mismatch → treated as miss).
+fn encode_meta(body_size: u64, internal: &[u8], header: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 + internal.len() + header.len());
+    out.extend_from_slice(&body_size.to_le_bytes());
     out.extend_from_slice(&(internal.len() as u32).to_le_bytes());
     out.extend_from_slice(&(header.len() as u32).to_le_bytes());
     out.extend_from_slice(internal);
@@ -50,17 +53,18 @@ fn encode_meta(internal: &[u8], header: &[u8]) -> Vec<u8> {
     out
 }
 
-fn decode_meta(buf: &[u8]) -> Option<(&[u8], &[u8])> {
-    if buf.len() < 8 {
+fn decode_meta(buf: &[u8]) -> Option<(u64, &[u8], &[u8])> {
+    if buf.len() < 16 {
         return None;
     }
-    let il = u32::from_le_bytes(buf[0..4].try_into().ok()?) as usize;
-    let hl = u32::from_le_bytes(buf[4..8].try_into().ok()?) as usize;
-    let end = 8usize.checked_add(il)?.checked_add(hl)?;
+    let body_size = u64::from_le_bytes(buf[0..8].try_into().ok()?);
+    let il = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+    let hl = u32::from_le_bytes(buf[12..16].try_into().ok()?) as usize;
+    let end = 16usize.checked_add(il)?.checked_add(hl)?;
     if buf.len() < end {
         return None;
     }
-    Some((&buf[8..8 + il], &buf[8 + il..end]))
+    Some((body_size, &buf[16..16 + il], &buf[16 + il..end]))
 }
 
 pub struct DiskCache {
@@ -127,7 +131,8 @@ struct DiskMiss {
     tmp_body: PathBuf,
     body_path: PathBuf,
     meta_path: PathBuf,
-    meta_blob: Vec<u8>,
+    meta_internal: Vec<u8>,
+    meta_header: Vec<u8>,
     written: usize,
     done: bool,
 }
@@ -151,8 +156,11 @@ impl HandleMiss for DiskMiss {
         tokio::fs::rename(&self.tmp_body, &self.body_path)
             .await
             .map_err(err("disk cache publish body"))?;
+        // Stamp the body length into the meta so lookup can detect a body swapped
+        // by a concurrent writer of a different size.
+        let blob = encode_meta(self.written as u64, &self.meta_internal, &self.meta_header);
         let meta_tmp = tmp_sibling(&self.meta_path);
-        tokio::fs::write(&meta_tmp, &self.meta_blob).await.map_err(err("disk cache write meta"))?;
+        tokio::fs::write(&meta_tmp, &blob).await.map_err(err("disk cache write meta"))?;
         tokio::fs::rename(&meta_tmp, &self.meta_path).await.map_err(err("disk cache publish meta"))?;
         self.done = true;
         Ok(MissFinishType::Created(self.written))
@@ -180,7 +188,7 @@ impl Storage for DiskCache {
         let Ok(blob) = tokio::fs::read(&meta_p).await else {
             return Ok(None);
         };
-        let Some((i, h)) = decode_meta(&blob) else {
+        let Some((body_size, i, h)) = decode_meta(&blob) else {
             return Ok(None);
         };
         let Ok(meta) = CacheMeta::deserialize(i, h) else {
@@ -189,8 +197,12 @@ impl Storage for DiskCache {
         let Ok(file) = tokio::fs::File::open(&body_p).await else {
             return Ok(None);
         };
-        let weight = file.metadata().await.map(|m| m.len() as usize).unwrap_or(0);
-        let hit = DiskHit { file, buf: vec![0u8; 64 * 1024], weight };
+        let actual = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        // Meta and body disagree (a concurrent writer replaced one) → miss.
+        if actual != body_size {
+            return Ok(None);
+        }
+        let hit = DiskHit { file, buf: vec![0u8; 64 * 1024], weight: actual as usize };
         Ok(Some((meta, Box::new(hit))))
     }
 
@@ -204,8 +216,7 @@ impl Storage for DiskCache {
         if let Some(dir) = body_p.parent() {
             tokio::fs::create_dir_all(dir).await.map_err(err("disk cache mkdir"))?;
         }
-        let (i, h) = meta.serialize()?;
-        let meta_blob = encode_meta(&i, &h);
+        let (meta_internal, meta_header) = meta.serialize()?;
         let tmp_body = tmp_sibling(&body_p);
         let file = tokio::fs::File::create(&tmp_body).await.map_err(err("disk cache create body"))?;
         Ok(Box::new(DiskMiss {
@@ -213,7 +224,8 @@ impl Storage for DiskCache {
             tmp_body,
             body_path: body_p,
             meta_path: meta_p,
-            meta_blob,
+            meta_internal,
+            meta_header,
             written: 0,
             done: false,
         }))
@@ -237,9 +249,11 @@ impl Storage for DiskCache {
         meta: &CacheMeta,
         _trace: &SpanHandle,
     ) -> Result<bool> {
-        let (meta_p, _) = self.paths(&key.combined());
+        let (meta_p, body_p) = self.paths(&key.combined());
         let (i, h) = meta.serialize()?;
-        let blob = encode_meta(&i, &h);
+        // Body is unchanged on a revalidation — preserve its size in the new meta.
+        let body_size = tokio::fs::metadata(&body_p).await.map(|m| m.len()).unwrap_or(0);
+        let blob = encode_meta(body_size, &i, &h);
         let tmp = tmp_sibling(&meta_p);
         tokio::fs::write(&tmp, &blob).await.map_err(err("disk cache update meta"))?;
         tokio::fs::rename(&tmp, &meta_p).await.map_err(err("disk cache publish meta"))?;
@@ -257,52 +271,95 @@ impl Storage for DiskCache {
 
 // ---- background reaper: bound total on-disk size ----
 
-/// Every 60s, if the cache dir exceeds `max_size`, delete the oldest files until
-/// it is back under ~90% of the cap. Runs in a plain thread (blocking IO). This
-/// also reclaims a previous run's files, so the bound survives restarts.
-pub fn spawn_reaper(root: PathBuf, max_size: u64) {
+type Entry = (PathBuf, u64, SystemTime, bool); // (path, size, mtime, is_tmp)
+
+/// Every 10s, bound the cache: keep total size under `max_size`, file count under
+/// `max_files` (inode-exhaustion guard), and at least `min_free` bytes free on
+/// the filesystem — evicting the oldest entries when any is exceeded. Also reaps
+/// temp files leaked by a hard kill. Runs in a plain thread (blocking IO), and
+/// reclaims a previous run's files so the bound survives restarts.
+pub fn spawn_reaper(root: PathBuf, max_size: u64, max_files: u64, min_free: u64) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(60));
-        reap(&root, max_size);
+        std::thread::sleep(Duration::from_secs(10));
+        reap(&root, max_size, max_files, min_free);
     });
 }
 
-fn reap(root: &Path, max_size: u64) {
-    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
-    let mut total: u64 = 0;
-    collect(root, &mut files, &mut total);
-    if total <= max_size {
+fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
+    let now = SystemTime::now();
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut total_size: u64 = 0;
+    collect(root, &mut entries, &mut total_size);
+    entries.sort_by_key(|e| e.2); // oldest first
+
+    // 1) Always delete leaked temp files (a hard kill left them behind); a fresh
+    //    temp is an in-progress write and is kept (but still counted).
+    entries.retain(|(p, sz, mtime, is_tmp)| {
+        let stale = *is_tmp
+            && now.duration_since(*mtime).map(|d| d > Duration::from_secs(300)).unwrap_or(false);
+        if stale {
+            if std::fs::remove_file(p).is_ok() {
+                total_size = total_size.saturating_sub(*sz);
+            }
+            false
+        } else {
+            true
+        }
+    });
+
+    // 2) Evict oldest until under every bound.
+    let mut count = entries.len() as u64;
+    let avail = avail_bytes(root).unwrap_or(u64::MAX);
+    if total_size <= max_size && count <= max_files && avail >= min_free {
         return;
     }
-    files.sort_by_key(|(_, _, mtime)| *mtime); // oldest first
-    let target = (max_size / 10) * 9;
-    for (p, sz, _) in files {
-        if total <= target {
+    let size_target = max_size / 10 * 9;
+    let count_target = max_files / 10 * 9;
+    let mut to_free_for_space = min_free.saturating_sub(avail);
+    for (p, sz, _, is_tmp) in entries {
+        if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
             break;
         }
+        if is_tmp {
+            continue; // never delete an in-progress write
+        }
         if std::fs::remove_file(&p).is_ok() {
-            total = total.saturating_sub(sz);
+            total_size = total_size.saturating_sub(sz);
+            count = count.saturating_sub(1);
+            to_free_for_space = to_free_for_space.saturating_sub(sz);
         }
     }
 }
 
-fn collect(dir: &Path, out: &mut Vec<(PathBuf, u64, SystemTime)>, total: &mut u64) {
+fn collect(dir: &Path, out: &mut Vec<Entry>, total: &mut u64) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for e in rd.flatten() {
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
             collect(&p, out, total);
-        } else {
-            // Skip in-progress temp writes.
-            if p.to_string_lossy().contains(".tmp.") {
-                continue;
-            }
-            if let Ok(md) = e.metadata() {
-                let sz = md.len();
-                *total += sz;
-                out.push((p, sz, md.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
-            }
+        } else if let Ok(md) = e.metadata() {
+            // Count temp files too (so slow/leaked writes can't hide from the cap).
+            let is_tmp = p.to_string_lossy().contains(".tmp.");
+            *total += md.len();
+            out.push((p, md.len(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH), is_tmp));
         }
     }
+}
+
+/// Free bytes on the filesystem holding `path` (via statvfs). None on failure.
+#[cfg(unix)]
+fn avail_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+        Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    } else {
+        None
+    }
+}
+#[cfg(not(unix))]
+fn avail_bytes(_path: &Path) -> Option<u64> {
+    None
 }

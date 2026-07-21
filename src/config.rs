@@ -136,6 +136,10 @@ pub struct DiskCacheCfg {
     pub dir: String,
     /// Soft cap on total on-disk size; a reaper evicts the oldest entries.
     pub max_size: u64,
+    /// Cap on the number of cache files (guards against inode exhaustion).
+    pub max_files: u64,
+    /// Keep at least this many free bytes on the filesystem; evict below it.
+    pub min_free: u64,
 }
 
 /// Automatic TLS via ACME (Let's Encrypt). Provisions a cert per `site` host
@@ -618,17 +622,26 @@ impl Config {
                 }
                 "cache-store" => match child_arg(node, "dir") {
                     Some(dir) => {
-                        let max_size = match child_arg(node, "max-size") {
-                            Some(s) => match parse_size(s) {
-                                Ok(v) => v,
-                                Err(e) => {
-                                    errs.push(format!("cache-store max-size: {e}"));
-                                    0
-                                }
-                            },
-                            None => 10 * 1024 * 1024 * 1024, // 10 GiB default
+                        let size = |name: &str, default: u64, errs: &mut Vec<String>| {
+                            match child_arg(node, name) {
+                                Some(s) => parse_size(s).unwrap_or_else(|e| {
+                                    errs.push(format!("cache-store {name}: {e}"));
+                                    default
+                                }),
+                                None => default,
+                            }
                         };
-                        disk_cache = Some(DiskCacheCfg { dir: dir.to_string(), max_size });
+                        let max_size = size("max-size", 10 * 1024 * 1024 * 1024, &mut errs);
+                        let min_free = size("min-free", 1024 * 1024 * 1024, &mut errs);
+                        let max_files = child_int(node, "max-files")
+                            .map(|v| v.max(1) as u64)
+                            .unwrap_or(1_000_000);
+                        disk_cache = Some(DiskCacheCfg {
+                            dir: dir.to_string(),
+                            max_size,
+                            max_files,
+                            min_free,
+                        });
                     }
                     None => errs.push("cache-store: `dir` is required".to_string()),
                 },
@@ -830,10 +843,13 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
                 .ok_or_else(|| format!("site `{host}`: upstream server needs an address"))?;
             let mut u = parse_upstream(a).map_err(|e| format!("site `{host}`: {e}"))?;
             if let Some(w) = prop_int(s, "weight") {
-                if w < 1 {
-                    return Err(format!("site `{host}`: server {a:?} weight must be ≥ 1"));
+                // Bounded (not up to u32::MAX): a huge weight with `balance ketama`
+                // would build a multi-GB hash ring and OOM at load/reload. 1000:1
+                // is already an extreme ratio.
+                if !(1..=1000).contains(&w) {
+                    return Err(format!("site `{host}`: server {a:?} weight must be 1..=1000"));
                 }
-                u.weight = w.min(u32::MAX as i128) as u32;
+                u.weight = w as u32;
             }
             servers.push(u);
         }

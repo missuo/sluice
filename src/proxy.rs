@@ -568,7 +568,12 @@ impl SluiceProxy {
             Option<&'static (dyn EvictionManager + Sync)>,
         ) = if let Some(dc) = cfg.load().disk_cache.clone() {
             let _ = std::fs::create_dir_all(&dc.dir);
-            crate::diskcache::spawn_reaper(dc.dir.clone().into(), dc.max_size);
+            crate::diskcache::spawn_reaper(
+                dc.dir.clone().into(),
+                dc.max_size,
+                dc.max_files,
+                dc.min_free,
+            );
             let disk: &'static crate::diskcache::DiskCache =
                 Box::leak(Box::new(crate::diskcache::DiskCache::new(dc.dir)));
             log::info!("sluice: response cache = disk");
@@ -797,6 +802,12 @@ impl ProxyHttp for SluiceProxy {
                         Some(&*CACHE_LOCK),
                         None,
                     );
+                    // Cap the cached object size mid-stream (aborts the cache
+                    // write when exceeded, without affecting the client stream) —
+                    // this bounds chunked responses that have no Content-Length.
+                    if cc.max_object > 0 {
+                        session.cache.set_max_file_size_bytes(cc.max_object);
+                    }
                 }
             }
         }

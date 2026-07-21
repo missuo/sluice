@@ -80,6 +80,14 @@ fn main() {
     conf.upstream_keepalive_pool_size = config.server.upstream_keepalive_pool;
     if let Some(sock) = &config.server.upgrade_sock {
         conf.upgrade_sock = sock.clone();
+    } else if upgrade {
+        // The FD handoff passes the listening sockets over this Unix socket. The
+        // Pingora default lives in world-writable /tmp; on a shared host a local
+        // user could squat it and hijack the sockets. Recommend a private path.
+        log::warn!(
+            "sluice: --upgrade with no `server.upgrade-sock` set; using the default in /tmp. \
+             Set upgrade-sock to a path in a 0700 dir (e.g. /run/sluice via systemd RuntimeDirectory)."
+        );
     }
 
     // `upgrade` makes bootstrap acquire the listening FDs from the old process

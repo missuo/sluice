@@ -2794,6 +2794,7 @@ dependencies = [
  "instant-acme",
  "ipnet",
  "kdl 6.7.1",
+ "libc",
  "log",
  "maxminddb",
  "pingora",
