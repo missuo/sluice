@@ -119,8 +119,8 @@ Sluice's niche is a **Cloudflare-fronted edge / API gateway**: it ships the
 things you'd otherwise bolt onto nginx with modules or pay NGINX Plus for
 (active health checks, GeoIP, Prometheus, anti-spoof client-IP, a WAF), with
 Caddy-style auto-TLS and config validation, on Pingora's Rust connection model.
-It is deliberately **not** a general nginx replacement — no HTTP/3, no disk
-cache, no scripting, and a smaller directive set (see DESIGN.md §2).
+It is deliberately **not** a general nginx replacement — no HTTP/3 (Pingora has
+no QUIC), no scripting, and a smaller directive set (see DESIGN.md §2).
 
 ## Build
 
