@@ -19,8 +19,9 @@ against live Let's Encrypt (staging + production).
 - Host-routed **sites**, then **path-routed `location` blocks** (prefix or
   `~regex`, first match wins) — nginx-style routing to different backends per path.
 - **Load-balanced upstream pools**: `upstream { server …; server …; balance … }`
-  with **round-robin / random / ip-hash** selection and connect-failure
-  **failover** to the next member. **Health checks**: passive by default (skip a
+  with **round-robin / random / ip-hash / ketama** selection, per-server
+  **`weight`**, and connect-failure **failover** to the next member. Ketama is
+  consistent hashing (scaling the pool only remaps ~1/n of clients). **Health checks**: passive by default (skip a
   backend for 10s after a failed connect) and optional **active** probing
   (`health-check { path … interval-secs … }`, like Caddy) that takes an
   unhealthy-but-reachable backend out of rotation proactively.
@@ -61,7 +62,7 @@ against live Let's Encrypt (staging + production).
 - Multi-core, graceful drain on SIGTERM, upstream keepalive pool.
 
 Roadmap (see DESIGN.md): true zero-downtime binary upgrade (SIGQUIT fd-handoff),
-config file-watch, Ketama/weighted balancing, response-body filters, disk cache.
+config file-watch, least-conn balancing, response-body filters, disk cache.
 
 ## Comparison with nginx and Caddy
 
@@ -83,8 +84,9 @@ Legend: ✅ built-in · 🔌 plugin/module · 💰 paid tier only · ❌ not ava
 | WebSocket passthrough | ✅ | ✅ | ✅ |
 | HTTP/2 | ✅ | ✅ | ✅ |
 | HTTP/3 (QUIC) | ❌ (Pingora has none) | ✅ | ✅ |
-| Load balancing | ✅ RR / random / ip-hash | ✅ + least-conn / weights | ✅ + least-conn / weights |
-| Weighted / Ketama balancing | ❌ (roadmap) | ✅ | ✅ |
+| Load balancing | ✅ RR / random / ip-hash / ketama | ✅ + least-conn | ✅ + least-conn |
+| Weighted backends | ✅ | ✅ | ✅ |
+| Consistent hashing (Ketama) | ✅ | 🔌 (`hash consistent`) | ✅ |
 | Passive health checks | ✅ | ✅ | ✅ |
 | Active health checks | ✅ | 💰 (NGINX Plus) | ✅ |
 | Response cache | ✅ in-memory LRU | ✅ disk-backed | 🔌 (Souin) |

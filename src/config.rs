@@ -147,15 +147,22 @@ pub struct Upstream {
     /// Host header to send upstream. None = preserve the client's Host.
     pub host_header: Option<String>,
     pub verify: bool,
+    /// Relative share of traffic (default 1). Used by round-robin, random, and
+    /// the size of this backend's arc on the Ketama ring.
+    pub weight: u32,
 }
 
 /// Load-balancing policy across a pool of backends.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Balance {
     RoundRobin,
     Random,
-    /// Sticky by client IP (same client → same backend while the pool is stable).
+    /// Sticky by client IP via plain modulo (simple; remaps everything when the
+    /// pool size changes — use `Ketama` if that matters).
     IpHash,
+    /// Sticky by client IP via a consistent-hash ring: adding/removing a backend
+    /// only remaps ~1/n of clients, and `weight` scales each backend's share.
+    Ketama,
 }
 
 /// One or more backends selected by a `Balance` policy, with connect-failure
@@ -166,6 +173,9 @@ pub struct UpstreamGroup {
     pub balance: Balance,
     /// Active background health checking for this pool (None = passive only).
     pub health_check: Option<HealthCheck>,
+    /// Precomputed Ketama hash ring `(point_hash → server index)`, sorted by
+    /// hash. Empty unless `balance` is `Ketama`. Built once at config load.
+    pub ring: Vec<(u64, usize)>,
 }
 
 /// Active health check (like Caddy's `health_checks active`): a background task
@@ -420,7 +430,31 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
         verify: tls,
         host,
         port,
+        weight: 1,
     })
+}
+
+/// Stable (run-independent) hash for Ketama ring points and key lookup.
+fn stable_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Build a Ketama consistent-hash ring: each backend gets `160 * weight` points,
+/// so its share of the key space is proportional to its weight and removing one
+/// backend only reshuffles that backend's arcs.
+fn build_ketama_ring(servers: &[Upstream]) -> Vec<(u64, usize)> {
+    let mut ring = Vec::new();
+    for (idx, s) in servers.iter().enumerate() {
+        let points = 160usize.saturating_mul(s.weight.max(1) as usize);
+        for p in 0..points {
+            ring.push((stable_hash(&format!("{}:{}-{p}", s.host, s.port)), idx));
+        }
+    }
+    ring.sort_by_key(|(h, _)| *h);
+    ring
 }
 
 const TOP_LEVEL: &[&str] = &[
@@ -750,16 +784,24 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
         for s in children.nodes().iter().filter(|n| n.name().value() == "server") {
             let a = first_arg(s)
                 .ok_or_else(|| format!("site `{host}`: upstream server needs an address"))?;
-            servers.push(parse_upstream(a).map_err(|e| format!("site `{host}`: {e}"))?);
+            let mut u = parse_upstream(a).map_err(|e| format!("site `{host}`: {e}"))?;
+            if let Some(w) = prop_int(s, "weight") {
+                if w < 1 {
+                    return Err(format!("site `{host}`: server {a:?} weight must be ≥ 1"));
+                }
+                u.weight = w.min(u32::MAX as i128) as u32;
+            }
+            servers.push(u);
         }
         if let Some(b) = child_arg(node, "balance") {
             balance = match b {
                 "round-robin" => Balance::RoundRobin,
                 "random" => Balance::Random,
                 "ip-hash" => Balance::IpHash,
+                "ketama" => Balance::Ketama,
                 other => {
                     return Err(format!(
-                        "site `{host}`: unknown balance {other:?} (round-robin|random|ip-hash)"
+                        "site `{host}`: unknown balance {other:?} (round-robin|random|ip-hash|ketama)"
                     ))
                 }
             };
@@ -772,7 +814,12 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
         Some(h) => Some(parse_health_check(h, host)?),
         None => None,
     };
-    Ok(UpstreamGroup { servers, balance, health_check })
+    let ring = if balance == Balance::Ketama {
+        build_ketama_ring(&servers)
+    } else {
+        Vec::new()
+    };
+    Ok(UpstreamGroup { servers, balance, health_check, ring })
 }
 
 fn parse_health_check(node: &KdlNode, host: &str) -> Result<HealthCheck, String> {

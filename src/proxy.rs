@@ -19,7 +19,9 @@ use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
 use pingora::proxy::{ProxyHttp, Session};
 
-use crate::config::{Balance, Config, Handler, RateLimit, UpstreamGroup, WafField, CF_RANGES};
+use crate::config::{
+    Balance, Config, Handler, RateLimit, Upstream, UpstreamGroup, WafField, CF_RANGES,
+};
 use crate::metrics::*;
 
 fn in_cloudflare(ip: IpAddr) -> bool {
@@ -320,6 +322,41 @@ fn fast_rand() -> u64 {
     x ^ (x >> 31)
 }
 
+/// Stable string hash (matches the Ketama ring builder in config.rs).
+fn str_hash(s: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut h);
+    h.finish()
+}
+
+/// Weighted random selection: pick a point in [0, total_weight) and walk.
+fn weighted_random(servers: &[Upstream]) -> usize {
+    let total: u64 = servers.iter().map(|s| s.weight as u64).sum();
+    if total == 0 {
+        return 0;
+    }
+    let mut r = fast_rand() % total;
+    for (i, s) in servers.iter().enumerate() {
+        let w = s.weight as u64;
+        if r < w {
+            return i;
+        }
+        r -= w;
+    }
+    servers.len() - 1
+}
+
+/// Ketama lookup: hash the key and take the first ring point clockwise.
+fn ketama_pick(ring: &[(u64, usize)], client_ip: &str) -> usize {
+    if ring.is_empty() {
+        return 0;
+    }
+    let h = str_hash(client_ip);
+    let i = ring.partition_point(|(rh, _)| *rh < h);
+    ring[i % ring.len()].1
+}
+
 /// How long a backend stays marked down after a connect failure.
 const HEALTH_COOLDOWN: Duration = Duration::from_secs(10);
 
@@ -442,8 +479,8 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
 pub struct SluiceProxy {
     cfg: Arc<ArcSwap<Config>>,
     limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
-    /// Round-robin cursor per (host, location index).
-    rr: Arc<DashMap<(String, usize), u64>>,
+    /// Smooth-weighted-round-robin state (current weights) per (host, location).
+    rr: Arc<DashMap<(String, usize), Vec<i64>>>,
     /// Passive health: "host:port" → instant until which it's considered down.
     health: Arc<DashMap<String, Instant>>,
     /// Active health: "host:port" → probe state (only for pools with a health-check).
@@ -486,27 +523,48 @@ impl SluiceProxy {
         self.health.insert(addr.to_string(), Instant::now() + HEALTH_COOLDOWN);
     }
 
-    /// Base index into the pool for this request (before failover offset).
+    /// Primary pool index for this request per the balance policy (failover then
+    /// walks forward from here, skipping down backends).
     fn lb_base(&self, host: &str, loc_idx: usize, group: &UpstreamGroup, client_ip: &str) -> usize {
         let n = group.servers.len();
         if n <= 1 {
             return 0;
         }
         match group.balance {
-            Balance::RoundRobin => {
-                let mut c = self.rr.entry((host.to_string(), loc_idx)).or_insert(0);
-                let v = *c;
-                *c = c.wrapping_add(1);
-                (v % n as u64) as usize
-            }
-            Balance::Random => (fast_rand() % n as u64) as usize,
-            Balance::IpHash => {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                client_ip.hash(&mut h);
-                (h.finish() % n as u64) as usize
+            Balance::RoundRobin => self.weighted_rr(host, loc_idx, &group.servers),
+            Balance::Random => weighted_random(&group.servers),
+            Balance::IpHash => (str_hash(client_ip) % n as u64) as usize,
+            Balance::Ketama => ketama_pick(&group.ring, client_ip),
+        }
+    }
+
+    /// Smooth weighted round-robin (Nginx's algorithm): each pick adds every
+    /// backend's weight to its running total, selects the max, then subtracts the
+    /// pool's total weight from the winner — even, weight-proportional, and
+    /// stateless across reloads (reset when the pool size changes).
+    fn weighted_rr(&self, host: &str, loc_idx: usize, servers: &[Upstream]) -> usize {
+        let n = servers.len();
+        let mut cw = self
+            .rr
+            .entry((host.to_string(), loc_idx))
+            .or_insert_with(|| vec![0i64; n]);
+        if cw.len() != n {
+            *cw = vec![0i64; n];
+        }
+        let mut total = 0i64;
+        let mut best = 0usize;
+        let mut best_cw = i64::MIN;
+        for (i, s) in servers.iter().enumerate() {
+            let w = s.weight as i64;
+            cw[i] += w;
+            total += w;
+            if cw[i] > best_cw {
+                best_cw = cw[i];
+                best = i;
             }
         }
+        cw[best] -= total;
+        best
     }
 
     /// Token bucket per (host, client-ip). Returns true if allowed.
