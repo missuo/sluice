@@ -61,7 +61,52 @@ against live Let's Encrypt (staging + production).
 - Multi-core, graceful drain on SIGTERM, upstream keepalive pool.
 
 Roadmap (see DESIGN.md): true zero-downtime binary upgrade (SIGQUIT fd-handoff),
-config file-watch, upstream pools/health-checks, ACME.
+config file-watch, Ketama/weighted balancing, response-body filters, disk cache.
+
+## Comparison with nginx and Caddy
+
+Legend: ✅ built-in · 🔌 plugin/module · 💰 paid tier only · ❌ not available
+
+| Feature | Sluice | nginx (OSS) | Caddy |
+| --- | :---: | :---: | :---: |
+| Written in | Rust (Pingora) | C | Go |
+| Single static binary | ✅ | ✅ | ✅ |
+| Config format | KDL | custom DSL | Caddyfile / JSON |
+| Config validation | ✅ semantic + `line:col` | ✅ syntax (`-t`) | ✅ |
+| Hot config reload | ✅ SIGHUP, fail-safe | ✅ SIGHUP | ✅ (API) |
+| Zero-downtime binary upgrade | ❌ (roadmap) | ✅ | ✅ |
+| Host (vhost) routing | ✅ | ✅ | ✅ |
+| Path routing (`location`) | ✅ prefix/regex | ✅ | ✅ |
+| Reverse proxy + keepalive pool | ✅ | ✅ | ✅ |
+| HTTPS upstreams + SNI + Host rewrite | ✅ | ✅ | ✅ |
+| SSE / streaming (unbuffered) | ✅ default | ⚠️ needs `proxy_buffering off` | ✅ |
+| WebSocket passthrough | ✅ | ✅ | ✅ |
+| HTTP/2 | ✅ | ✅ | ✅ |
+| HTTP/3 (QUIC) | ❌ (Pingora has none) | ✅ | ✅ |
+| Load balancing | ✅ RR / random / ip-hash | ✅ + least-conn / weights | ✅ + least-conn / weights |
+| Weighted / Ketama balancing | ❌ (roadmap) | ✅ | ✅ |
+| Passive health checks | ✅ | ✅ | ✅ |
+| Active health checks | ✅ | 💰 (NGINX Plus) | ✅ |
+| Response cache | ✅ in-memory LRU | ✅ disk-backed | 🔌 (Souin) |
+| Static file server | ✅ streamed | ✅ (sendfile) | ✅ |
+| Automatic TLS (ACME) | ✅ HTTP-01 | 🔌 (certbot, external) | ✅ (flagship) |
+| Dynamic SNI / multi-cert | ✅ | ✅ | ✅ |
+| Rate limiting | ✅ token bucket | ✅ (`limit_req`) | 🔌 |
+| WAF | ✅ regex rules (path/query/method/header) | 🔌 (ModSecurity) | 🔌 (Coraza) |
+| GeoIP (country / ASN / city) | ✅ built-in | 🔌 (geoip2) | 🔌 |
+| Prometheus metrics | ✅ built-in | ⚠️ basic `stub_status` / 🔌 exporter | ✅ built-in |
+| Trusted client-IP + anti-spoofing | ✅ | ⚠️ manual (`realip`) | ⚠️ manual |
+| Request-body size cap (streaming) | ✅ | ✅ | ✅ |
+| Response-body rewrite | ❌ (roadmap) | 🔌 (`sub_filter` for text) | 🔌 |
+| Scripting | ❌ (Rust plugins) | ✅ njs / 🔌 Lua | ❌ (Go plugins) |
+| TLS backends | OpenSSL / BoringSSL | OpenSSL | Go crypto / BoringSSL |
+
+Sluice's niche is a **Cloudflare-fronted edge / API gateway**: it ships the
+things you'd otherwise bolt onto nginx with modules or pay NGINX Plus for
+(active health checks, GeoIP, Prometheus, anti-spoof client-IP, a WAF), with
+Caddy-style auto-TLS and config validation, on Pingora's Rust connection model.
+It is deliberately **not** a general nginx replacement — no HTTP/3, no disk
+cache, no scripting, and a smaller directive set (see DESIGN.md §2).
 
 ## Build
 
