@@ -68,7 +68,7 @@ jobs:
           total=$(printf '%s\n' "$out" | grep -c .)
           headers=$(printf '%s\n' "$out" | grep -c '^config error in ')
           certs=$(printf '%s\n' "$out" | grep -c ': cert file not found: ')
-          roots=$(printf '%s\n' "$out" | grep -c ': file-server root not a directory: ')
+          roots=$(printf '%s\n' "$out" | grep -c ': file-server root not usable: ')
           echo "lines=$total header=$headers cert=$certs root=$roots"
           if [ "$headers" -ne 1 ] || [ "$certs" -ne 1 ] || [ "$roots" -ne 2 ] || [ "$total" -ne 4 ]; then
             echo "::error::--check output is not the exact expected error set (1 header + 1 cert + 2 root = 4 lines)"
@@ -77,7 +77,7 @@ jobs:
           # Belt-and-suspenders: every NON-BLANK line must match an allowed
           # pattern, so a new error that happened to keep the counts (it can't,
           # given the exact counts above, but be explicit) is still caught.
-          printf '%s\n' "$out" | grep . | grep -vqE '^config error in |: cert file not found: |: file-server root not a directory: ' \
+          printf '%s\n' "$out" | grep . | grep -vqE '^config error in |: cert file not found: |: file-server root not usable: ' \
             && { echo "::error::unexpected --check line present"; exit 1; } || true
 
   boringssl:

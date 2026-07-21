@@ -268,7 +268,16 @@ impl Matcher {
 /// What a matched location does with the request.
 pub enum Handler {
     Proxy(UpstreamGroup),
-    File { root: String, index: String },
+    File {
+        /// The docroot pinned by fd at config load (`SecureDir::open_ro`, which
+        /// refuses symlink components). Requests serve via `openat` from THIS
+        /// fd, so a low-priv user swapping the docroot path afterwards can't
+        /// re-route reads to another directory (a per-request re-open would).
+        root_fd: std::sync::Arc<crate::dirs::SecureDir>,
+        /// Kept for the access log and the cache-epoch fingerprint.
+        root: String,
+        index: String,
+    },
 }
 
 /// A path-routed block inside a `site`. Locations are matched in declaration
@@ -515,7 +524,22 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     } else {
         (false, s, 0u16, false)
     };
+    // An upstream is an ORIGIN (host[:port]), not a URL. Reject a query/fragment
+    // outright (`https://h?x`, `https://h#y`) — for BOTH forms, since the bare
+    // form's suffix was previously unchecked and silently dropped.
+    if rest.contains('?') || rest.contains('#') {
+        return Err(format!(
+            "upstream {s:?}: query/fragment not allowed — give just host[:port]"
+        ));
+    }
     let hostport = rest.split('/').next().unwrap_or(rest);
+    // A path is not allowed in EITHER form (`127.0.0.1:9/path` used to drop it).
+    let after_authority = &rest[hostport.len()..];
+    if !after_authority.is_empty() && after_authority != "/" {
+        return Err(format!(
+            "upstream {s:?}: a path is not allowed — give just the origin host[:port]"
+        ));
+    }
     let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
         // IPv6 literal: `[::1]` or `[::1]:8080`. Host keeps no brackets.
         let (addr, after) = rest
@@ -554,23 +578,16 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     if host.is_empty() {
         return Err(format!("upstream {s:?}: empty host"));
     }
-    // Strict authority: reject whitespace/control/userinfo in the host (which
-    // would corrupt the connection target or SNI), and a silently-dropped path/
-    // query/fragment (an upstream is an ORIGIN, not a URL — `https://h/v1` used
-    // to quietly become `https://h`).
+    if port == 0 {
+        return Err(format!("upstream {s:?}: port 0 is not valid"));
+    }
+    // Strict authority: reject whitespace/control/userinfo in the host, which
+    // would corrupt the connection target or SNI.
     if host
         .bytes()
         .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'@')
     {
         return Err(format!("upstream {s:?}: invalid host {host:?}"));
-    }
-    if url_form {
-        let after_authority = &rest[hostport.len()..];
-        if !after_authority.is_empty() && after_authority != "/" {
-            return Err(format!(
-                "upstream {s:?}: a URL path/query is not allowed — give just the origin host[:port]"
-            ));
-        }
     }
     Ok(Upstream {
         sni: host.clone(),
@@ -1339,13 +1356,26 @@ impl Config {
         }
         // Two acceptors on one address both try to bind → the second fails at
         // startup, after --check said ok. Compare PARSED addresses so `:19550`
-        // and `:019550` (same socket, different string) are caught too.
+        // and `:019550` (same socket, different string) are caught too — AND
+        // treat a wildcard (unspecified, `0.0.0.0`/`[::]`) as conflicting with
+        // ANY same-family address on the same port, since `0.0.0.0:80` already
+        // binds `127.0.0.1:80` (a plain-equality check let that pair through).
         use std::net::SocketAddr;
         let paddr = |s: &str| s.parse::<SocketAddr>().ok();
+        let conflict = |a: &SocketAddr, b: &SocketAddr| -> bool {
+            a.port() == b.port()
+                && a.is_ipv4() == b.is_ipv4()
+                && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
+        };
         for (i, l) in listeners.iter().enumerate() {
-            let a = paddr(&l.addr);
-            if a.is_some() && listeners[..i].iter().any(|p| paddr(&p.addr) == a) {
-                errs.push(format!("duplicate listener address `{}`", l.addr));
+            if let Some(a) = paddr(&l.addr) {
+                if listeners[..i]
+                    .iter()
+                    .filter_map(|p| paddr(&p.addr))
+                    .any(|b| conflict(&a, &b))
+                {
+                    errs.push(format!("conflicting listener address `{}`", l.addr));
+                }
             }
         }
         // metrics-addr is bound at startup; validate it, and reject a collision
@@ -1356,7 +1386,12 @@ impl Config {
                 None => errs.push(format!(
                     "server metrics-addr {m:?}: not a valid socket address"
                 )),
-                Some(ma) if listeners.iter().any(|l| paddr(&l.addr) == Some(ma)) => {
+                Some(ma)
+                    if listeners
+                        .iter()
+                        .filter_map(|l| paddr(&l.addr))
+                        .any(|l| conflict(&ma, &l)) =>
+                {
                     errs.push(format!(
                         "server metrics-addr {m:?} collides with a listener address"
                     ));
@@ -1694,11 +1729,14 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
             let root = child_arg(f, "root")
                 .ok_or_else(|| format!("site `{host}`: file-server missing root"))?
                 .to_string();
-            if !Path::new(&root).is_dir() {
-                return Err(format!(
-                    "site `{host}`: file-server root not a directory: {root}"
-                ));
-            }
+            // Pin the docroot by fd NOW, refusing symlink components — instead of
+            // `Path::is_dir` (which follows symlinks) + a per-request path re-open
+            // (which a swapped docroot could re-route to a root-only dir). The fd
+            // is held in the config snapshot and every request `openat`s from it.
+            let root_fd = std::sync::Arc::new(
+                crate::dirs::SecureDir::open_ro(&root)
+                    .map_err(|e| format!("site `{host}`: file-server root not usable: {e}"))?,
+            );
             let index = child_arg(f, "index").unwrap_or("index.html").to_string();
             // The index is appended as a path component when a directory is
             // requested, so it MUST be a single, plain basename — `index
@@ -1716,7 +1754,11 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
                     "site `{host}`: file-server index must be a plain filename, not {index:?}"
                 ));
             }
-            Ok(Handler::File { root, index })
+            Ok(Handler::File {
+                root_fd,
+                root,
+                index,
+            })
         }
         (None, None) => Err(format!("site `{host}`: needs an upstream or a file-server")),
     }
@@ -1980,7 +2022,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
                         );
                     }
                 }
-                Handler::File { root, index } => {
+                Handler::File { root, index, .. } => {
                     let _ = write!(fp, "F{root}:{index}\u{1f}");
                 }
             }
@@ -2325,9 +2367,7 @@ mod tests {
         ))
         .contains("invalid header name"));
         // upstream URL: space in authority, dropped path, and userinfo.
-        assert!(
-            parse_err(&cfg_with(" upstream \"https://bad host/path\"")).contains("invalid host")
-        );
+        assert!(parse_err(&cfg_with(" upstream \"https://bad host\"")).contains("invalid host"));
         assert!(parse_err(&cfg_with(" upstream \"https://api.test/v1\"")).contains("path"));
         assert!(
             parse_err(&cfg_with(" upstream \"https://user@api.test\"")).contains("invalid host")
@@ -2335,15 +2375,48 @@ mod tests {
     }
 
     #[test]
+    fn strict_schema_rejects_round10_silent_values() {
+        // upstream: query, fragment, path in the BARE form, and port 0.
+        assert!(
+            parse_err(&cfg_with(" upstream \"https://api.test?x=1\"")).contains("query/fragment")
+        );
+        assert!(
+            parse_err(&cfg_with(" upstream \"https://api.test#frag\"")).contains("query/fragment")
+        );
+        assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:9/path\"")).contains("path"));
+        assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:0\"")).contains("port 0"));
+    }
+
+    #[test]
+    fn wildcard_listener_and_metrics_conflicts() {
+        // 0.0.0.0:P already binds 127.0.0.1:P — must be flagged (plain
+        // SocketAddr equality let this pair through).
+        let dup = "listener \"0.0.0.0:28580\" {\n redirect-to-https true\n}\nlistener \"127.0.0.1:28580\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n";
+        assert!(
+            parse_err(dup).contains("conflicting listener"),
+            "{}",
+            parse_err(dup)
+        );
+        // metrics on a wildcard-overlapping listener port.
+        let m = "server {\n metrics-addr \"127.0.0.1:28580\"\n}\nlistener \"0.0.0.0:28580\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n";
+        assert!(parse_err(m).contains("collides"), "{}", parse_err(m));
+        // A different port is fine.
+        let ok = "server {\n metrics-addr \"127.0.0.1:28581\"\n}\nlistener \"0.0.0.0:28580\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n";
+        assert!(Config::parse(ok).is_ok());
+    }
+
+    #[test]
     fn file_server_index_must_be_a_basename() {
         // `index "../Cargo.toml"` used to pass --check and escape the docroot.
-        let bad = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n file-server {\n root \".\"\n index \"../Cargo.toml\"\n }\n}\n";
+        // Use a real docroot (`src` exists in the crate root, where tests run) so
+        // the docroot-fd open succeeds and index validation is reached.
+        let bad = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n file-server {\n root \"src\"\n index \"../Cargo.toml\"\n }\n}\n";
         assert!(
             parse_err(bad).contains("plain filename"),
             "{}",
             parse_err(bad)
         );
-        let abs = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n file-server {\n root \".\"\n index \"/etc/passwd\"\n }\n}\n";
+        let abs = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n file-server {\n root \"src\"\n index \"/etc/passwd\"\n }\n}\n";
         assert!(parse_err(abs).contains("plain filename"));
     }
 

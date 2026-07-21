@@ -121,8 +121,12 @@ The parser uses **KDL v1 grammar** (`KdlDocument::parse_v1`):
 
 These were fixed after review; a change that reverts any of them is a bug:
 
-- **Path normalization** (`normalize_path`) runs before WAF / `deny` / location
-  matching, so `%2e`/`//`/`..` can't bypass them. Match on the normalized path.
+- **Path normalization** (`normalize_path`) decodes percent-escapes REPEATEDLY
+  until stable, THEN collapses `//`/`.`/`..`, producing ONE canonical view that
+  WAF, `deny`, redirects, and location routing all match — so multi-encoding
+  (`%252e%252e`, `/adm%2569n`) can't bypass a check a deeper origin decode would
+  reach. It fails closed (400) on non-stabilizing / over-long paths. Always match
+  on this canonical path, never a single-decode or the raw path alone.
 - **Cache never crosses auth boundaries**: a request with `Authorization` or a
   `Cookie` is only cacheable if the origin says `Cache-Control: public`; responses
   with `Set-Cookie` or a non-`Accept-Encoding` `Vary` are never cached.
@@ -148,11 +152,13 @@ These were fixed after review; a change that reverts any of them is a bug:
   downgrade to in-memory); a cache LOOKUP must never create dirs (use `sub_open`,
   not `sub`); `--check` uses read-only `dirs::validate` (fails on any
   non-`NotFound` error).
-- **Static files are served race-free**: descend from the docroot with
-  `openat`/`O_NOFOLLOW` per component (rejecting `.`/`..`/separators); never
-  `canonicalize`→`open` (TOCTOU), and take `Content-Length` from `fstat` on the
-  streamed fd. Symlinks under the root are not followed. The `file-server index`
-  is validated to be a single basename at config load.
+- **Static files are served from a docroot pinned by fd** at config load
+  (`SecureDir::open_ro`, refusing symlink components), held in the config
+  snapshot: each request `openat`s the file FROM that fd (`open_file_under`,
+  `O_NOFOLLOW` per component), NEVER re-resolving a docroot path string — so a
+  swapped docroot can't re-route reads. `Content-Length` from `fstat` on the
+  streamed fd. The `file-server index` is validated to a single basename at load.
+  Never reintroduce a per-request path open of the docroot.
 - **Cache entries and ACME certs are single-file + one atomic rename** — never
   split state across two files whose renames can be separated by a crash. The
   cache key is namespaced by a per-site config epoch (a reload can't serve a

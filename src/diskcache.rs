@@ -23,8 +23,9 @@
 //! only ever touches files matching the cache's exact naming.
 
 use std::any::Any;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -41,6 +42,32 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use crate::dirs::SecureDir;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Temp files currently held open by a live miss-writer. The reaper's stale-temp
+/// sweep skips these, so a long write (e.g. a slow SSE/stream whose read-timeout
+/// exceeds the 300 s stale threshold) can't have its temp deleted out from under
+/// it — which would fail the final publish `renameat`. Names are process-unique
+/// (`.tmp.<pid>.<seq>.<nanos>`), so the name alone identifies the writer. After a
+/// restart the set is empty, so genuinely-leaked temps from a prior run are
+/// still reaped.
+static ACTIVE_TMPS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+
+fn tmp_active_insert(name: &str) {
+    if let Ok(mut s) = ACTIVE_TMPS.lock() {
+        s.insert(name.to_string());
+    }
+}
+fn tmp_active_remove(name: &str) {
+    if let Ok(mut s) = ACTIVE_TMPS.lock() {
+        s.remove(name);
+    }
+}
+fn tmp_is_active(name: &str) -> bool {
+    ACTIVE_TMPS
+        .lock()
+        .map(|s| s.contains(name))
+        .unwrap_or(false)
+}
 
 /// Sanity cap on the serialized meta (internal + header) length read back from
 /// disk — a corrupt length field must not trigger a huge allocation.
@@ -201,6 +228,8 @@ impl HandleMiss for DiskMiss {
 
 impl Drop for DiskMiss {
     fn drop(&mut self) {
+        // Runs after finish() (which consumes self) too, so it always fires.
+        tmp_active_remove(&self.tmp);
         if !self.done {
             let _ = self.shard.remove(&self.tmp);
         }
@@ -262,6 +291,8 @@ impl Storage for DiskCache {
         let tmp = tmp_name();
         let mut file =
             tokio::fs::File::from_std(shard.create_new(&tmp).map_err(err("disk cache create"))?);
+        // Protect this temp from the reaper's stale sweep while we hold it open.
+        tmp_active_insert(&tmp);
         // Body size stamped at finish; 0 for now.
         file.write_all(&encode_prefix(0, internal.len(), header.len()))
             .await
@@ -461,10 +492,13 @@ fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
     let mut total_size: u64 = 0;
     collect(root, &mut entries, &mut total_size);
 
-    // 1) Delete stale temps (a hard kill left them; a fresh temp is an
-    //    in-progress write, kept but counted) and legacy files on sight.
+    // 1) Delete stale temps (a hard kill left them) and legacy files on sight.
+    //    A temp still HELD by a live writer (in ACTIVE_TMPS) is never deleted,
+    //    however old — a slow stream can legitimately hold one past 300 s, and
+    //    deleting it would fail the writer's publish `renameat`.
     entries.retain(|e| {
         let stale_tmp = e.5 == Kind::Tmp
+            && !tmp_is_active(&e.2)
             && now
                 .duration_since(e.4)
                 .map(|d| d > Duration::from_secs(300))
@@ -638,6 +672,49 @@ mod tests {
         );
         assert!(dir.join("01").join("keep.dat").exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reaper_spares_active_temp_however_stale() {
+        let dir0 = std::env::temp_dir().join(format!("sluice-active-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        std::fs::create_dir_all(dir0.join("ab").join("cd")).unwrap();
+        let dir = std::fs::canonicalize(&dir0).unwrap();
+        // An OLD temp (year-2020 mtime) that a live writer still holds.
+        let held = ".tmp.999999.0.0";
+        let held_path = dir.join("ab").join("cd").join(held);
+        std::fs::write(&held_path, b"partial").unwrap();
+        set_old_mtime(&held_path);
+        // A leaked temp from a dead process (not in the active set).
+        let leaked = ".tmp.111111.0.0";
+        let leaked_path = dir.join("ab").join("cd").join(leaked);
+        std::fs::write(&leaked_path, b"leaked").unwrap();
+        set_old_mtime(&leaked_path);
+
+        tmp_active_insert(held); // writer registers its temp
+        let root = SecureDir::provision(dir.to_str().unwrap()).unwrap();
+        reap(&root, u64::MAX, u64::MAX, 0);
+        assert!(
+            held_path.exists(),
+            "an active writer's temp must NOT be reaped"
+        );
+        assert!(!leaked_path.exists(), "a stale leaked temp MUST be reaped");
+        tmp_active_remove(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn set_old_mtime(p: &std::path::Path) {
+        let old = std::time::SystemTime::now() - Duration::from_secs(400);
+        let d = old.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ts = libc::timespec {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_nsec: d.subsec_nanos() as _,
+        };
+        let c = std::ffi::CString::new(p.to_str().unwrap()).unwrap();
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [ts, ts].as_ptr(), 0) },
+            0
+        );
     }
 
     #[test]

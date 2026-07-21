@@ -169,25 +169,35 @@ fn decode_once(s: &str, plus_is_space: bool) -> String {
 /// `.`, resolve `..`, and reject control/NUL bytes or non-UTF-8. Returns None
 /// for a malformed path (caller responds 400). Preserves a trailing slash.
 pub fn normalize_path(raw: &str) -> Option<String> {
-    let b = raw.as_bytes();
-    let mut dec = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%' {
-            let (h, l) = (hex_val(*b.get(i + 1)?)?, hex_val(*b.get(i + 2)?)?);
-            dec.push(h * 16 + l);
-            i += 3;
-        } else {
-            dec.push(b[i]);
-            i += 1;
+    // Percent-decode REPEATEDLY until the bytes stop changing, THEN collapse.
+    // Deciding on a single fully-decoded canonical view is what defeats
+    // multi-encoding: `%252e%252e` (→ `%2e%2e` → `..`) and `/adm%2569n`
+    // (→ `/adm%69n` → `/admin`) collapse to the same string that WAF, `deny`,
+    // redirects, and location routing all match on — so a deeper decode by the
+    // origin can't reach a path the proxy didn't see. Fail closed (→ 400) if it
+    // won't stabilize (pathological over-encoding) or is over-long.
+    if raw.len() > 8192 {
+        return None;
+    }
+    let mut cur = raw.as_bytes().to_vec();
+    let mut stable = false;
+    for _ in 0..16 {
+        let next = decode_percent_once(&cur);
+        if next == cur {
+            stable = true;
+            break;
         }
+        cur = next;
+    }
+    if !stable {
+        return None;
     }
     // Reject NUL and control bytes (0x00–0x1F, 0x7F) — never valid in a path and
     // a classic filter-evasion / smuggling vector.
-    if dec.iter().any(|&c| c < 0x20 || c == 0x7f) {
+    if cur.iter().any(|&c| c < 0x20 || c == 0x7f) {
         return None;
     }
-    let s = std::str::from_utf8(&dec).ok()?;
+    let s = std::str::from_utf8(&cur).ok()?;
     let trailing = s.len() > 1 && s.ends_with('/');
     let mut segs: Vec<&str> = Vec::new();
     for seg in s.split('/') {
@@ -205,6 +215,25 @@ pub fn normalize_path(raw: &str) -> Option<String> {
         out.push('/');
     }
     Some(out)
+}
+
+/// One percent-decode pass over raw path bytes (leaves a `%` that isn't a valid
+/// `%XX` escape untouched, so decoding terminates).
+fn decode_percent_once(b: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
 }
 
 async fn redirect(
@@ -233,107 +262,15 @@ async fn send_status(session: &mut Session, status: u16, hsts: Option<&str>) -> 
     Ok(())
 }
 
-/// Serve a static file from `root`, streamed in chunks off the async runtime so
-/// a large file (or slow FS) never blocks the worker or buffers the whole body
-/// in memory. Path traversal is rejected two ways: `..` components up front, and
-/// a canonicalized-under-root check.
-/// Open `root/comps...` as a regular file WITHOUT following any symlink below
-/// the root, resolving each component relative to the previously-opened
-/// directory fd so nothing can be swapped mid-walk (TOCTOU-free). Returns a
-/// tokio `File`; any symlink/missing/not-a-file component is an `Err`.
-#[cfg(unix)]
-fn open_regular_under(
-    root: &std::path::Path,
-    comps: &[String],
-) -> std::io::Result<tokio::fs::File> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
-
-    let cstr = |b: &[u8]| {
-        CString::new(b).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL"))
-    };
-    // Defense in depth: reject any unsafe component here too, so this function is
-    // safe regardless of how comps were built (the caller already filters, and
-    // the file-server index is validated at config load).
-    let comp_cstr = |name: &str| -> std::io::Result<CString> {
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "unsafe path component",
-            ));
-        }
-        cstr(name.as_bytes())
-    };
-    // The docroot itself is admin-controlled — open it following symlinks.
-    let root_c = cstr(root.as_os_str().as_bytes())?;
-    let base = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
-    if base < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let mut dir = unsafe { OwnedFd::from_raw_fd(base) };
-    let (parents, last) = comps.split_at(comps.len() - 1);
-    for comp in parents {
-        let c = comp_cstr(comp)?;
-        // O_NOFOLLOW: a symlinked intermediate dir yields ELOOP → error.
-        let fd = unsafe {
-            libc::openat(
-                dir.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        dir = unsafe { OwnedFd::from_raw_fd(fd) };
-    }
-    let c = comp_cstr(&last[0])?;
-    let fd = unsafe {
-        libc::openat(
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW,
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let f = unsafe { std::fs::File::from_raw_fd(fd) };
-    if !f.metadata()?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a regular file",
-        ));
-    }
-    Ok(tokio::fs::File::from_std(f))
-}
-
-#[cfg(not(unix))]
-fn open_regular_under(
-    root: &std::path::Path,
-    comps: &[String],
-) -> std::io::Result<tokio::fs::File> {
-    // Non-unix fallback: canonicalize + containment check (not TOCTOU-free, but
-    // unix is the only deploy target).
-    let mut p = std::path::PathBuf::from(root);
-    for c in comps {
-        p.push(c);
-    }
-    let real = std::fs::canonicalize(&p)?;
-    let base = std::fs::canonicalize(root)?;
-    if !real.starts_with(&base) || !std::fs::metadata(&real)?.is_file() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "outside root or not a file",
-        ));
-    }
-    Ok(tokio::fs::File::from_std(std::fs::File::open(&real)?))
-}
-
+/// Serve a static file from the docroot pinned by `root_fd` (opened once at
+/// config load, symlink-free). The file is opened via `openat` FROM that fd —
+/// never by re-resolving a path string — so a low-priv user swapping the docroot
+/// path afterwards can't re-route reads, and no symlink UNDER the root is
+/// followed. Streamed in chunks off the async runtime; the Content-Length comes
+/// from `fstat` on the SAME fd streamed, so length and bytes can't disagree.
 async fn serve_file(
     session: &mut Session,
-    root: &str,
+    root_fd: std::sync::Arc<crate::dirs::SecureDir>,
     index: &str,
     req_path: &str,
     hsts: Option<&str>,
@@ -374,18 +311,13 @@ async fn serve_file(
         comps.last().map(String::as_str).unwrap_or(""),
     ));
 
-    // Open the file RACE-FREE: descend from the root one component at a time with
-    // `O_NOFOLLOW`, so no directory or the final file can be swapped for a
-    // symlink between a check and the open (the classic TOCTOU that let a
-    // writable docroot leak files outside root). Symlinks UNDER the root are not
-    // followed (nginx `disable_symlinks` semantics) — the docroot itself may be
-    // one (admin-controlled). The Content-Length then comes from `fstat` on the
-    // SAME fd we stream, so length and bytes can't disagree.
-    let root_owned = root.to_string();
-    let open_res =
-        tokio::task::spawn_blocking(move || open_regular_under(root_owned.as_ref(), &comps)).await;
+    // Open the file via `openat` FROM the pinned docroot fd, descending one
+    // component at a time with `O_NOFOLLOW` — no path re-resolution, so the
+    // docroot can't be re-routed and no symlink under it is followed. Blocking
+    // openat syscalls run on the blocking pool.
+    let open_res = tokio::task::spawn_blocking(move || root_fd.open_file_under(&comps)).await;
     let file = match open_res {
-        Ok(Ok(f)) => f,
+        Ok(Ok(f)) => tokio::fs::File::from_std(f),
         // ELOOP (a symlink under root), ENOENT, ENOTDIR, or "not a regular file".
         _ => return send_status(session, 404, hsts).await,
     };
@@ -1367,9 +1299,11 @@ impl ProxyHttp for SluiceProxy {
             }
         }
 
-        // Normalize the path so matching sees what the backend will (defeats
-        // %2e/%2f/`//`/`.`/`..` evasion of WAF, deny, and location routing).
-        // Owned so it can be re-read after a `&mut session` call (send_status).
+        // Canonical path: `normalize_path` now decodes-until-stable THEN
+        // collapses, so `path` is the single fully-decoded view that WAF, deny,
+        // redirects, and routing ALL match on — a multi-encoded traversal or
+        // payload can't reach a form the origin sees but the proxy didn't.
+        // (Owned so it can be re-read after a `&mut session` call.)
         let raw_path = session.req_header().uri.path().to_owned();
         let Some(path) = normalize_path(&raw_path) else {
             send_status(session, 400, hsts).await?;
@@ -1377,12 +1311,11 @@ impl ProxyHttp for SluiceProxy {
         };
 
         // WAF (site-wide) → block matching requests. Skip all of it — including
-        // the query/path decode — when the site has no rules (most requests).
+        // the query decode — when the site has no rules (most requests).
         if !site.waf.is_empty() {
             let has_query_rule = site.waf.iter().any(|r| matches!(r.field, WafField::Query));
-            let has_path_rule = site.waf.iter().any(|r| matches!(r.field, WafField::Path));
-            // Only pay for the raw copy + multi-round decode when a rule of that
-            // kind actually exists.
+            // Only pay for the raw-query copy + multi-round decode when a query
+            // rule actually exists.
             let (raw_query, decoded_query) = if has_query_rule {
                 let raw = session.req_header().uri.query().unwrap_or("").to_owned();
                 let (decoded, stable) = decode_query(&raw);
@@ -1394,30 +1327,12 @@ impl ProxyHttp for SluiceProxy {
             } else {
                 (String::new(), String::new())
             };
-            // The PATH gets the same treatment as the query: `normalize_path`
-            // only decodes ONCE (matching what a well-behaved backend sees), so
-            // a double-encoded `union%2520select` slips a path rule and could be
-            // re-decoded by the app. Also match the raw path and the
-            // decode-until-stable path, and fail closed if it won't stabilize.
-            let decoded_path = if has_path_rule {
-                let (decoded, stable) = decode_until_stable(&raw_path, false);
-                if !stable {
-                    send_status(session, 403, hsts).await?;
-                    return Ok(true);
-                }
-                decoded
-            } else {
-                String::new()
-            };
             for rule in &site.waf {
                 let blocked = match &rule.field {
-                    // Normalized (backend-view) path OR raw OR fully-decoded, so
-                    // neither single- nor multi-encoding evades the rule.
-                    WafField::Path => {
-                        rule.re.is_match(&path)
-                            || rule.re.is_match(&raw_path)
-                            || rule.re.is_match(&decoded_path)
-                    }
+                    // The fully-canonical path OR the raw (as-sent) path, so a
+                    // rule written against either the literal or the encoded form
+                    // matches, and no depth of encoding evades it.
+                    WafField::Path => rule.re.is_match(&path) || rule.re.is_match(&raw_path),
                     // Match both the raw query AND its fully-decoded form, so an
                     // attacker can't slip `union%20select` / `union%2520select`
                     // past a rule written against the literal payload.
@@ -1477,8 +1392,8 @@ impl ProxyHttp for SluiceProxy {
 
         match &loc.handler {
             // static file server → serve here and short-circuit
-            Handler::File { root, index } => {
-                serve_file(session, root, index, &path, hsts).await?;
+            Handler::File { root_fd, index, .. } => {
+                serve_file(session, root_fd.clone(), index, &path, hsts).await?;
                 return Ok(true);
             }
             // proxy → choose the pool member now (round-robin cursor advances once)
@@ -1891,6 +1806,24 @@ mod tests {
             Some("/etc/passwd")
         );
         assert!(normalize_path("/a\u{0}b").is_none()); // NUL rejected
+                                                       // MULTI-encoding must collapse to the SAME canonical view (the round-10
+                                                       // bypass): `/%2e%2e/admin` and `/%252e%252e/admin` both → `/admin`, and
+                                                       // `/adm%2569n` (→ %69 → i) → `/admin`. So WAF/deny/routing can't be
+                                                       // slipped by a deeper origin-side decode.
+        assert_eq!(normalize_path("/%2e%2e/admin").as_deref(), Some("/admin"));
+        assert_eq!(
+            normalize_path("/%252e%252e/admin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(
+            normalize_path("/%25252e%25252e/admin").as_deref(),
+            Some("/admin")
+        );
+        assert_eq!(normalize_path("/adm%2569n").as_deref(), Some("/admin"));
+        // Encoded slash decodes and splits (segment can't hide a traversal).
+        assert_eq!(normalize_path("/a%2f..%2fadmin").as_deref(), Some("/admin"));
+        // Pathologically over-encoded / over-long → fail closed (400).
+        assert!(normalize_path(&("%25".repeat(9000))).is_none());
     }
 
     #[test]
@@ -1930,36 +1863,44 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
-    fn open_regular_under_refuses_symlink_escape() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async {
-            let base = std::env::temp_dir().join(format!("sluice-static-{}", std::process::id()));
-            let _ = std::fs::remove_dir_all(&base);
-            let root = base.join("www");
-            std::fs::create_dir_all(&root).unwrap();
-            std::fs::write(root.join("ok.txt"), b"public").unwrap();
-            std::fs::write(base.join("secret"), b"TOPSECRET").unwrap();
-            // A real file under root opens and reports the correct length.
-            let f =
-                open_regular_under(&root, &["ok.txt".to_string()]).expect("real file must open");
-            assert_eq!(f.metadata().await.unwrap().len(), 6);
-            // A symlink under root pointing OUTSIDE must not be followed.
-            std::os::unix::fs::symlink(base.join("secret"), root.join("leak")).unwrap();
-            assert!(
-                open_regular_under(&root, &["leak".to_string()]).is_err(),
-                "symlink escape must be refused (O_NOFOLLOW)"
-            );
-            // A symlinked intermediate directory must not be followed either.
-            std::os::unix::fs::symlink(&base, root.join("up")).unwrap();
-            assert!(
-                open_regular_under(&root, &["up".to_string(), "secret".to_string()]).is_err(),
-                "symlinked parent dir must be refused"
-            );
-            let _ = std::fs::remove_dir_all(&base);
-        });
+    fn docroot_fd_serves_real_files_and_refuses_symlink_escape() {
+        let base0 = std::env::temp_dir().join(format!("sluice-static-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base0);
+        std::fs::create_dir_all(&base0).unwrap();
+        let base = std::fs::canonicalize(&base0).unwrap(); // macOS /var symlink
+        let root = base.join("www");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.txt"), b"public").unwrap();
+        std::fs::write(base.join("secret"), b"TOPSECRET").unwrap();
+
+        // Pin the docroot by fd (as config load does).
+        let rf = crate::dirs::SecureDir::open_ro(root.to_str().unwrap()).unwrap();
+        // A real file under root opens and reports the correct length.
+        let f = rf.open_file_under(&["ok.txt".to_string()]).unwrap();
+        assert_eq!(f.metadata().unwrap().len(), 6);
+        // A symlink UNDER root pointing outside must not be followed.
+        std::os::unix::fs::symlink(base.join("secret"), root.join("leak")).unwrap();
+        assert!(rf.open_file_under(&["leak".to_string()]).is_err());
+        // A symlinked intermediate dir must not be followed either.
+        std::os::unix::fs::symlink(&base, root.join("up")).unwrap();
+        assert!(rf
+            .open_file_under(&["up".to_string(), "secret".to_string()])
+            .is_err());
+
+        // The docroot-swap attack: replace the docroot PATH with a symlink to a
+        // sibling. The pinned fd still serves the ORIGINAL inode, not the swap.
+        std::fs::write(base.join("evil.txt"), b"ATTACKER").unwrap();
+        let evildir = base.join("evildir");
+        std::fs::create_dir(&evildir).unwrap();
+        std::fs::write(evildir.join("ok.txt"), b"SWAPPED!").unwrap();
+        std::fs::remove_dir_all(&root).unwrap(); // remove original docroot path
+        std::os::unix::fs::symlink(&evildir, &root).unwrap(); // path now → attacker dir
+                                                              // A NEW open_ro of the (now-symlinked) path is refused…
+        assert!(crate::dirs::SecureDir::open_ro(root.to_str().unwrap()).is_err());
+        // …and the already-pinned fd still can't find ok.txt (original inode
+        // was removed) — it never resolves the swapped path.
+        assert!(rf.open_file_under(&["ok.txt".to_string()]).is_err());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

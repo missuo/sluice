@@ -176,6 +176,53 @@ mod unix {
             Ok(SecureDir { fd: cur })
         }
 
+        /// Open an EXISTING directory (read-only) component-by-component from a
+        /// trusted anchor, refusing any symlink component — like `provision` but
+        /// with NO create, NO chmod, and NO owner check. Used to pin a
+        /// file-server docroot (owned by the deploy user, not us) by fd ONCE at
+        /// config load, so per-request serving can't re-resolve — and thus be
+        /// re-routed by — a swapped docroot path. The path must be real (no
+        /// symlink components) and must already exist.
+        pub fn open_ro(path: &str) -> Result<SecureDir, String> {
+            let comps: Vec<&str> = path
+                .split('/')
+                .filter(|c| !c.is_empty() && *c != ".")
+                .collect();
+            if comps.is_empty() {
+                return Err(format!("{path:?}: must name a directory"));
+            }
+            if comps.contains(&"..") {
+                return Err(format!("{path}: must not contain `..`"));
+            }
+            let anchor = if path.starts_with('/') { "/" } else { "." };
+            let ac = CString::new(anchor).map_err(|_| "bad anchor".to_string())?;
+            let afd = unsafe {
+                libc::open(
+                    ac.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+                )
+            };
+            if afd < 0 {
+                return Err(format!("{anchor}: {}", errno()));
+            }
+            let mut cur = unsafe { OwnedFd::from_raw_fd(afd) };
+            for comp in comps {
+                let c = component(comp).map_err(|e| format!("{path}: {e}"))?;
+                let fd = unsafe {
+                    libc::openat(
+                        cur.as_raw_fd(),
+                        c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(format!("{path}: component {comp:?}: {}", errno()));
+                }
+                cur = unsafe { OwnedFd::from_raw_fd(fd) };
+            }
+            Ok(SecureDir { fd: cur })
+        }
+
         /// Open (creating if needed, 0700) a SUB-directory by a single component,
         /// relative to this dir's fd, `O_NOFOLLOW` — a symlinked component is
         /// refused. Used only on the cache WRITE path (a miss).
@@ -242,6 +289,55 @@ mod unix {
                 return Err(errno());
             }
             Ok(unsafe { File::from_raw_fd(fd) })
+        }
+
+        /// Open `comps...` (multiple components) under this dir as a REGULAR
+        /// file, `O_NOFOLLOW` at every level so no symlink under the pinned root
+        /// is followed. Used to serve a static file from the docroot fd without
+        /// ever re-resolving a path string. Errors on a symlink/missing/dir/
+        /// special-file component.
+        pub fn open_file_under(&self, comps: &[String]) -> io::Result<File> {
+            if comps.is_empty() {
+                return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
+            }
+            let (parents, last) = comps.split_at(comps.len() - 1);
+            let mut hold: Vec<OwnedFd> = Vec::new();
+            let mut cur = self.raw();
+            for p in parents {
+                let c = component(p)?;
+                let fd = unsafe {
+                    libc::openat(
+                        cur,
+                        c.as_ptr(),
+                        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    )
+                };
+                if fd < 0 {
+                    return Err(errno());
+                }
+                let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+                cur = owned.as_raw_fd();
+                hold.push(owned);
+            }
+            let c = component(&last[0])?;
+            let fd = unsafe {
+                libc::openat(
+                    cur,
+                    c.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(errno());
+            }
+            let f = unsafe { File::from_raw_fd(fd) };
+            if !f.metadata()?.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "not a regular file",
+                ));
+            }
+            Ok(f)
         }
 
         /// Open an existing file for reading (O_NOFOLLOW) by a single component.
@@ -336,46 +432,64 @@ mod unix {
         }
     }
 
-    /// Read-only validation for `--check`: NEVER creates or chmods. If the dir
-    /// exists it must be a non-symlink directory owned by the running uid;
-    /// otherwise it's fine (startup will create it). Also rejects a symlinked
-    /// final component (the attack shape).
+    /// Read-only validation for `--check`: NEVER creates or chmods. Mirrors what
+    /// `provision` will do at startup, WALKING the path component-by-component so
+    /// `--check` and startup agree: reject empty/`.`/`/` and `..`, reject a
+    /// symlink at ANY existing component (not just the final one — a previous
+    /// version only lstat'd the final path, so a symlinked PARENT passed --check
+    /// then failed at startup), and require the final existing dir to be owned by
+    /// us. A missing component is fine (startup creates the rest 0700).
     pub fn validate(path: &str) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
-        // Reject a path that names no real directory (`""`, `"."`, `"/"`) — at
-        // startup provisioning would otherwise `fchmod` the CWD or `/`.
-        if path.split('/').all(|c| c.is_empty() || c == ".") {
+        use std::path::PathBuf;
+        let comps: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .collect();
+        if comps.is_empty() {
             return Err(format!(
                 "{path:?}: must name a directory (not empty, \".\", or \"/\")"
             ));
         }
-        match std::fs::symlink_metadata(path) {
-            Ok(md) => {
-                if md.file_type().is_symlink() {
-                    return Err(format!(
-                        "{path}: is a symlink; refusing to store files here"
-                    ));
-                }
-                if !md.is_dir() {
-                    return Err(format!("{path}: exists but is not a directory"));
-                }
-                let euid = unsafe { libc::geteuid() };
-                if md.uid() != euid {
-                    return Err(format!(
-                        "{path}: owned by uid {} but sluice runs as uid {euid}",
-                        md.uid()
-                    ));
-                }
-                Ok(())
-            }
-            // ONLY a genuine "not found" is OK (startup will create it 0700).
-            // Any other error — ENOTDIR (a path component is a file), EACCES
-            // (unreadable ancestor), ELOOP (symlink loop) — is a real problem
-            // that would fail at startup, so it must fail `--check` too, not be
-            // treated as "doesn't exist yet" (a previous fail-open bug).
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(format!("{path}: {e}")),
+        if comps.contains(&"..") {
+            return Err(format!("{path}: must not contain `..`"));
         }
+        let euid = unsafe { libc::geteuid() };
+        let mut cur = if path.starts_with('/') {
+            PathBuf::from("/")
+        } else {
+            PathBuf::from(".")
+        };
+        for (i, comp) in comps.iter().enumerate() {
+            cur.push(comp);
+            match std::fs::symlink_metadata(&cur) {
+                Ok(md) => {
+                    if md.file_type().is_symlink() {
+                        return Err(format!(
+                            "{path}: component {comp:?} is a symlink; refusing (use the real path)"
+                        ));
+                    }
+                    let last = i == comps.len() - 1;
+                    if last {
+                        if !md.is_dir() {
+                            return Err(format!("{path}: exists but is not a directory"));
+                        }
+                        if md.uid() != euid {
+                            return Err(format!(
+                                "{path}: owned by uid {} but sluice runs as uid {euid}",
+                                md.uid()
+                            ));
+                        }
+                    } else if !md.is_dir() {
+                        return Err(format!("{}: not a directory", cur.display()));
+                    }
+                }
+                // A missing component is OK — startup creates the rest.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(format!("{}: {e}", cur.display())),
+            }
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -532,6 +646,17 @@ mod unix {
                 validate(under_file.to_str().unwrap()).is_err(),
                 "ENOTDIR must fail --check, not fail-open"
             );
+            // PARENT-symlink --check/startup mismatch (round-10): a symlinked
+            // PARENT component must fail validate (as provision would), not only
+            // a symlinked final component. Here `link` (→ loose) is a parent of
+            // `link/cache`; validate must reject it.
+            let via_link_parent = link.join("cache");
+            assert!(
+                validate(via_link_parent.to_str().unwrap()).is_err(),
+                "a symlinked PARENT component must fail --check too"
+            );
+            // And provision agrees (fails), so --check and startup are consistent.
+            assert!(SecureDir::provision(via_link_parent.to_str().unwrap()).is_err());
             let _ = std::fs::remove_dir_all(&base);
         }
     }

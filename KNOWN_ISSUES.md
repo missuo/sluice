@@ -133,14 +133,15 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   (`https://…`) upstream it falls back to a **TCP-connect** check (no TLS
   handshake, no HTTP status assertion). A TLS backend that accepts connections
   but returns errors won't be marked down by the path check.
-- **Static-file serving does not follow symlinks under the root.** The file is
-  opened race-free by descending from the docroot one component at a time with
-  `openat`/`O_NOFOLLOW` (no `canonicalize`→`open` TOCTOU that a writable docroot
-  could exploit), and the `Content-Length` is taken by `fstat` on the very fd
-  that streams the bytes (length and body can't disagree). The trade-off is
-  nginx-`disable_symlinks` semantics: a symlink anywhere **under** the root is
-  not served (the docroot itself may be a symlink — it's admin-controlled). Per
-  request this is a few `openat` syscalls rather than two `canonicalize` calls.
+- **Static-file serving: docroot pinned by fd, no symlink followed.** The
+  docroot is opened once at config load (`SecureDir::open_ro`, refusing symlink
+  components) and its fd held in the config snapshot; each request `openat`s the
+  file FROM that fd, descending one component at a time with `O_NOFOLLOW`. So the
+  docroot path can't be re-routed after load (a per-request path re-open could),
+  and no symlink under the root is followed (nginx-`disable_symlinks` semantics —
+  the docroot path itself must also be real, no symlink components). The
+  `Content-Length` is taken by `fstat` on the very fd streamed (length and body
+  can't disagree).
 - **Disk cache: one file per entry, published by a single atomic rename.** Meta
   (prefix + serialized headers) and body live in the SAME `.ent` file, written
   to a fsync'd temp and installed with one `rename` — a crash at any point
@@ -188,7 +189,22 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
 - **A cache LOOKUP never creates directories.** Only a miss that actually caches
   (the write path) creates the two shard dirs; a lookup/purge uses a no-create
   open, so an attacker varying the URL can't mint unbounded empty directories.
-  The reaper reclaims empty shard dirs every cycle regardless.
+  Empty shard dirs left by eviction are NOT reclaimed (see §2.2 — that would race
+  a live writer), so they're bounded by the fan-out (≤ 65 536).
+- **A static file-server serves from a docroot pinned by fd at config load.**
+  `SecureDir::open_ro` walks the docroot path once (refusing symlink components)
+  and holds its fd in the config snapshot; every request `openat`s the file FROM
+  that fd (no path re-resolution) and follows no symlink under the root. So a
+  low-priv user who swaps the docroot's parent/path afterwards can't re-route
+  reads to a directory Sluice can otherwise read (the old per-request path
+  re-open could). The docroot path itself must be real (no symlink components),
+  same as the private dirs; a reload with a now-symlinked docroot is refused and
+  keeps the old config.
+- **An in-progress cache write is never reaped.** The reaper's stale-temp sweep
+  skips any temp a live miss-writer still holds (tracked in a process-local set),
+  so a slow stream whose write outlives the 300 s stale threshold can't have its
+  temp deleted out from under it (which would fail the publish `rename`). Genuine
+  leaks from a dead process (absent from the set after restart) are still reaped.
 - **Rate-limit table is hard-capped with a per-host overflow bucket.** Buckets
   are keyed by (host, client) with IPv6 collapsed to its /64; the per-client
   table is capped at 256k. When full, a NEW client is throttled against a single
