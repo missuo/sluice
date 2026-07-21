@@ -48,6 +48,13 @@ listener "0.0.0.0:80" {
 //     cache-dir "/var/lib/sluice/acme"
 // }
 
+// Response cache backend. Omit for the default in-memory LRU; set this to
+// persist cached responses to disk (survives restarts, holds far more than RAM).
+// cache-store {
+//     dir "/var/cache/sluice"
+//     max-size "10GiB"                // a reaper evicts the oldest over this cap
+// }
+
 alias prefix="staging"                 // staging-app.example.com == app.example.com
 
 defaults {

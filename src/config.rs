@@ -72,6 +72,8 @@ pub struct Config {
     pub listeners: Vec<Listener>,
     pub alias_prefix: Option<String>,
     pub acme: Option<AcmeCfg>,
+    /// Disk-backed response cache (None = the default in-memory LRU).
+    pub disk_cache: Option<DiskCacheCfg>,
     pub unknown_host: u16,
     pub sites: Vec<Site>,
     /// host -> index into `sites`
@@ -125,6 +127,15 @@ pub enum ListenerKind {
     /// Certs auto-provisioned via ACME (needs a top-level `acme {}` block).
     TlsAcme { http2: bool },
     RedirectHttps,
+}
+
+/// Disk-backed response cache. When set, cached responses persist to `dir`
+/// (survive restarts, hold far more than memory) instead of the in-memory LRU.
+#[derive(Debug, Clone)]
+pub struct DiskCacheCfg {
+    pub dir: String,
+    /// Soft cap on total on-disk size; a reaper evicts the oldest entries.
+    pub max_size: u64,
 }
 
 /// Automatic TLS via ACME (Let's Encrypt). Provisions a cert per `site` host
@@ -476,6 +487,7 @@ const TOP_LEVEL: &[&str] = &[
     "client-ip",
     "geoip",
     "acme",
+    "cache-store",
     "listener",
     "alias",
     "defaults",
@@ -504,6 +516,7 @@ impl Config {
         let mut listeners = Vec::new();
         let mut alias_prefix = None;
         let mut acme: Option<AcmeCfg> = None;
+        let mut disk_cache: Option<DiskCacheCfg> = None;
         let mut default_hsts = None;
         let mut unknown_host = 404u16;
         let mut sites: Vec<Site> = Vec::new();
@@ -603,6 +616,22 @@ impl Config {
                         }
                     }
                 }
+                "cache-store" => match child_arg(node, "dir") {
+                    Some(dir) => {
+                        let max_size = match child_arg(node, "max-size") {
+                            Some(s) => match parse_size(s) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    errs.push(format!("cache-store max-size: {e}"));
+                                    0
+                                }
+                            },
+                            None => 10 * 1024 * 1024 * 1024, // 10 GiB default
+                        };
+                        disk_cache = Some(DiskCacheCfg { dir: dir.to_string(), max_size });
+                    }
+                    None => errs.push("cache-store: `dir` is required".to_string()),
+                },
                 "defaults" => {
                     if let Some(v) = child_arg(node, "hsts") {
                         default_hsts = Some(v.to_string());
@@ -684,6 +713,7 @@ impl Config {
                 listeners,
                 alias_prefix,
                 acme,
+                disk_cache,
                 unknown_host,
                 sites,
                 index,

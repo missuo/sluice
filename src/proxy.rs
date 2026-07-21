@@ -12,8 +12,10 @@ use ipnet::IpNet;
 use maxminddb::geoip2;
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::eviction::simple_lru::Manager as LruEviction;
+use pingora_cache::eviction::EvictionManager;
 use pingora_cache::filters as cache_filters;
 use pingora_cache::lock::CacheLock;
+use pingora_cache::storage::Storage;
 use pingora_cache::{CacheKey, CacheMeta, CacheMetaDefaults, MemCache, NoCacheReason, RespCacheable};
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::prelude::*;
@@ -539,6 +541,10 @@ pub struct SluiceProxy {
     health_active: Arc<DashMap<String, ActiveHealth>>,
     /// In-flight request count per backend "host:port", for `balance least-conn`.
     conns: Arc<DashMap<String, i64>>,
+    /// Response-cache storage backend (in-memory LRU by default, or disk).
+    storage: &'static (dyn Storage + Sync),
+    /// Eviction manager for the storage (None when the disk reaper bounds size).
+    eviction: Option<&'static (dyn EvictionManager + Sync)>,
 }
 
 impl SluiceProxy {
@@ -554,6 +560,23 @@ impl SluiceProxy {
         // Background active health checker (reads the live config each cycle).
         let health_active: Arc<DashMap<String, ActiveHealth>> = Arc::new(DashMap::new());
         spawn_health_prober(cfg.clone(), health_active.clone());
+
+        // Choose the cache storage backend once, from config. Disk cache persists
+        // to files (bounded by its own reaper); otherwise the in-memory LRU.
+        let (storage, eviction): (
+            &'static (dyn Storage + Sync),
+            Option<&'static (dyn EvictionManager + Sync)>,
+        ) = if let Some(dc) = cfg.load().disk_cache.clone() {
+            let _ = std::fs::create_dir_all(&dc.dir);
+            crate::diskcache::spawn_reaper(dc.dir.clone().into(), dc.max_size);
+            let disk: &'static crate::diskcache::DiskCache =
+                Box::leak(Box::new(crate::diskcache::DiskCache::new(dc.dir)));
+            log::info!("sluice: response cache = disk");
+            (disk, None)
+        } else {
+            (&*CACHE_STORAGE, Some(&*CACHE_EVICTION))
+        };
+
         SluiceProxy {
             cfg,
             limiter,
@@ -561,6 +584,8 @@ impl SluiceProxy {
             health: Arc::new(DashMap::new()),
             health_active,
             conns: Arc::new(DashMap::new()),
+            storage,
+            eviction,
         }
     }
 
@@ -766,8 +791,8 @@ impl ProxyHttp for SluiceProxy {
                     ctx.cache_ttl = Some(cc.ttl);
                     ctx.cache_max_object = cc.max_object;
                     session.cache.enable(
-                        &*CACHE_STORAGE,
-                        Some(&*CACHE_EVICTION),
+                        self.storage,
+                        self.eviction,
                         None,
                         Some(&*CACHE_LOCK),
                         None,

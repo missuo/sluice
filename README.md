@@ -29,6 +29,9 @@ against live Let's Encrypt (staging + production).
 - **Response cache** (`cache { ttl-secs … }`, backed by `pingora-cache`): in-memory
   LRU with a thundering-herd lock; honors the origin's `Cache-Control` (never
   caches `no-store`/`private`/`Set-Cookie`) and applies the location TTL otherwise.
+  Optional **disk backend** (`cache-store { dir … max-size … }`) — a hand-written
+  `Storage` impl (Pingora ships only an in-memory one) with atomic writes,
+  sharded files, a size-bounding reaper, and **cache that survives restarts**.
 - **WAF**: `waf { block field=… match=… }` blocks requests by regex on
   path / query / method / any header (e.g. bad user-agents, injection patterns).
 - **regex redirects** with `{uri}`/`{host}`; per-location **body limits**
@@ -69,8 +72,9 @@ against live Let's Encrypt (staging + production).
   the running one), then `SIGQUIT` the old process to drain and exit — no dropped
   connections. Verified: 120 continuous requests across an upgrade, 0 failures.
 
-Roadmap (see DESIGN.md): config file-watch, disk-backed cache, least-conn EWMA,
-a constrained request-routing expression language (not full scripting).
+Roadmap (see DESIGN.md): config file-watch, least-conn EWMA, a constrained
+request-routing expression language (not full scripting), HTTP/3 (needs upstream
+Pingora QUIC support).
 
 ## Comparison with nginx and Caddy
 
@@ -97,7 +101,7 @@ Legend: ✅ built-in · 🔌 plugin/module · 💰 paid tier only · ❌ not ava
 | Consistent hashing (Ketama) | ✅ | 🔌 (`hash consistent`) | ✅ |
 | Passive health checks | ✅ | ✅ | ✅ |
 | Active health checks | ✅ | 💰 (NGINX Plus) | ✅ |
-| Response cache | ✅ in-memory LRU | ✅ disk-backed | 🔌 (Souin) |
+| Response cache | ✅ in-memory LRU **+ disk** | ✅ disk-backed | 🔌 (Souin) |
 | Static file server | ✅ streamed | ✅ (sendfile) | ✅ |
 | Automatic TLS (ACME) | ✅ HTTP-01 | 🔌 (certbot, external) | ✅ (flagship) |
 | Dynamic SNI / multi-cert | ✅ | ✅ | ✅ |
