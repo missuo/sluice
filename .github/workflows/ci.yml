@@ -74,6 +74,11 @@ jobs:
             echo "::error::--check output is not the exact expected error set (1 header + 1 cert + 2 root = 4 lines)"
             exit 1
           fi
+          # Belt-and-suspenders: every NON-BLANK line must match an allowed
+          # pattern, so a new error that happened to keep the counts (it can't,
+          # given the exact counts above, but be explicit) is still caught.
+          printf '%s\n' "$out" | grep . | grep -vqE '^config error in |: cert file not found: |: file-server root not a directory: ' \
+            && { echo "::error::unexpected --check line present"; exit 1; } || true
 
   boringssl:
     name: build / test (BoringSSL)

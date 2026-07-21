@@ -162,7 +162,7 @@ site "api.example.com" {
     upstream "127.0.0.1:31100"
     max-body "32MiB"
     read-timeout-secs 300              // SSE: max gap between chunks
-    rate-limit rps=50 burst=100 key="client_ip"
+    rate-limit rps=50 burst=100        // token bucket, keyed by client IP (/64 for v6)
 }
 
 site "example.com" {                   // apex with auth-path redirects

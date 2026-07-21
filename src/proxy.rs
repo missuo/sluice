@@ -111,13 +111,22 @@ fn hex_val(b: u8) -> Option<u8> {
 /// cap (pathologically over-encoded), which the caller treats as an attack
 /// (fail closed). Lossy on invalid UTF-8.
 fn decode_query(q: &str) -> (String, bool) {
-    // A very long query is a DoS risk under repeated decoding — treat as unstable.
-    if q.len() > 16 * 1024 {
-        return (q.to_owned(), false);
+    decode_until_stable(q, true)
+}
+
+/// Repeatedly percent-decode `s` until it stops changing, so any depth of
+/// over-encoding is caught by a rule written against the literal payload.
+/// `plus_is_space` = query semantics (`+`→space); paths pass false. Returns
+/// `(decoded, stabilized)`; `stabilized == false` means it was still decoding at
+/// the iteration/length cap — the caller treats that as an attack (fail closed).
+fn decode_until_stable(s: &str, plus_is_space: bool) -> (String, bool) {
+    // A very long input is a DoS risk under repeated decoding — treat as unstable.
+    if s.len() > 16 * 1024 {
+        return (s.to_owned(), false);
     }
-    let mut cur = q.to_owned();
+    let mut cur = s.to_owned();
     for _ in 0..16 {
-        let next = decode_query_once(&cur);
+        let next = decode_once(&cur, plus_is_space);
         if next == cur {
             return (cur, true);
         }
@@ -126,8 +135,8 @@ fn decode_query(q: &str) -> (String, bool) {
     (cur, false)
 }
 
-fn decode_query_once(q: &str) -> String {
-    let b = q.as_bytes();
+fn decode_once(s: &str, plus_is_space: bool) -> String {
+    let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
@@ -142,7 +151,7 @@ fn decode_query_once(q: &str) -> String {
                     i += 1;
                 }
             },
-            b'+' => {
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -1360,23 +1369,23 @@ impl ProxyHttp for SluiceProxy {
 
         // Normalize the path so matching sees what the backend will (defeats
         // %2e/%2f/`//`/`.`/`..` evasion of WAF, deny, and location routing).
-        let raw_path = session.req_header().uri.path();
-        let Some(path) = normalize_path(raw_path) else {
+        // Owned so it can be re-read after a `&mut session` call (send_status).
+        let raw_path = session.req_header().uri.path().to_owned();
+        let Some(path) = normalize_path(&raw_path) else {
             send_status(session, 400, hsts).await?;
             return Ok(true);
         };
 
         // WAF (site-wide) → block matching requests. Skip all of it — including
-        // the query decode — when the site has no rules (most requests).
+        // the query/path decode — when the site has no rules (most requests).
         if !site.waf.is_empty() {
             let has_query_rule = site.waf.iter().any(|r| matches!(r.field, WafField::Query));
-            // Only pay for the raw-query copy + multi-round decode when a query
-            // rule actually exists (path/method/header rules don't need it).
+            let has_path_rule = site.waf.iter().any(|r| matches!(r.field, WafField::Path));
+            // Only pay for the raw copy + multi-round decode when a rule of that
+            // kind actually exists.
             let (raw_query, decoded_query) = if has_query_rule {
                 let raw = session.req_header().uri.query().unwrap_or("").to_owned();
                 let (decoded, stable) = decode_query(&raw);
-                // A query that won't stop decoding (over-encoded) is treated as an
-                // attack — fail closed rather than let a deeper layer slip through.
                 if !stable {
                     send_status(session, 403, hsts).await?;
                     return Ok(true);
@@ -1385,9 +1394,30 @@ impl ProxyHttp for SluiceProxy {
             } else {
                 (String::new(), String::new())
             };
+            // The PATH gets the same treatment as the query: `normalize_path`
+            // only decodes ONCE (matching what a well-behaved backend sees), so
+            // a double-encoded `union%2520select` slips a path rule and could be
+            // re-decoded by the app. Also match the raw path and the
+            // decode-until-stable path, and fail closed if it won't stabilize.
+            let decoded_path = if has_path_rule {
+                let (decoded, stable) = decode_until_stable(&raw_path, false);
+                if !stable {
+                    send_status(session, 403, hsts).await?;
+                    return Ok(true);
+                }
+                decoded
+            } else {
+                String::new()
+            };
             for rule in &site.waf {
                 let blocked = match &rule.field {
-                    WafField::Path => rule.re.is_match(&path),
+                    // Normalized (backend-view) path OR raw OR fully-decoded, so
+                    // neither single- nor multi-encoding evades the rule.
+                    WafField::Path => {
+                        rule.re.is_match(&path)
+                            || rule.re.is_match(&raw_path)
+                            || rule.re.is_match(&decoded_path)
+                    }
                     // Match both the raw query AND its fully-decoded form, so an
                     // attacker can't slip `union%20select` / `union%2520select`
                     // past a rule written against the literal payload.
@@ -2046,6 +2076,23 @@ mod tests {
         // Nested double/triple encoding is decoded until stable, then flagged stable.
         assert_eq!(decode_query("%252520").0, " ");
         assert!(decode_query("%252520").1);
+    }
+
+    #[test]
+    fn path_decode_until_stable_catches_double_encoding() {
+        // The WAF path bypass: `union%2520select` normalizes (single decode) to
+        // `union%20select`, which a rule for "union select" misses — but the
+        // decode-until-stable form recovers the literal payload. `+` is NOT a
+        // space in a path (query-only), so it's preserved.
+        let (d, stable) = decode_until_stable("/union%2520select", false);
+        assert_eq!(d, "/union select");
+        assert!(stable);
+        assert_eq!(decode_until_stable("/a+b", false).0, "/a+b"); // path: + kept
+        assert_eq!(decode_until_stable("a+b", true).0, "a b"); // query: + = space
+                                                               // A very long input is treated as unstable (DoS guard) → caller fails
+                                                               // closed rather than spin decoding.
+        let huge = "%2520".repeat(4000); // > 16 KiB
+        assert!(!decode_until_stable(&huge, false).1);
     }
 
     #[test]

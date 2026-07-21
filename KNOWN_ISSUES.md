@@ -83,6 +83,13 @@ Two categories:
   cache, measure the reaper cycle time before relying on it.
 - **Mitigation:** keep `cache-store { max-files }` reasonable; the cost scales
   with it.
+- **Empty shard dirs left by eviction are not reclaimed.** Deleting the last
+  `.ent` in a shard leaves an empty `<ab>/<cd>` directory. The reaper does NOT
+  rmdir it — doing so races a concurrent writer that has just opened a fresh
+  (still-empty) shard but not yet written its temp (the rmdir would succeed and
+  the writer's create then `ENOENT`, failing that cache-fill). Since a lookup no
+  longer mints empty dirs, the number of empty shards is bounded by the fan-out
+  (≤ 65 536 inodes) — accepted over the write-failure race.
 
 ### 2.3 Config file-watch / `cert-dir` hot-reload
 - **What:** config reload is **SIGHUP-triggered**, not automatic on file change.
@@ -147,35 +154,37 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   `<32hex>.meta`/`.body`) — a user's stray `keep.txt` or `.tmp.notes` is never
   counted or deleted.
 - **Response cache is namespaced by a per-site config epoch.** The cache key
-  includes a versioned (`v2`) fingerprint of the site's content-affecting config:
-  location matchers, upstream host/port/TLS/SNI/**verify**/Host-rewrite, file
-  roots, websocket/read-timeout, and sub-filters. A reload/restart/upgrade that
-  changes ANY of these (e.g. flipping `upstream-verify` false→true — a review
-  gap that previously kept serving unverified content) gets a fresh namespace
+  includes a versioned (`v3`) fingerprint of the site's content-affecting config:
+  location matchers, upstream host/port/TLS/SNI/**verify**/Host-rewrite, the
+  **balance policy** and per-backend **weight**, file roots, websocket/
+  read-timeout, the cache **policy** (TTL, max-object), and sub-filters. A
+  reload/restart/upgrade that changes ANY of these (several were review gaps:
+  `upstream-verify` false→true served unverified content; a TTL/balance/weight
+  change served entries chosen/bounded by the old policy) gets a fresh namespace
   and can never serve the OLD config's cached bodies; identical config keeps the
-  namespace, so the persistent disk cache still survives a plain restart. The
-  fingerprint also covers the cache **policy** (TTL, max-object), so a reload
-  that changes the TTL doesn't keep serving entries bound by the old policy. Bump
-  the `v2` tag whenever the fingerprint format changes.
+  namespace, so the persistent disk cache still survives a plain restart. Bump
+  the `v3` tag whenever the fingerprint format changes.
 - **Dynamic-SNI cert lookup is case-insensitive.** Certs are keyed (and looked
   up) by the lowercased SNI, since DNS hostnames are case-insensitive and a
   client may send any case — so `B.TEST` resolves to `b.test`'s cert rather than
   falling back to the wrong one.
-- **Private dirs (ACME store, disk cache) are pinned by fd, from the root down.**
-  `dirs::SecureDir::provision` walks the path from a trusted anchor (`/` or the
-  CWD) creating/opening ONE component at a time with `O_NOFOLLOW` at EVERY level
-  (not just the last), then holds the final directory by fd; all later IO is
-  `openat`/`mkdirat`/`renameat`/`unlinkat`-relative. So a low-priv user who
-  controls a PARENT directory can't reroute provisioning (or any later write) by
-  swapping a component for a symlink between `--check` and startup — the open
-  fails. A symlink component is followed ONLY if the link is owned by root or by
-  us (so system symlinks like macOS `/var` still work; an attacker's link is
-  refused). The final dir must be owned by us and is locked to 0700 on its fd.
-  Provisioning (which mutates) happens only at startup and is FATAL on failure —
-  a bad `cache-store`/ACME dir fails the process, never a silent downgrade to
-  in-memory. `--check` runs a read-only `validate` that never creates or chmods
-  and fails on any real error (a non-`NotFound` stat error is no longer treated
-  as "doesn't exist yet").
+- **Private dirs (ACME store, disk cache) are pinned by fd, from the root down,
+  and NEVER traverse a symlink.** `dirs::SecureDir::provision` walks the path
+  from a trusted anchor (`/` or the CWD) creating/opening ONE component at a time
+  with `O_NOFOLLOW` at EVERY level — and a symlink component is REFUSED, not
+  followed (the earlier "trusted-owner symlink" exception was itself unsafe: it
+  stat'd the outer link then did a following open, which had a stat→open TOCTOU
+  and followed the whole chain, so a root→nobody→root symlink chain slipped by).
+  The final directory is then held by fd; all later IO is `openat`/`renameat`/
+  `unlinkat`-relative, so a low-priv user who controls a parent can't reroute a
+  write. Consequence: **the configured `cache-store`/ACME dir path must not
+  contain a symlink component** — use the real path (on macOS, `/private/var/…`
+  not `/var/…`). Empty, `.`, and `/` paths are rejected (they'd otherwise
+  `fchmod` the CWD or `/`). The final dir must be owned by us and is 0700.
+  Provisioning happens only at startup and is FATAL on failure — a bad dir fails
+  the process, never a silent downgrade to in-memory. `--check` runs a read-only
+  `validate` that never creates or chmods and fails on any real error (a
+  non-`NotFound` stat error is no longer treated as "doesn't exist yet").
 - **A cache LOOKUP never creates directories.** Only a miss that actually caches
   (the write path) creates the two shard dirs; a lookup/purge uses a no-create
   open, so an attacker varying the URL can't mint unbounded empty directories.

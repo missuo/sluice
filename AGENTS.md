@@ -137,13 +137,16 @@ These were fixed after review; a change that reverts any of them is a bug:
   split state across two files whose renames can be separated by a crash.
 - **Private dirs (ACME, disk cache) are fd-pinned from the root down** via
   `dirs::SecureDir::provision`: it walks from a trusted anchor (`/` or CWD) with
-  `O_NOFOLLOW` at EVERY component (a symlink component is followed only if
-  root/self-owned), then holds the dir by fd; ALL later IO is `*at`-relative.
-  Never go back to path-based `open`/`rename`/`create_dir_all` or a single
-  `open(path, O_NOFOLLOW)` — that reopens the parent-symlink cross-UID exploit.
-  Provisioning mutates and is done ONCE at startup and is FATAL on error (no
-  silent downgrade to in-memory); a cache LOOKUP must never create dirs (use
-  `sub_open`, not `sub`); `--check` uses read-only `dirs::validate` (fails on any
+  `O_NOFOLLOW` at EVERY component and REFUSES any symlink component (no
+  trusted-owner exception — that had a stat→open TOCTOU and followed the whole
+  chain), then holds the dir by fd; ALL later IO is `*at`-relative. Never go back
+  to path-based `open`/`rename`/`create_dir_all`, a single `open(path,
+  O_NOFOLLOW)`, or a stat-then-follow — each reopens the parent-symlink cross-UID
+  exploit. The configured dir path must be real (no symlink components); tests
+  canonicalize their temp base (macOS `/var`). Empty/`.`/`/` paths are rejected.
+  Provisioning mutates, runs ONCE at startup, and is FATAL on error (no silent
+  downgrade to in-memory); a cache LOOKUP must never create dirs (use `sub_open`,
+  not `sub`); `--check` uses read-only `dirs::validate` (fails on any
   non-`NotFound` error).
 - **Static files are served race-free**: descend from the docroot with
   `openat`/`O_NOFOLLOW` per component (rejecting `.`/`..`/separators); never

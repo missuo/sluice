@@ -454,7 +454,13 @@ mod tests {
         let d = std::env::temp_dir().join(format!("sluice-acme-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        let path = d.to_str().unwrap().to_string();
+        // Canonicalize: provision refuses symlink components and macOS temp_dir()
+        // is under `/var` (a symlink).
+        let path = std::fs::canonicalize(&d)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
         let sd = crate::dirs::SecureDir::provision(&path).unwrap();
         (path, sd)
     }

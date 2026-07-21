@@ -441,30 +441,6 @@ fn collect(root: &SecureDir, out: &mut Vec<Entry>, total: &mut u64) {
     }
 }
 
-/// Reclaim empty shard directories (a MISS used to mint two per varied URL —
-/// they aren't counted toward max-files and would otherwise accumulate and
-/// slow every scan). rmdir only removes a dir that is actually empty, so an
-/// entry racing in during the scan is safe (ENOTEMPTY → left in place).
-fn reap_empty_shards(root: &SecureDir) {
-    let Ok(l1s) = root.entries() else { return };
-    for l1 in l1s {
-        if !is_shard(&l1) || !root.stat(&l1).map(|s| s.0 && !s.1).unwrap_or(false) {
-            continue;
-        }
-        let Ok(d1) = root.sub_open(&l1) else { continue };
-        if let Ok(l2s) = d1.entries() {
-            for l2 in l2s {
-                if is_shard(&l2) && d1.stat(&l2).map(|s| s.0 && !s.1).unwrap_or(false) {
-                    let _ = d1.remove_dir(&l2); // ENOTEMPTY if it has entries — fine
-                }
-            }
-        }
-        if d1.entries().map(|e| e.is_empty()).unwrap_or(false) {
-            let _ = root.remove_dir(&l1);
-        }
-    }
-}
-
 fn remove_entry(root: &SecureDir, e: &Entry) -> bool {
     let Ok(d1) = root.sub_open(&e.0) else {
         return false;
@@ -484,7 +460,6 @@ fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
     let mut entries: Vec<Entry> = Vec::new();
     let mut total_size: u64 = 0;
     collect(root, &mut entries, &mut total_size);
-    entries.sort_by_key(|e| e.4); // oldest first
 
     // 1) Delete stale temps (a hard kill left them; a fresh temp is an
     //    in-progress write, kept but counted) and legacy files on sight.
@@ -504,36 +479,40 @@ fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
         }
     });
 
-    // 2) Evict oldest until under every bound (skip the loop when already under).
+    // 2) Evict oldest until under every bound. Only sort (O(n log n)) when we
+    //    actually need to evict — a cache under all bounds costs just the scan.
     let mut count = entries.len() as u64;
     let avail = avail_bytes(root).unwrap_or(u64::MAX);
-    if total_size > max_size || count > max_files || avail < min_free {
-        // Evict to ~90% of the cap but never below 1 (a tiny `max-files` would
-        // otherwise round its target to 0 and wipe the whole cache).
-        let size_target = (max_size / 10 * 9).max(1);
-        let count_target = (max_files - max_files / 10).max(1);
-        let mut to_free_for_space = min_free.saturating_sub(avail);
-        if to_free_for_space > total_size {
-            to_free_for_space = 0; // floor unachievable — don't wipe the cache
+    if total_size <= max_size && count <= max_files && avail >= min_free {
+        return;
+    }
+    entries.sort_by_key(|e| e.4); // oldest first
+                                  // Evict to ~90% of the cap but never below 1 (a tiny `max-files` would
+                                  // otherwise round its target to 0 and wipe the whole cache).
+    let size_target = (max_size / 10 * 9).max(1);
+    let count_target = (max_files - max_files / 10).max(1);
+    let mut to_free_for_space = min_free.saturating_sub(avail);
+    if to_free_for_space > total_size {
+        to_free_for_space = 0; // floor unachievable — don't wipe the cache
+    }
+    // Empty shard dirs left by eviction are NOT reclaimed here: doing so races a
+    // concurrent writer that has opened a fresh (still-empty) shard but not yet
+    // written its temp file (rmdir would succeed and its create then ENOENT).
+    // Since a lookup no longer mints empty dirs, the count is bounded by the
+    // shard fan-out (<= 65536) — acceptable.
+    for e in entries {
+        if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
+            break;
         }
-        for e in entries {
-            if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
-                break;
-            }
-            if e.5 == Kind::Tmp {
-                continue; // never delete an in-progress write
-            }
-            if remove_entry(root, &e) {
-                total_size = total_size.saturating_sub(e.3);
-                count = count.saturating_sub(1);
-                to_free_for_space = to_free_for_space.saturating_sub(e.3);
-            }
+        if e.5 == Kind::Tmp {
+            continue; // never delete an in-progress write
+        }
+        if remove_entry(root, &e) {
+            total_size = total_size.saturating_sub(e.3);
+            count = count.saturating_sub(1);
+            to_free_for_space = to_free_for_space.saturating_sub(e.3);
         }
     }
-
-    // 3) Always reclaim empty shard dirs (misses mint them; eviction empties
-    //    more). Runs every cycle so they can't accumulate unboundedly.
-    reap_empty_shards(root);
 }
 
 /// Free bytes on the filesystem holding the cache (via fstatvfs on the root fd).
@@ -567,9 +546,10 @@ mod tests {
     }
 
     fn test_cache(tag: &str) -> (&'static DiskCache, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("sluice-disk-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir0 = std::env::temp_dir().join(format!("sluice-disk-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        std::fs::create_dir_all(&dir0).unwrap();
+        let dir = std::fs::canonicalize(&dir0).unwrap(); // macOS /var symlink
         let sd = Arc::new(SecureDir::provision(dir.to_str().unwrap()).unwrap());
         (Box::leak(Box::new(DiskCache::new(sd))), dir)
     }
@@ -618,23 +598,6 @@ mod tests {
     }
 
     #[test]
-    fn reaper_reclaims_empty_shard_dirs() {
-        let dir = std::env::temp_dir().join(format!("sluice-empty-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        // Empty shard dirs (as a miss would have left) must be rmdir'd.
-        std::fs::create_dir_all(dir.join("ab").join("cd")).unwrap();
-        std::fs::create_dir_all(dir.join("ef").join("01")).unwrap();
-        let root = SecureDir::provision(dir.to_str().unwrap()).unwrap();
-        reap(&root, u64::MAX, u64::MAX, 0);
-        assert!(
-            !dir.join("ab").exists(),
-            "empty shard tree must be reclaimed"
-        );
-        assert!(!dir.join("ef").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn classify_strict_tmp_and_hash_names() {
         let h = "0123456789abcdef0123456789abcdef";
         assert!(matches!(classify(&format!("{h}.ent")), Some(Kind::Entry)));
@@ -652,8 +615,10 @@ mod tests {
 
     #[test]
     fn reaper_never_touches_foreign_files() {
-        let dir = std::env::temp_dir().join(format!("sluice-reap-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir0 = std::env::temp_dir().join(format!("sluice-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir0);
+        std::fs::create_dir_all(&dir0).unwrap();
+        let dir = std::fs::canonicalize(&dir0).unwrap();
         std::fs::create_dir_all(dir.join("01").join("23")).unwrap();
         std::fs::write(dir.join("keep-1.txt"), b"important").unwrap();
         std::fs::write(dir.join(".tmp.important"), b"foreign tmp").unwrap();

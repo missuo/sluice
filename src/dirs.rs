@@ -57,11 +57,18 @@ mod unix {
         CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))
     }
 
-    /// Open a single directory component relative to `dir` with `O_NOFOLLOW`,
-    /// creating it 0700 if missing. If the component is a symlink, accept it ONLY
-    /// when the link is owned by root or by us (a trusted system symlink); an
-    /// attacker-owned link is refused. Returns the opened directory fd.
-    fn open_or_make_dir(dir: &OwnedFd, comp: &str, euid: libc::uid_t) -> io::Result<OwnedFd> {
+    /// Open a single directory component relative to `dir`, creating it 0700 if
+    /// missing, with `O_NOFOLLOW` — and NEVER follow a symlink for ANY component.
+    ///
+    /// The earlier "trusted-owner symlink" exception was itself unsafe: it
+    /// `fstatat`'d the outer link's owner and then did a plain (following) open,
+    /// which (a) has a stat→open TOCTOU and (b) follows the WHOLE chain, so a
+    /// root-owned link → nobody-owned link → root-owned victim slipped through
+    /// (only the outer owner was checked). Refusing all symlinks with a single
+    /// `openat(O_NOFOLLOW)` per component is atomic and closes both holes. The
+    /// caller canonicalizes legitimate system symlinks (macOS `/var`) ONCE up
+    /// front, so the walked path has none.
+    fn open_or_make_dir(dir: &OwnedFd, comp: &str) -> io::Result<OwnedFd> {
         let c = component(comp)?;
         let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
@@ -70,47 +77,22 @@ mod unix {
         }
         let e = errno();
         if e.raw_os_error() == Some(libc::ENOENT) {
-            // Create it (0700) and reopen no-follow. A racing symlink swap makes
-            // the reopen fail (ELOOP) → error, never a followed link.
             if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) } != 0 {
                 let me = errno();
                 if me.raw_os_error() != Some(libc::EEXIST) {
                     return Err(me);
                 }
             }
+            // Reopen no-follow. A racing symlink swap makes this fail (a symlink
+            // component is refused, never followed) — no owner check, no second
+            // stat, no TOCTOU.
             let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
             if fd >= 0 {
                 return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
             }
-            // fall through to the symlink/other-error handling below
+            return Err(errno());
         }
-        // Not ENOENT (or the reopen failed): if it's a symlink, allow only a
-        // trusted-owner one (root/us); otherwise refuse.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe {
-            libc::fstatat(
-                dir.as_raw_fd(),
-                c.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } == 0
-            && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
-        {
-            if st.st_uid == 0 || st.st_uid == euid {
-                // Trusted system symlink (e.g. macOS /var) — follow it.
-                let follow = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
-                let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), follow) };
-                if fd >= 0 {
-                    return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
-                }
-                return Err(errno());
-            }
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("untrusted symlink (owned by uid {})", st.st_uid),
-            ));
-        }
+        // ELOOP (a symlink component), ENOTDIR, EACCES, … → refuse.
         Err(e)
     }
 
@@ -133,27 +115,29 @@ mod unix {
         }
 
         /// Startup: create + open `path` component-by-component from a trusted
-        /// root fd (`/` for an absolute path, the CWD for a relative one), with
-        /// `O_NOFOLLOW` at EVERY level — not just the last. This closes the
-        /// startup parent-symlink TOCTOU: the old code let `mkdir -p` + a single
-        /// `open(path, O_NOFOLLOW)` follow a symlinked PARENT that a low-priv user
-        /// swapped in between `--check` and provisioning, so provisioning could
-        /// pin (and chmod 0700) an attacker-chosen root-owned victim dir.
+        /// anchor (`/` for an absolute path, the CWD for a relative one), with
+        /// `O_NOFOLLOW` at EVERY level and NO symlink ever followed. This closes
+        /// the startup parent-symlink TOCTOU (a low-priv user swapping a PARENT
+        /// to a symlink between `--check` and provisioning could otherwise make
+        /// provisioning pin — and `fchmod 0700` — an attacker-chosen victim dir).
         ///
-        /// A symlink component is accepted ONLY if the link itself is owned by
-        /// root or by us — so legitimate system symlinks (macOS `/var` →
-        /// `private/var`) still work, while an attacker's link (owned by their
-        /// uid) is refused. Real directory components are opened by fd and never
-        /// re-resolved. The final dir must be owned by us; it's `fchmod`'d 0700.
+        /// The path must name at least one real component: `""`, `"."`, and
+        /// `"/"` are rejected so provisioning can't accidentally `fchmod` the CWD
+        /// or `/`. A path that traverses a symlink is refused (use the real
+        /// path); the final dir must be owned by us and is `fchmod`'d 0700.
         pub fn provision(path: &str) -> Result<SecureDir, String> {
             let comps: Vec<&str> = path
                 .split('/')
                 .filter(|c| !c.is_empty() && *c != ".")
                 .collect();
+            if comps.is_empty() {
+                return Err(format!(
+                    "{path:?}: must name a directory (not empty, \".\", or \"/\")"
+                ));
+            }
             if comps.contains(&"..") {
                 return Err(format!("{path}: must not contain `..`"));
             }
-            let euid = unsafe { libc::geteuid() };
             // Trusted anchor: "/" (root, not a symlink) or "." (our CWD).
             let anchor = if path.starts_with('/') { "/" } else { "." };
             let ac = CString::new(anchor).map_err(|_| "bad anchor".to_string())?;
@@ -166,9 +150,10 @@ mod unix {
             if afd < 0 {
                 return Err(format!("{anchor}: {}", errno()));
             }
+            let euid = unsafe { libc::geteuid() };
             let mut cur = unsafe { OwnedFd::from_raw_fd(afd) };
             for comp in comps {
-                cur = open_or_make_dir(&cur, comp, euid)
+                cur = open_or_make_dir(&cur, comp)
                     .map_err(|e| format!("{path}: component {comp:?}: {e}"))?;
             }
             // fstat the final OPEN fd → owner check with no TOCTOU.
@@ -357,6 +342,13 @@ mod unix {
     /// final component (the attack shape).
     pub fn validate(path: &str) -> Result<(), String> {
         use std::os::unix::fs::MetadataExt;
+        // Reject a path that names no real directory (`""`, `"."`, `"/"`) — at
+        // startup provisioning would otherwise `fchmod` the CWD or `/`.
+        if path.split('/').all(|c| c.is_empty() || c == ".") {
+            return Err(format!(
+                "{path:?}: must name a directory (not empty, \".\", or \"/\")"
+            ));
+        }
         match std::fs::symlink_metadata(path) {
             Ok(md) => {
                 if md.file_type().is_symlink() {
@@ -396,7 +388,10 @@ mod unix {
             let d = std::env::temp_dir().join(format!("sluice-sd-{tag}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&d);
             std::fs::create_dir_all(&d).unwrap();
-            d
+            // provision refuses ALL symlink components; macOS temp_dir() goes
+            // through `/var` (a symlink). Canonicalize so the test path is real
+            // (an attacker isn't in the loop for a freshly-created test dir).
+            std::fs::canonicalize(&d).unwrap()
         }
 
         #[test]
@@ -427,25 +422,48 @@ mod unix {
         }
 
         #[test]
-        fn provision_follows_self_owned_symlink_component_but_would_reject_foreign() {
-            // The parent-symlink TOCTOU fix walks each component with O_NOFOLLOW
-            // and accepts a symlink component ONLY if the link is owned by root
-            // or us. We can't create a foreign-owned symlink without root, so we
-            // assert the TRUSTED path (a self-owned symlink IS followed — needed
-            // for real system symlinks like macOS /var → private/var, which every
-            // other provision test here already traverses). The foreign-owned
-            // rejection is exercised by the reviewer's cross-UID test + the
-            // `st_uid == 0 || st_uid == euid` gate in `open_or_make_dir`.
-            let base = tmpbase("symparent");
+        fn provision_rejects_empty_and_root_and_dot_without_touching_cwd() {
+            // Regression: `dir ""` walked zero components and `fchmod`'d the CWD;
+            // as root, `dir "/"` would `fchmod` the root directory. All of these
+            // must be rejected with NO filesystem side effect.
+            let base = tmpbase("empty");
+            let cwd = base.join("cwd");
+            std::fs::create_dir(&cwd).unwrap();
+            std::fs::set_permissions(&cwd, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Run these with `cwd` as the process CWD so `provision("")` (which
+            // anchors at ".") would chmod IT if the bug were present.
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&cwd).unwrap();
+            for bad in ["", ".", "/", "//", "/.", "./."] {
+                assert!(
+                    SecureDir::provision(bad).is_err(),
+                    "provision({bad:?}) must be rejected"
+                );
+            }
+            std::env::set_current_dir(&prev).unwrap();
+            assert_eq!(
+                std::fs::metadata(&cwd).unwrap().permissions().mode() & 0o777,
+                0o755,
+                "the CWD must NOT have been chmod'd by provision(\"\")"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn provision_refuses_symlink_component() {
+            // A symlink component is NEVER followed (no trusted-owner exception):
+            // it closes the trusted→untrusted symlink-chain bypass. A self-owned
+            // link is refused too — the point is that the walk never resolves a
+            // symlink, so a chain to an attacker's target can't form.
+            let base = tmpbase("sym");
             let realparent = base.join("realparent");
             std::fs::create_dir(&realparent).unwrap();
             let linkparent = base.join("linkparent");
-            std::os::unix::fs::symlink(&realparent, &linkparent).unwrap(); // owned by us
-            let sd = SecureDir::provision(linkparent.join("cache").to_str().unwrap())
-                .expect("a self-owned symlink component is trusted and followed");
-            drop(sd);
-            // The real dir behind the trusted link now holds the pinned cache dir.
-            assert!(realparent.join("cache").is_dir());
+            std::os::unix::fs::symlink(&realparent, &linkparent).unwrap();
+            assert!(
+                SecureDir::provision(linkparent.join("cache").to_str().unwrap()).is_err(),
+                "a symlink path component must be refused, not followed"
+            );
             let _ = std::fs::remove_dir_all(&base);
         }
 

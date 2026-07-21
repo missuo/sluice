@@ -454,6 +454,11 @@ fn positional_count(node: &KdlNode) -> usize {
     node.entries().iter().filter(|e| e.name().is_none()).count()
 }
 
+/// RFC 7230 `token` byte (valid in a header field name).
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
 /// `32MiB` / `1024` / `512KB` -> bytes.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -548,6 +553,24 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     };
     if host.is_empty() {
         return Err(format!("upstream {s:?}: empty host"));
+    }
+    // Strict authority: reject whitespace/control/userinfo in the host (which
+    // would corrupt the connection target or SNI), and a silently-dropped path/
+    // query/fragment (an upstream is an ORIGIN, not a URL — `https://h/v1` used
+    // to quietly become `https://h`).
+    if host
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'@')
+    {
+        return Err(format!("upstream {s:?}: invalid host {host:?}"));
+    }
+    if url_form {
+        let after_authority = &rest[hostport.len()..];
+        if !after_authority.is_empty() && after_authority != "/" {
+            return Err(format!(
+                "upstream {s:?}: a URL path/query is not allowed — give just the origin host[:port]"
+            ));
+        }
     }
     Ok(Upstream {
         sni: host.clone(),
@@ -1772,11 +1795,12 @@ fn parse_waf(node: &KdlNode, host: &str) -> Result<Vec<WafRule>, String> {
         let field_s = prop_str(b, "field")
             .ok_or_else(|| format!("site `{host}`: waf block needs field=\"...\""))?;
         let field = if let Some(h) = field_s.strip_prefix("header:") {
-            // `field="header:"` (empty name) makes a rule that can never match —
-            // reject it instead of silently installing a dead rule.
-            if h.is_empty() {
+            // The name must be a valid HTTP header token (RFC 7230), else the
+            // rule can never match a real header and is silently dead. `header:`
+            // (empty) and `header:bad name` (space) are both rejected here.
+            if h.is_empty() || !h.bytes().all(is_token_byte) {
                 return Err(format!(
-                    "site `{host}`: waf field=\"header:\" needs a header name (e.g. header:x-api-key)"
+                    "site `{host}`: waf field={field_s:?} — invalid header name (e.g. header:x-api-key)"
                 ));
             }
             WafField::Header(h.to_ascii_lowercase())
@@ -1928,11 +1952,12 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
     // Content-affecting fingerprint → cache namespace (see `Site.cache_epoch`).
     // Every field that can change what bytes an origin returns (or whether they
     // were trust-verified) MUST be included, so a reload that changes it can't
-    // keep serving the old config's cached responses. The leading `v2` is a
+    // keep serving the old config's cached responses. The leading `v3` is a
     // version tag: bump it whenever this format changes to force a clean
-    // namespace across an upgrade. (Missing `verify` here was a review finding —
-    // switching upstream-verify false→true kept serving unverified content.)
-    let mut fp = String::from("v2\u{1f}");
+    // namespace across an upgrade. (Review findings folded in: `verify`, and the
+    // `balance`/`weight` below — changing which backend is selected can change
+    // the bytes an origin returns.)
+    let mut fp = String::from("v3\u{1f}");
     {
         use std::fmt::Write;
         for loc in &locations {
@@ -1946,11 +1971,12 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
             }
             match &loc.handler {
                 Handler::Proxy(g) => {
+                    let _ = write!(fp, "B{:?}\u{1f}", g.balance);
                     for sv in &g.servers {
                         let _ = write!(
                             fp,
-                            "U{}:{}:tls={}:sni={}:verify={}:host={:?}\u{1f}",
-                            sv.host, sv.port, sv.tls, sv.sni, sv.verify, sv.host_header
+                            "U{}:{}:tls={}:sni={}:verify={}:w={}:host={:?}\u{1f}",
+                            sv.host, sv.port, sv.tls, sv.sni, sv.verify, sv.weight, sv.host_header
                         );
                     }
                 }
@@ -2256,6 +2282,23 @@ mod tests {
             ttl(1).sites[0].cache_epoch,
             "cache TTL must be part of the namespace"
         );
+        // balance policy and backend weight change which origin is selected → epoch.
+        let pool = |extra: &str| {
+            Config::parse(&format!(
+                "listener \"0.0.0.0:80\" {{\n redirect-to-https true\n}}\nsite \"x\" {{\n upstream {{\n server \"127.0.0.1:9001\"{extra}\n server \"127.0.0.1:9002\"\n }}\n}}\n",
+            ))
+            .unwrap()
+        };
+        assert_ne!(
+            pool("\n balance \"round-robin\"").sites[0].cache_epoch,
+            pool("\n balance \"least-conn\"").sites[0].cache_epoch,
+            "balance policy must be part of the namespace"
+        );
+        assert_ne!(
+            pool(" weight=1").sites[0].cache_epoch,
+            pool(" weight=10").sites[0].cache_epoch,
+            "backend weight must be part of the namespace"
+        );
     }
 
     #[test]
@@ -2266,12 +2309,29 @@ mod tests {
         assert!(parse_err(&cfg_with(
             " upstream \"127.0.0.1:9\"\n waf {\n block field=\"header:\" match=\"x\"\n }"
         ))
-        .contains("needs a header name"));
+        .contains("invalid header name"));
         // upstream-host with a space (would corrupt the Host header).
         assert!(parse_err(&cfg_with(
             " upstream \"127.0.0.1:9\"\n upstream-host \"bad host\""
         ))
         .contains("not a valid host"));
+    }
+
+    #[test]
+    fn strict_schema_rejects_round9_silent_values() {
+        // waf header name must be a valid RFC-7230 token (space → dead rule).
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n waf {\n block field=\"header:bad name\" match=\"x\"\n }"
+        ))
+        .contains("invalid header name"));
+        // upstream URL: space in authority, dropped path, and userinfo.
+        assert!(
+            parse_err(&cfg_with(" upstream \"https://bad host/path\"")).contains("invalid host")
+        );
+        assert!(parse_err(&cfg_with(" upstream \"https://api.test/v1\"")).contains("path"));
+        assert!(
+            parse_err(&cfg_with(" upstream \"https://user@api.test\"")).contains("invalid host")
+        );
     }
 
     #[test]
