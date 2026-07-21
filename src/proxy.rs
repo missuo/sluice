@@ -104,19 +104,26 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Percent-decode a query and turn `+` into space, repeatedly until stable (a
-/// few rounds), so double-encoding like `union%2520select` is also caught by a
-/// rule written against the literal payload. Lossy on invalid UTF-8.
-fn decode_query(q: &str) -> String {
+/// Percent-decode a query and turn `+` into space, repeatedly until it stops
+/// changing, so any depth of over-encoding (`union%252520select`, …) is caught
+/// by a rule written against the literal payload. Returns `(decoded, stabilized)`
+/// — `stabilized == false` means it was still decodable at the iteration/length
+/// cap (pathologically over-encoded), which the caller treats as an attack
+/// (fail closed). Lossy on invalid UTF-8.
+fn decode_query(q: &str) -> (String, bool) {
+    // A very long query is a DoS risk under repeated decoding — treat as unstable.
+    if q.len() > 16 * 1024 {
+        return (q.to_owned(), false);
+    }
     let mut cur = q.to_owned();
-    for _ in 0..3 {
+    for _ in 0..16 {
         let next = decode_query_once(&cur);
         if next == cur {
-            break;
+            return (cur, true);
         }
         cur = next;
     }
-    cur
+    (cur, false)
 }
 
 fn decode_query_once(q: &str) -> String {
@@ -527,9 +534,15 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                         if let Handler::Proxy(g) = &loc.handler {
                             if let Some(hc) = &g.health_check {
                                 for s in &g.servers {
+                                    // Probe with the Host the real requests use
+                                    // (upstream-host / the rewritten https host),
+                                    // not the raw backend IP — else a vhost that
+                                    // only answers for its own Host looks DOWN.
+                                    let probe_host =
+                                        s.host_header.clone().unwrap_or_else(|| s.host.clone());
                                     targets
                                         .entry(format!("{}:{}", s.host, s.port))
-                                        .or_insert_with(|| (hc.clone(), s.tls, s.host.clone()));
+                                        .or_insert_with(|| (hc.clone(), s.tls, probe_host));
                                 }
                             }
                         }
@@ -919,38 +932,40 @@ impl ProxyHttp for SluiceProxy {
         Ok(())
     }
 
-    /// Cache key: host + method + a coarse Accept-Encoding bucket + full URI.
-    /// The encoding bucket keeps a gzip/br body from being served to a client
-    /// that only accepts identity (we don't implement full `Vary` yet).
+    /// Cache key: host + method + the client's full (normalized) Accept-Encoding
+    /// + URI. We key on the WHOLE Accept-Encoding rather than a coarse br/gzip/id
+    /// bucket, because the origin chooses the encoding from the full header — two
+    /// clients that map to the same bucket but send different `q`-values can get
+    /// different origin representations, and sharing an entry would serve one an
+    /// encoding it can't decode. (We don't implement full `Vary`, so this is the
+    /// safe conservative key.)
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<CacheKey> {
         let req = session.req_header();
         let uri = req.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        // Coarse Accept-Encoding bucket. Parse tokens case-insensitively and skip
-        // any with `q=0` — otherwise `GZIP` (or `gzip;q=0`) would fall to the
-        // identity bucket and a gzip body could be served to an identity client.
-        let ae = req
-            .headers
-            .get("accept-encoding")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        let accepts = |enc: &str| {
-            ae.split(',').map(str::trim).any(|tok| {
+        // Merge every Accept-Encoding line, lowercase, drop q=0 tokens, sort+dedup
+        // so the key is order-insensitive but distinguishes any real difference.
+        let mut toks: Vec<String> = Vec::new();
+        for v in req.headers.get_all("accept-encoding") {
+            let Ok(s) = v.to_str() else { continue };
+            for tok in s.split(',') {
+                let tok = tok.trim().to_ascii_lowercase();
                 let mut parts = tok.split(';').map(str::trim);
-                parts.next() == Some(enc)
-                    && !parts.any(|p| p.replace(' ', "") == "q=0" || p.replace(' ', "") == "q=0.0")
-            })
-        };
-        let enc = if accepts("br") {
-            "br"
-        } else if accepts("gzip") {
-            "gzip"
-        } else {
-            "id"
-        };
+                let name = parts.next().unwrap_or("");
+                let q0 = parts.any(|p| {
+                    let p = p.replace(' ', "");
+                    p == "q=0" || p == "q=0.0" || p == "q=0.00"
+                });
+                if !name.is_empty() && !q0 {
+                    toks.push(name.to_string());
+                }
+            }
+        }
+        toks.sort();
+        toks.dedup();
+        let ae = toks.join(",");
         Ok(CacheKey::new(
             ctx.host.clone(),
-            format!("{}:{}:{}", req.method.as_str(), enc, uri),
+            format!("{}:ae={}:{}", req.method.as_str(), ae, uri),
             "",
         ))
     }
@@ -1107,13 +1122,20 @@ impl ProxyHttp for SluiceProxy {
         // the query decode — when the site has no rules (most requests).
         if !site.waf.is_empty() {
             let raw_query = session.req_header().uri.query().unwrap_or("").to_owned();
-            let decoded_query = decode_query(&raw_query);
+            let (decoded_query, stable) = decode_query(&raw_query);
+            let has_query_rule = site.waf.iter().any(|r| matches!(r.field, WafField::Query));
+            // A query that won't stop decoding (over-encoded) is treated as an
+            // attack — fail closed rather than let a deeper layer slip through.
+            if has_query_rule && !stable {
+                send_status(session, 403, hsts).await?;
+                return Ok(true);
+            }
             for rule in &site.waf {
                 let blocked = match &rule.field {
                     WafField::Path => rule.re.is_match(&path),
-                    // Match both the raw query AND a percent/`+`-decoded form, so an
-                    // attacker can't slip `union%20select` / `union+select` past a
-                    // rule written against the literal payload.
+                    // Match both the raw query AND its fully-decoded form, so an
+                    // attacker can't slip `union%20select` / `union%2520select`
+                    // past a rule written against the literal payload.
                     WafField::Query => {
                         rule.re.is_match(&raw_query) || rule.re.is_match(&decoded_query)
                     }
@@ -1588,10 +1610,15 @@ mod tests {
 
     #[test]
     fn decode_query_catches_encoded_forms() {
-        assert_eq!(decode_query("union%20select"), "union select");
-        assert_eq!(decode_query("union+select"), "union select");
-        assert_eq!(decode_query("union%09select"), "union\tselect");
-        assert_eq!(decode_query("plain=1"), "plain=1");
+        assert_eq!(decode_query("union%20select").0, "union select");
+        assert_eq!(decode_query("union+select").0, "union select");
+        assert_eq!(decode_query("union%09select").0, "union\tselect");
+        assert_eq!(decode_query("plain=1").0, "plain=1");
+        // Single decode stabilizes these.
+        assert!(decode_query("plain=1").1);
+        // Nested double/triple encoding is decoded until stable, then flagged stable.
+        assert_eq!(decode_query("%252520").0, " ");
+        assert!(decode_query("%252520").1);
     }
 
     #[test]

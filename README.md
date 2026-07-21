@@ -24,7 +24,9 @@ against live Let's Encrypt (staging + production).
 - **Load-balanced upstream pools**: `upstream { server …; server …; balance … }`
   with **round-robin / random / ip-hash / ketama / least-conn** selection,
   per-server **`weight`**, and connect-failure **failover** to the next member.
-  Ketama is consistent hashing (scaling the pool only remaps ~1/n of clients);
+  `weight` applies to round-robin / random / ketama / least-conn; **`ip-hash` is
+  unweighted** (plain `hash(ip) % N`) — use **`ketama`** for weighted *and*
+  consistent hashing. Ketama scaling the pool only remaps ~1/n of clients;
   least-conn sends each request to the least busy backend. **Health checks**: passive by default (skip a
   backend for 10s after a failed connect) and optional **active** probing
   (`health-check { path … interval-secs … }`, like Caddy) that takes an
@@ -79,8 +81,10 @@ against live Let's Encrypt (staging + production).
   connections. Verified: 120 continuous requests across an upgrade, 0 failures.
 
 Roadmap (see DESIGN.md): config file-watch, least-conn EWMA, a constrained
-request-routing expression language (not full scripting), HTTP/3 (needs upstream
-Pingora QUIC support).
+request-routing expression language (not full scripting). Items that are blocked
+upstream or deliberately deferred — HTTP/3, Rustls, `notAfter`-based ACME renewal,
+weighted `ip-hash`, full scripting — and the reason for each are documented in
+**[KNOWN_ISSUES.md](KNOWN_ISSUES.md)**.
 
 ## Comparison with nginx and Caddy
 

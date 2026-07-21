@@ -67,19 +67,13 @@ pub fn spawn(
                     }
                     match provision(account, d, &challenges).await {
                         Ok((cert_pem, key_pem)) => {
-                            let (crt_p, key_p) = cert_paths(&cfg, d);
-                            // Write the key first (0600), then the cert, so a
-                            // present .crt always implies a present .key on disk.
-                            if let Err(e) = write_private(&key_p, key_pem.as_bytes()) {
-                                log::warn!("acme: {d}: could not write key: {e}; skipping");
-                                continue;
-                            }
-                            if let Err(e) = std::fs::write(&crt_p, &cert_pem) {
-                                // Disk copy is now missing/partial; remove the key so
-                                // the pair is consistent and needs_cert re-issues next
-                                // cycle rather than leaving a mismatched pair.
-                                log::warn!("acme: {d}: could not write cert: {e}; skipping");
-                                let _ = std::fs::remove_file(&key_p);
+                            // Publish atomically: write temps, verify they load as a
+                            // matching pair, then rename into place. A disk-full /
+                            // short write during renewal can't clobber the previous
+                            // valid cert — the old files stay until the new pair is
+                            // proven good.
+                            if let Err(e) = publish_cert(&cfg, d, &cert_pem, &key_pem) {
+                                log::warn!("acme: {d}: could not publish cert: {e}; keeping old");
                                 continue;
                             }
                             match Cert::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()) {
@@ -109,6 +103,42 @@ fn cert_paths(cfg: &AcmeCfg, domain: &str) -> (String, String) {
         format!("{}/{env}-{domain}.crt", cfg.cache_dir),
         format!("{}/{env}-{domain}.key", cfg.cache_dir),
     )
+}
+
+/// Publish a new cert/key atomically: write both to temp files, verify they load
+/// as a matching pair, then rename into place (key first). On any failure the
+/// temps are cleaned up and the previous live cert is left untouched.
+fn publish_cert(cfg: &AcmeCfg, domain: &str, cert_pem: &str, key_pem: &str) -> Result<(), String> {
+    let (crt, key) = cert_paths(cfg, domain);
+    let (crt_tmp, key_tmp) = (format!("{crt}.tmp"), format!("{key}.tmp"));
+    let cleanup = || {
+        let _ = std::fs::remove_file(&crt_tmp);
+        let _ = std::fs::remove_file(&key_tmp);
+    };
+    if let Err(e) = write_private(&key_tmp, key_pem.as_bytes()) {
+        cleanup();
+        return Err(format!("write key: {e}"));
+    }
+    if let Err(e) = std::fs::write(&crt_tmp, cert_pem.as_bytes()) {
+        cleanup();
+        return Err(format!("write cert: {e}"));
+    }
+    if let Err(e) = Cert::from_files(&crt_tmp, &key_tmp) {
+        cleanup();
+        return Err(format!("verify new pair: {e}"));
+    }
+    // Both temps are valid — swap them in (key before cert).
+    if let Err(e) = std::fs::rename(&key_tmp, &key) {
+        cleanup();
+        return Err(format!("install key: {e}"));
+    }
+    if let Err(e) = std::fs::rename(&crt_tmp, &crt) {
+        // Key already replaced; cert rename failed. Next cycle's needs_cert loads
+        // the (now-mismatched) pair, fails, and re-issues — no permanent bad state.
+        let _ = std::fs::remove_file(&crt_tmp);
+        return Err(format!("install cert: {e}"));
+    }
+    Ok(())
 }
 
 /// Create the cache dir with owner-only permissions (it holds private keys).

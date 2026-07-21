@@ -439,6 +439,8 @@ fn reject_unknown_props(node: &KdlNode, ctx: &str, allowed: &[&str], errs: &mut 
 #[derive(Clone, Copy)]
 enum Ty {
     Int,
+    /// Integer or float (e.g. `rps`).
+    Num,
     Bool,
     Str,
 }
@@ -446,8 +448,17 @@ impl Ty {
     fn describe(self) -> &'static str {
         match self {
             Ty::Int => "an integer",
+            Ty::Num => "a number",
             Ty::Bool => "true or false",
             Ty::Str => "a quoted string",
+        }
+    }
+    fn matches(self, v: &kdl::KdlValue) -> bool {
+        match self {
+            Ty::Int => v.as_integer().is_some(),
+            Ty::Num => v.as_integer().is_some() || v.as_float().is_some(),
+            Ty::Bool => v.as_bool().is_some(),
+            Ty::Str => v.as_string().is_some(),
         }
     }
 }
@@ -462,12 +473,7 @@ fn check_child_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut
             .iter()
             .find(|e| e.name().is_none())
             .map(|e| e.value());
-        let ok = match (val, ty) {
-            (Some(v), Ty::Int) => v.as_integer().is_some(),
-            (Some(v), Ty::Bool) => v.as_bool().is_some(),
-            (Some(v), Ty::Str) => v.as_string().is_some(),
-            (None, _) => false,
-        };
+        let ok = matches!(val, Some(v) if ty.matches(v));
         if !ok {
             errs.push(format!("{ctx}: `{name}` must be {}", ty.describe()));
         }
@@ -479,12 +485,7 @@ fn check_child_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut
 fn check_prop_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut Vec<String>) {
     for (name, ty) in specs {
         let Some(v) = node.get(*name) else { continue };
-        let ok = match ty {
-            Ty::Int => v.as_integer().is_some() || v.as_float().is_some(),
-            Ty::Bool => v.as_bool().is_some(),
-            Ty::Str => v.as_string().is_some(),
-        };
-        if !ok {
+        if !ty.matches(v) {
             errs.push(format!(
                 "{ctx}: property `{name}` must be {}",
                 ty.describe()
@@ -701,31 +702,59 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
                     errs,
                 );
             }
-            "client-ip" => reject_unknown_children(
-                node,
-                "client-ip",
-                &["trusted-header", "trusted-proxies"],
-                errs,
-            ),
-            "geoip" => reject_unknown_children(
-                node,
-                "geoip",
-                &[
-                    "enabled",
-                    "country-header",
-                    "mmdb-asn",
-                    "mmdb-city",
-                    "log-fields",
-                    "metric-labels",
-                ],
-                errs,
-            ),
-            "acme" => reject_unknown_children(
-                node,
-                "acme",
-                &["enabled", "contact", "staging", "cache-dir"],
-                errs,
-            ),
+            "client-ip" => {
+                reject_unknown_children(
+                    node,
+                    "client-ip",
+                    &["trusted-header", "trusted-proxies"],
+                    errs,
+                );
+                check_child_types(node, "client-ip", &[("trusted-header", Ty::Str)], errs);
+            }
+            "geoip" => {
+                reject_unknown_children(
+                    node,
+                    "geoip",
+                    &[
+                        "enabled",
+                        "country-header",
+                        "mmdb-asn",
+                        "mmdb-city",
+                        "log-fields",
+                        "metric-labels",
+                    ],
+                    errs,
+                );
+                check_child_types(
+                    node,
+                    "geoip",
+                    &[
+                        ("enabled", Ty::Bool),
+                        ("country-header", Ty::Str),
+                        ("mmdb-asn", Ty::Str),
+                        ("mmdb-city", Ty::Str),
+                    ],
+                    errs,
+                );
+            }
+            "acme" => {
+                reject_unknown_children(
+                    node,
+                    "acme",
+                    &["enabled", "contact", "staging", "cache-dir"],
+                    errs,
+                );
+                check_child_types(
+                    node,
+                    "acme",
+                    &[
+                        ("enabled", Ty::Bool),
+                        ("staging", Ty::Bool),
+                        ("cache-dir", Ty::Str),
+                    ],
+                    errs,
+                );
+            }
             "cache-store" => reject_unknown_children(
                 node,
                 "cache-store",
@@ -733,14 +762,28 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
                 errs,
             ),
             "defaults" => {
-                reject_unknown_children(node, "defaults", &["hsts", "unknown-host"], errs)
+                reject_unknown_children(node, "defaults", &["hsts", "unknown-host"], errs);
+                check_child_types(
+                    node,
+                    "defaults",
+                    &[("hsts", Ty::Str), ("unknown-host", Ty::Int)],
+                    errs,
+                );
             }
             "alias" => reject_unknown_props(node, "alias", &["prefix"], errs),
             "listener" => {
+                // A listener takes only its bind-address argument — reject `typo=true`.
+                reject_unknown_props(node, "listener", &[], errs);
                 reject_unknown_children(
                     node,
                     "listener",
                     &["http2", "tls", "redirect-to-https"],
+                    errs,
+                );
+                check_child_types(
+                    node,
+                    "listener",
+                    &[("http2", Ty::Bool), ("redirect-to-https", Ty::Bool)],
                     errs,
                 );
                 if let Some(tls) = child(node, "tls") {
@@ -798,6 +841,13 @@ const SINGLE_HANDLER_CHILDREN: &[&str] = &[
     "rate-limit",
     "access",
     "waf",
+    "max-body",
+    "websocket",
+    "read-timeout-secs",
+    "hsts",
+    "upstream-host",
+    "upstream-verify",
+    "acme",
 ];
 /// Typed leaf fields shared by a site and a location.
 const HANDLER_FIELD_TYPES: &[(&str, Ty)] = &[
@@ -826,18 +876,43 @@ fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
             "location" => {
                 let lctx = format!("{ctx} location");
                 reject_unknown_children(n, &lctx, LOCATION_CHILDREN, errs);
+                // A location takes only a matcher argument — reject `typo=true`.
+                reject_unknown_props(n, &lctx, &[], errs);
                 reject_dup_children(n, &lctx, SINGLE_HANDLER_CHILDREN, errs);
                 check_child_types(n, &lctx, HANDLER_FIELD_TYPES, errs);
+                if let Some(lch) = n.children() {
+                    for c in lch.nodes() {
+                        let cn = c.name().value();
+                        if VALUE_ONLY_LEAVES.contains(&cn) {
+                            reject_unknown_props(c, &format!("{lctx} {cn}"), &[], errs);
+                        }
+                    }
+                }
                 validate_backend_unknowns(n, &ctx, errs);
             }
             "upstream" | "file-server" | "cache" | "rate-limit" | "access" | "waf" | "redirect"
             | "sub-filter" => validate_backend_child(n, &ctx, errs),
+            name if VALUE_ONLY_LEAVES.contains(&name) => {
+                // e.g. `max-body "10mb" typo=true` — the leaf takes only its value.
+                reject_unknown_props(n, &format!("{ctx} {name}"), &[], errs);
+            }
             _ => {}
         }
     }
     // The site-level backend sugar (upstream/file-server/cache/...) at the site node.
     validate_backend_unknowns(node, &ctx, errs);
 }
+
+/// Value-only leaf directives: they take exactly one argument and no properties.
+const VALUE_ONLY_LEAVES: &[&str] = &[
+    "max-body",
+    "websocket",
+    "read-timeout-secs",
+    "hsts",
+    "upstream-host",
+    "upstream-verify",
+    "acme",
+];
 
 /// Validate the backend/handler-shaped children shared by a site and a location.
 fn validate_backend_unknowns(node: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
@@ -903,7 +978,19 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
             }
         }
         "file-server" => {
-            reject_unknown_children(n, &format!("{ctx} file-server"), &["root", "index"], errs)
+            let fctx = format!("{ctx} file-server");
+            reject_unknown_children(n, &fctx, &["root", "index"], errs);
+            reject_unknown_props(n, &fctx, &[], errs);
+            check_child_types(n, &fctx, &[("root", Ty::Str), ("index", Ty::Str)], errs);
+            // `root "/tmp" typo=true` — root/index take only their value.
+            if let Some(ch) = n.children() {
+                for c in ch.nodes() {
+                    let cn = c.name().value();
+                    if cn == "root" || cn == "index" {
+                        reject_unknown_props(c, &format!("{fctx} {cn}"), &[], errs);
+                    }
+                }
+            }
         }
         "cache" => {
             reject_unknown_children(
@@ -924,7 +1011,7 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
             check_prop_types(
                 n,
                 &format!("{ctx} rate-limit"),
-                &[("rps", Ty::Int), ("burst", Ty::Int)],
+                &[("rps", Ty::Num), ("burst", Ty::Num)],
                 errs,
             );
         }
@@ -937,12 +1024,20 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
                 errs,
             );
         }
-        "redirect" => reject_unknown_props(
-            n,
-            &format!("{ctx} redirect"),
-            &["match", "target", "status"],
-            errs,
-        ),
+        "redirect" => {
+            reject_unknown_props(
+                n,
+                &format!("{ctx} redirect"),
+                &["match", "target", "status"],
+                errs,
+            );
+            check_prop_types(
+                n,
+                &format!("{ctx} redirect"),
+                &[("match", Ty::Str), ("target", Ty::Str), ("status", Ty::Int)],
+                errs,
+            );
+        }
         "sub-filter" => {
             reject_unknown_props(n, &format!("{ctx} sub-filter"), &["from", "to"], errs)
         }
@@ -956,6 +1051,12 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
                         b,
                         &format!("{ctx} waf block"),
                         &["field", "match", "status"],
+                        errs,
+                    );
+                    check_prop_types(
+                        b,
+                        &format!("{ctx} waf block"),
+                        &[("field", Ty::Str), ("match", Ty::Str), ("status", Ty::Int)],
                         errs,
                     );
                 }
@@ -1331,6 +1432,12 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
             return Err(format!(
                 "listener {addr:?}: cert-dir not a directory: {dir}"
             ));
+        }
+        // Actually load the store at --check time so an empty directory or one
+        // with only malformed pairs is caught now, not when the server boots and
+        // immediately exits. (`--check` must reject anything startup would.)
+        if let Err(e) = crate::certs::CertStore::from_dir(dir) {
+            return Err(format!("listener {addr:?}: cert-dir: {e}"));
         }
         return Ok(Listener {
             addr,

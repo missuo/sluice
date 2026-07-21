@@ -378,10 +378,12 @@ benefit. Tracked as M5.
   couldn't deserialize (`token` was a required field), breaking issuance entirely.
   **Note:** behind a proxying CDN (orange-cloud Cloudflare) HTTP-01 won't validate
   — use a Cloudflare Origin CA cert (15yr) or DNS-01 there. ACME is for
-  direct-public deployments. **Known limitations (see review):** the ACME loop
-  currently attempts *every* site host (a CF-fronted host will fail HTTP-01
-  forever), and `tls acme=true` needs a `:80 redirect-to-https` listener present
-  to answer challenges.
+  direct-public deployments. ACME is **opt-in per site**: only hosts that set
+  `acme true` are provisioned (a CF-fronted host is left alone instead of
+  failing HTTP-01 forever), and `tls acme=true` needs a `:80 redirect-to-https`
+  listener present to answer challenges. Renewal is **mtime-based** (re-issue
+  when the cert file is older than 60 days) rather than reading the certificate's
+  `notAfter` — see [Known limitations](KNOWN_ISSUES.md).
 - **M6 — Caddy/nginx parity — DONE:** **path routing** (`location` blocks, prefix
   or `~regex`, first-match; a bare site-level backend is an implicit `/`),
   **multi-upstream load balancing** (`upstream { server…; balance round-robin|
@@ -395,13 +397,14 @@ benefit. Tracked as M5.
   SIGQUIT fd-handoff), weighted + Ketama + least-conn balancing, passive **and
   active** upstream health checks, disk-backed cache (a custom `pingora-cache`
   `Storage` with a size/count/free-space reaper), response-body rewrite
-  (`sub-filter`), and two rounds of adversarial security review + a config
-  validator that rejects unknown/mistyped/duplicate directives. All verified live.
+  (`sub-filter`), and three rounds of adversarial security review + a config
+  validator that rejects unknown/mistyped/duplicate directives and type-checks
+  leaf values (integer/bool/string) at `--check` time. All verified live.
 - **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
-  header add/remove, JSON access log, least-conn EWMA, notAfter-based ACME renewal
-  (blocked on pingora's TLS facade not re-exporting asn1), Grafana board, HTTP/3
-  (blocked on upstream Pingora QUIC). Full Lua/Rhai **scripting** stays out of
-  scope (a compiled-in plugin seam, or a constrained routing expression, instead).
+  header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`. See
+  **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items that are deliberately not
+  built or blocked upstream (notAfter-based ACME renewal, HTTP/3, Rustls,
+  full Lua/Rhai scripting) and why.
 
 "nginx-like general tool" is explicitly out of scope (months, not weeks). Known MVP
 gaps to revisit: rate-limiter map has no eviction (grows with distinct client IPs);
