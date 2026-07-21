@@ -12,23 +12,29 @@ cargo build                      # dev build (OpenSSL, the default)
 cargo build --release            # release (LTO, one codegen unit)
 cargo build --release --no-default-features --features boringssl   # optional BoringSSL
 cargo clippy --all-targets       # lint before committing
+cargo bench                      # CPU hot-path micro-benchmarks (benches/hot.rs)
 ./target/release/sluice --check -c examples/sluice.kdl   # validate a config, exit
 ./target/release/sluice -c /etc/sluice/sluice.kdl        # run
 ./target/release/sluice -c cfg.kdl -u                    # zero-downtime upgrade (see below)
 ```
 
-- **`cargo test`** runs a unit suite (declarative-schema rejection, `parse_size`,
-  path normalization, query decode, Accept-Encoding cache-key isolation,
-  active-health key scoping, fragmented health-probe reads, combined-PEM certs,
-  ACME legacy migration + cache-dir hardening, disk-cache roundtrip/torn-entry,
-  sub-filter carry-over, Ketama distribution). It is NOT end-to-end — also
-  validate with `--check` and manual testing against a local backend + a
-  self-signed cert. Never test against a production/live host unless that is
-  explicitly the task.
-- **CI** (`.github/workflows/ci.yml`) runs fmt, `clippy -D warnings`, build,
-  test, a strict `--check` on the self-contained `examples/smoke.kdl` (must exit
-  0), an asserted-failure check on the full `examples/sluice.kdl` (must fail
-  with exactly the expected filesystem errors, no schema errors, no panic), and
+The crate is a **lib + thin bin** (see `lib.rs`): tests and benches link
+`sluice::…`.
+
+- **`cargo test`** runs the unit suite (declarative-schema + value-range
+  rejection, `parse_size`, path normalization, query decode, Accept-Encoding
+  cache-key isolation, active-health key scoping + no-CRLF probe, combined-PEM
+  certs, ACME legacy migration + atomic secret write, `SecureDir` openat/symlink
+  safety, disk-cache roundtrip/torn-entry + reaper file-boundary, cache-epoch
+  tracking, static index validation, sub-filter carry-over, Ketama). It is NOT
+  end-to-end — also validate with `--check` and manual testing against a local
+  backend + a self-signed cert. Never test against a production/live host unless
+  that is explicitly the task.
+- **CI** (`.github/workflows/ci.yml`, all actions on Node 24): fmt,
+  `clippy -D warnings`, build, test; a strict `--check` on the self-contained
+  `examples/smoke.kdl` (must exit 0); an EXACT-error assertion on the full
+  `examples/sluice.kdl` (every non-header line must be a known filesystem error —
+  any new error/panic/schema line fails); a **BoringSSL** build+test job; and
   `cargo audit` (one documented ignore: RUSTSEC-2024-0437, see KNOWN_ISSUES.md).
 - The **BoringSSL** feature (`boring-sys`) needs extra tools beyond a C toolchain
   on a fresh Debian: `git golang-go nasm ninja-build`.
@@ -69,10 +75,17 @@ blocked upstream (Pingora has no QUIC transport).
   entry (meta prefix + body), `O_EXCL` temp + single atomic rename, background
   reaper that only ever touches cache-owned filenames (`<32hex>.ent`, `.tmp.*`,
   legacy `.meta`/`.body`) — never a user's stray file.
-- **`dirs.rs`** — `secure_owned_dir`: shared owner/mode/symlink validation for
-  the private ACME and disk-cache directories. Returns the CANONICAL path;
-  callers store that so later opens can't be re-routed via a parent symlink.
+- **`dirs.rs`** — `SecureDir`: a private directory PINNED by fd. `provision`
+  (startup) creates 0700 / verifies owner / `fchmod`s the fd; `validate` is the
+  read-only `--check` counterpart. All IO goes through its `openat`/`renameat`/
+  `unlinkat` methods (single component, `O_NOFOLLOW`), so a swapped parent can't
+  reroute a write. Used by both the ACME store and the disk cache.
 - **`metrics.rs`** — Prometheus metric definitions.
+- **`lib.rs` + `main.rs`** — the crate is a lib (`sluice::…`, all the modules
+  above) plus a thin bin that wires listeners. The split exists so unit tests
+  and `benches/hot.rs` (criterion micro-benchmarks of the CPU hot path) can link
+  the internals. `cargo bench` runs the micro-benchmarks; `scripts/loadtest.sh`
+  (needs `oha`) is the end-to-end P50/P99 harness.
 
 ### Config hot-reload model (do not break this)
 
@@ -122,14 +135,17 @@ These were fixed after review; a change that reverts any of them is a bug:
 - Disk-cache `lookup` treats any IO/parse error as a miss — never fail a request.
 - **Cache entries and ACME certs are single-file + one atomic rename** — never
   split state across two files whose renames can be separated by a crash.
-- **Private dirs (ACME, disk cache) are fail-closed** via `dirs::secure_owned_dir`:
-  refused if a symlink / wrongly owned / not chmod-able to 0700; the stored path
-  is canonical. Secret and cache writes use `create_new` (O_EXCL) temps with
-  unpredictable names so a pre-planted symlink can't capture or truncate.
+- **Private dirs (ACME, disk cache) are fd-pinned** via `dirs::SecureDir`: the
+  validated directory is held by fd and ALL IO is `*at`-relative + `O_NOFOLLOW`,
+  so a swapped parent/shard symlink can't reroute a write or a delete. Never go
+  back to path-based `open`/`rename`/`create_dir_all` for these — that reopens
+  the cross-UID symlink exploit. Provisioning mutates (startup only); `--check`
+  uses read-only `dirs::validate`.
 - **Static files are served race-free**: descend from the docroot with
-  `openat`/`O_NOFOLLOW` per component; never `canonicalize`→`open` (TOCTOU), and
-  take `Content-Length` from `fstat` on the streamed fd. Symlinks under the root
-  are not followed.
+  `openat`/`O_NOFOLLOW` per component (rejecting `.`/`..`/separators); never
+  `canonicalize`→`open` (TOCTOU), and take `Content-Length` from `fstat` on the
+  streamed fd. Symlinks under the root are not followed. The `file-server index`
+  is validated to be a single basename at config load.
 - **Cache entries and ACME certs are single-file + one atomic rename** — never
   split state across two files whose renames can be separated by a crash. The
   cache key is namespaced by a per-site config epoch (a reload can't serve a

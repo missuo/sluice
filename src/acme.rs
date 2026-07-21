@@ -53,20 +53,20 @@ pub fn spawn(
                 return;
             }
         };
-        // The cache dir was already validated + canonicalized at config load
-        // (crate::dirs::secure_owned_dir, so `--check` and startup fail loudly
-        // rather than the background thread silently disabling ACME). Re-verify
-        // here as defense in depth (TOCTOU between load and now) and re-canonical
-        // in case the config path was relative.
-        let cache_dir = match crate::dirs::secure_owned_dir(&cfg.cache_dir) {
-            Ok(canon) => canon,
+        // Pin the cache dir by fd (create 0700 if missing, verify owner, chmod).
+        // Every key read/write below is done relative to THIS fd via openat/
+        // renameat, so a local user can't reroute a write by swapping a parent
+        // path component after validation. Config load already did a read-only
+        // `validate`; the real provisioning (which mutates) happens here at
+        // startup, never during `--check`.
+        let dir = match crate::dirs::SecureDir::provision(&cfg.cache_dir) {
+            Ok(d) => d,
             Err(e) => {
                 log::error!("acme: cache-dir {}: {e}; ACME disabled", cfg.cache_dir);
                 return;
             }
         };
-        let cfg = AcmeCfg { cache_dir, ..cfg };
-        load_cached(&cfg, &domains, &cert_store);
+        load_cached(&cfg, &dir, &domains, &cert_store);
         rt.block_on(async move {
             // One ACME account, created once and reused for every domain and every
             // renewal cycle (a fresh account per provision would hit Let's
@@ -75,7 +75,7 @@ pub fn spawn(
             let mut account: Option<Account> = None;
             loop {
                 if account.is_none() {
-                    match get_account(&cfg).await {
+                    match get_account(&cfg, &dir).await {
                         Ok(a) => account = Some(a),
                         Err(e) => {
                             log::error!("acme: account init failed ({e}); retrying in 60s");
@@ -86,7 +86,7 @@ pub fn spawn(
                 }
                 let account = account.as_ref().unwrap();
                 for d in &domains {
-                    if !needs_cert(&cfg, d) {
+                    if !needs_cert(&cfg, &dir, d) {
                         continue;
                     }
                     match provision(account, d, &challenges).await {
@@ -94,7 +94,7 @@ pub fn spawn(
                             // Publish atomically: one combined temp file, verified,
                             // then a single rename. A disk-full / short write / crash
                             // during renewal can't clobber the previous valid cert.
-                            if let Err(e) = publish_cert(&cfg, d, &cert_pem, &key_pem) {
+                            if let Err(e) = publish_cert(&cfg, &dir, d, &cert_pem, &key_pem) {
                                 log::warn!("acme: {d}: could not publish cert: {e}; keeping old");
                                 continue;
                             }
@@ -117,54 +117,58 @@ pub fn spawn(
     });
 }
 
-/// Per-environment combined cert+key file path, so switching `staging` on/off
-/// doesn't serve the other environment's (e.g. untrusted staging) cert. Key and
-/// full chain live in ONE file so publishing is a single atomic rename.
-fn cert_path(cfg: &AcmeCfg, domain: &str) -> String {
+/// Per-environment combined cert+key file NAME (a single basename under the
+/// pinned cache dir — not a path), so switching `staging` on/off doesn't serve
+/// the other environment's cert. Key + full chain live in ONE file so publishing
+/// is a single atomic rename.
+fn cert_name(cfg: &AcmeCfg, domain: &str) -> String {
     let env = if cfg.staging { "staging" } else { "production" };
-    format!("{}/{env}-{domain}.pem", cfg.cache_dir)
+    format!("{env}-{domain}.pem")
 }
 
-/// The pre-combined-file layout: cert and key as two separate files. Only read
-/// for the startup migration; never written anymore.
-fn legacy_cert_paths(cfg: &AcmeCfg, domain: &str) -> (String, String) {
+/// The pre-combined-file layout: cert and key as two separate file NAMES. Only
+/// read for the startup migration; never written anymore.
+fn legacy_names(cfg: &AcmeCfg, domain: &str) -> (String, String) {
     let env = if cfg.staging { "staging" } else { "production" };
-    (
-        format!("{}/{env}-{domain}.crt", cfg.cache_dir),
-        format!("{}/{env}-{domain}.key", cfg.cache_dir),
-    )
+    (format!("{env}-{domain}.crt"), format!("{env}-{domain}.key"))
 }
 
-/// Publish a new cert atomically. Key + full chain are concatenated into a
-/// single buffer, verified to load as a matching pair, then installed with ONE
-/// atomic rename (O_EXCL temp, fsync of file and parent dir — errors propagate,
-/// durability is not best-effort). A single file means there is never a window
-/// where a new key is paired with an old certificate — the earlier two-file
-/// scheme could crash between its two renames and leave a mismatched pair that
-/// broke TLS load on the next boot.
-fn publish_cert(cfg: &AcmeCfg, domain: &str, cert_pem: &str, key_pem: &str) -> Result<(), String> {
-    let path = cert_path(cfg, domain);
+/// Publish a new cert atomically, relative to the pinned cache dir `dir`. Key +
+/// full chain are concatenated, verified to load as a matching pair, then
+/// installed with ONE `renameat` (O_EXCL temp). A single file means there is
+/// never a window where a new key pairs with an old certificate.
+fn publish_cert(
+    cfg: &AcmeCfg,
+    dir: &crate::dirs::SecureDir,
+    domain: &str,
+    cert_pem: &str,
+    key_pem: &str,
+) -> Result<(), String> {
+    let name = cert_name(cfg, domain);
     let mut combined = String::with_capacity(key_pem.len() + cert_pem.len() + 1);
     combined.push_str(key_pem.trim_end());
     combined.push('\n');
     combined.push_str(cert_pem);
     // Prove the bytes load as a matching pair before anything durable is written.
     Cert::from_combined_pem(combined.as_bytes()).map_err(|e| format!("verify new pair: {e}"))?;
-    write_private_atomic(&path, combined.as_bytes(), None).map_err(|e| format!("install: {e}"))
+    write_secret_atomic(dir, &name, combined.as_bytes(), None).map_err(|e| format!("install: {e}"))
 }
 
-/// Write secret material to `path` atomically: a unique temp sibling opened with
-/// `create_new` (O_CREAT|O_EXCL — refuses to follow a pre-planted symlink and
-/// never truncates an existing file), mode 0600 from birth. If `mtime` is given
-/// it is stamped on the TEMP fd BEFORE the fsync+rename — so the freshness
-/// timestamp is durable atomically with the content, closing the crash window
-/// where a rename could land before a separate post-rename `utimensat` ran (a
-/// migrated old cert would otherwise look freshly written and skip renewal). The
-/// temp is fsync'd, renamed over `path` (rename replaces a symlink at the
-/// destination rather than following it), then the parent dir is fsync'd. Any
-/// failure cleans up the temp and propagates.
-fn write_private_atomic(
-    path: &str,
+/// Write secret material to `name` in the pinned dir atomically: an
+/// unpredictably-named `O_EXCL` temp (openat, mode 0600), optional `mtime`
+/// stamped on the temp fd BEFORE fsync+rename (so freshness is durable with the
+/// content — a migrated old cert can't look freshly written and skip renewal),
+/// then `renameat` over `name`.
+///
+/// Durability vs. commit are distinguished: once the `renameat` SUCCEEDS the
+/// file IS the live cert, so a subsequent directory-fsync failure is a
+/// durability warning (might not survive a power loss) — NOT a publish failure.
+/// Returning an error there would make the caller skip updating the in-memory
+/// cert store while the new cert (and its fresh mtime) already sit on disk,
+/// leaving the process serving the OLD cert until restart — a review finding.
+fn write_secret_atomic(
+    dir: &crate::dirs::SecureDir,
+    name: &str,
     data: &[u8],
     mtime: Option<std::time::SystemTime>,
 ) -> std::io::Result<()> {
@@ -174,84 +178,88 @@ fn write_private_atomic(
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
     let tmp = format!(
-        "{path}.tmp.{}.{}.{nonce}",
+        ".tmp.{}.{}.{nonce}",
         std::process::id(),
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     );
-    let res = (|| {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut f = opts.open(&tmp)?;
+    let write_tmp = (|| -> std::io::Result<()> {
+        let mut f = dir.create_new(&tmp)?;
         f.write_all(data)?;
         if let Some(t) = mtime {
-            f.set_modified(t)?; // stamped BEFORE sync+rename → durable with content
+            f.set_modified(t)?; // BEFORE sync+rename → durable with content
         }
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        sync_parent_dir(path)
+        f.sync_all()
     })();
-    if res.is_err() {
-        let _ = std::fs::remove_file(&tmp);
+    if let Err(e) = write_tmp {
+        let _ = dir.remove(&tmp);
+        return Err(e);
     }
-    res
-}
-
-/// fsync the directory holding `path` so a freshly `rename`d entry survives a
-/// crash/power loss (a rename is only durable once its directory is synced).
-fn sync_parent_dir(path: &str) -> std::io::Result<()> {
-    #[cfg(unix)]
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        let dir = std::fs::File::open(parent)?;
-        dir.sync_all()?;
+    if let Err(e) = dir.rename(&tmp, name) {
+        let _ = dir.remove(&tmp);
+        return Err(e);
+    }
+    // Rename committed — the cert is live. fsync the dir for power-loss
+    // durability, but a failure here is non-fatal (log only).
+    if let Err(e) = dir.sync() {
+        log::warn!("acme: {name}: installed but dir fsync failed ({e}); durable on next sync");
     }
     Ok(())
 }
 
-/// Load a domain's cached cert: the combined `.pem` if present, else a legacy
-/// `.crt`/`.key` pair — which keeps serving across an upgrade AND is converted
-/// to the combined layout on the spot. The legacy file's mtime is stamped onto
-/// the migrated file ATOMICALLY (on the temp, before rename — see
-/// `write_private_atomic`), so a crash can't leave a migrated cert that looks
-/// freshly written and skips renewal past its real expiry. If the conversion
-/// can't be written, the pair is still served from memory and `needs_cert`
-/// re-issues via the CA. Legacy files are left in place so a rollback to the
-/// old binary still works.
-fn load_or_migrate(cfg: &AcmeCfg, domain: &str) -> Option<Cert> {
-    let path = cert_path(cfg, domain);
-    if let Ok(c) = Cert::from_combined_file(&path) {
+/// Load a domain's cached cert (relative to the pinned dir): the combined `.pem`
+/// if present, else a legacy `.crt`/`.key` pair — which keeps serving across an
+/// upgrade AND is migrated to the combined layout on the spot, preserving the
+/// legacy mtime (stamped atomically on the temp) so renewal timing is unchanged.
+/// If the conversion can't be written, the pair is still served from memory and
+/// `needs_cert` re-issues. Legacy files are left in place for rollback.
+fn load_combined(dir: &crate::dirs::SecureDir, name: &str) -> Option<Cert> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    dir.open_read(name).ok()?.read_to_end(&mut buf).ok()?;
+    Cert::from_combined_pem(&buf).ok()
+}
+
+fn load_or_migrate(cfg: &AcmeCfg, dir: &crate::dirs::SecureDir, domain: &str) -> Option<Cert> {
+    use std::io::Read;
+    let name = cert_name(cfg, domain);
+    if let Some(c) = load_combined(dir, &name) {
         return Some(c);
     }
-    let (crt, key) = legacy_cert_paths(cfg, domain);
-    let cert = Cert::from_files(&crt, &key).ok()?; // also verifies the pair matches
-    let legacy_mtime = std::fs::metadata(&crt).and_then(|m| m.modified()).ok();
-    match (std::fs::read_to_string(&crt), std::fs::read_to_string(&key)) {
-        (Ok(cert_pem), Ok(key_pem)) => {
-            let combined = format!("{}\n{cert_pem}", key_pem.trim_end());
-            let ok = Cert::from_combined_pem(combined.as_bytes()).is_ok()
-                && write_private_atomic(&path, combined.as_bytes(), legacy_mtime).is_ok();
-            if ok {
-                log::info!("acme: {domain}: migrated legacy .crt/.key to combined {path}");
-            } else {
-                let _ = std::fs::remove_file(&path);
-                log::warn!("acme: {domain}: cannot migrate legacy pair; will re-issue");
-            }
-        }
-        _ => log::warn!("acme: {domain}: legacy pair unreadable; will re-issue"),
+    let (crt, key) = legacy_names(cfg, domain);
+    let mut cbuf = Vec::new();
+    let mut kbuf = Vec::new();
+    let legacy_mtime = {
+        let mut cf = dir.open_read(&crt).ok()?;
+        let mtime = cf.metadata().and_then(|m| m.modified()).ok();
+        cf.read_to_end(&mut cbuf).ok()?;
+        mtime
+    };
+    dir.open_read(&key).ok()?.read_to_end(&mut kbuf).ok()?;
+    let cert = Cert::from_pem(&cbuf, &kbuf).ok()?; // verifies the pair matches
+    let combined = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&kbuf).trim_end(),
+        String::from_utf8_lossy(&cbuf)
+    );
+    if write_secret_atomic(dir, &name, combined.as_bytes(), legacy_mtime).is_ok() {
+        log::info!("acme: {domain}: migrated legacy .crt/.key to combined {name}");
+    } else {
+        let _ = dir.remove(&name);
+        log::warn!("acme: {domain}: cannot migrate legacy pair; will re-issue");
     }
     Some(cert)
 }
 
-fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertStore>>) {
+fn load_cached(
+    cfg: &AcmeCfg,
+    dir: &crate::dirs::SecureDir,
+    domains: &[String],
+    cert_store: &Arc<ArcSwap<CertStore>>,
+) {
     let mut store = (**cert_store.load()).clone();
     let mut any = false;
     for d in domains {
-        if let Some(c) = load_or_migrate(cfg, d) {
+        if let Some(c) = load_or_migrate(cfg, dir, d) {
             store.insert(d.clone(), c);
             any = true;
         }
@@ -261,20 +269,23 @@ fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertS
     }
 }
 
-/// Re-issue if the cached pair won't load as a valid, matching cert, or if it's
-/// older than 60 days (LE certs last 90). Loading the pair (not just checking the
-/// files exist) means a broken/mismatched/partial cached cert is re-issued
-/// promptly instead of sitting unusable for 60 days. A future mtime (clock skew)
-/// is treated as "fresh" so a skewed clock can't trigger an every-12h re-issue
-/// storm. (mtime, not X.509 notAfter, because pingora's TLS facade doesn't
-/// re-export the asn1 module needed to read notAfter portably across OpenSSL/
-/// BoringSSL — tracked in KNOWN_ISSUES.)
-fn needs_cert(cfg: &AcmeCfg, domain: &str) -> bool {
-    let path = cert_path(cfg, domain);
-    if Cert::from_combined_file(&path).is_err() {
+/// Re-issue if the cached cert won't load as a valid pair, or if it's older than
+/// 60 days (LE certs last 90). A future mtime (clock skew) is treated as "fresh"
+/// so a skewed clock can't trigger an every-12h re-issue storm. (mtime, not
+/// X.509 notAfter — pingora's TLS facade doesn't re-export the asn1 module;
+/// tracked in KNOWN_ISSUES.)
+fn needs_cert(cfg: &AcmeCfg, dir: &crate::dirs::SecureDir, domain: &str) -> bool {
+    let name = cert_name(cfg, domain);
+    let Ok(f) = dir.open_read(&name) else {
+        return true;
+    };
+    let mut buf = Vec::new();
+    use std::io::Read;
+    let mut f2 = f;
+    if f2.read_to_end(&mut buf).is_err() || Cert::from_combined_pem(&buf).is_err() {
         return true;
     }
-    match std::fs::metadata(&path).and_then(|m| m.modified()) {
+    match f2.metadata().and_then(|m| m.modified()) {
         Ok(mtime) => mtime
             .elapsed()
             .map(|e| e > Duration::from_secs(60 * 24 * 3600))
@@ -284,27 +295,34 @@ fn needs_cert(cfg: &AcmeCfg, domain: &str) -> bool {
 }
 
 /// Load the cached ACME account for this environment, or register a new one and
-/// persist its credentials. Cached per environment (staging and production are
-/// distinct accounts on distinct directory URLs).
-async fn get_account(cfg: &AcmeCfg) -> Result<Account, String> {
+/// persist its credentials (relative to the pinned dir). Cached per environment.
+async fn get_account(cfg: &AcmeCfg, dir: &crate::dirs::SecureDir) -> Result<Account, String> {
+    use std::io::Read;
     let env = if cfg.staging { "staging" } else { "production" };
-    let creds_path = format!("{}/account-{env}.json", cfg.cache_dir);
+    let creds_name = format!("account-{env}.json");
 
-    if let Ok(bytes) = std::fs::read(&creds_path) {
-        match serde_json::from_slice::<AccountCredentials>(&bytes) {
-            Ok(creds) => match Account::builder()
-                .map_err(|e| format!("account builder: {e}"))?
-                .from_credentials(creds)
-                .await
-            {
-                Ok(account) => return Ok(account),
-                Err(e) => log::warn!("acme: cached account unusable ({e}); registering a new one"),
-            },
-            Err(e) => log::warn!("acme: cached account creds corrupt ({e}); registering a new one"),
+    if let Ok(mut f) = dir.open_read(&creds_name) {
+        let mut bytes = Vec::new();
+        if f.read_to_end(&mut bytes).is_ok() {
+            match serde_json::from_slice::<AccountCredentials>(&bytes) {
+                Ok(creds) => match Account::builder()
+                    .map_err(|e| format!("account builder: {e}"))?
+                    .from_credentials(creds)
+                    .await
+                {
+                    Ok(account) => return Ok(account),
+                    Err(e) => {
+                        log::warn!("acme: cached account unusable ({e}); registering a new one")
+                    }
+                },
+                Err(e) => {
+                    log::warn!("acme: cached account creds corrupt ({e}); registering a new one")
+                }
+            }
         }
     }
 
-    let dir = if cfg.staging {
+    let url = if cfg.staging {
         LetsEncrypt::Staging.url()
     } else {
         LetsEncrypt::Production.url()
@@ -318,17 +336,17 @@ async fn get_account(cfg: &AcmeCfg) -> Result<Account, String> {
                 terms_of_service_agreed: true,
                 only_return_existing: false,
             },
-            dir.to_owned(),
+            url.to_owned(),
             None,
         )
         .await
         .map_err(|e| format!("account: {e}"))?;
-    // Account credentials embed the account private key — 0600, O_EXCL temp,
-    // atomic rename (a predictable-path symlink can't capture or truncate).
+    // Account credentials embed the account private key — write 0600 via O_EXCL
+    // temp + atomic rename in the pinned dir.
     match serde_json::to_vec(&creds) {
         Ok(json) => {
-            if let Err(e) = write_private_atomic(&creds_path, &json, None) {
-                log::warn!("acme: could not cache account credentials to {creds_path}: {e}");
+            if let Err(e) = write_secret_atomic(dir, &creds_name, &json, None) {
+                log::warn!("acme: could not cache account credentials: {e}");
             }
         }
         Err(e) => log::warn!("acme: could not serialize account credentials: {e}"),
@@ -429,11 +447,13 @@ mod tests {
     const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiA8cUWegRzXpawhI\neFydTRVo8XZtftk6JVs188iFnD+hRANCAAR1ETweKF6kwa1+xSYIYY4xqmzd5C/a\nzSuE7b+1Ttbj/aVo080GbqY3HAim/bruu0QmzMK3sVAghAJ5w3CdBMZF\n-----END PRIVATE KEY-----\n";
     const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBhDCCASugAwIBAgIUY2qpVCvSrv2kWbErBo0p+mjSMXIwCgYIKoZIzj0EAwIw\nGDEWMBQGA1UEAwwNY29tYmluZWQudGVzdDAeFw0yNjA3MjEwNTQ3MjdaFw0yNjA3\nMjMwNTQ3MjdaMBgxFjAUBgNVBAMMDWNvbWJpbmVkLnRlc3QwWTATBgcqhkjOPQIB\nBggqhkjOPQMBBwNCAAR1ETweKF6kwa1+xSYIYY4xqmzd5C/azSuE7b+1Ttbj/aVo\n080GbqY3HAim/bruu0QmzMK3sVAghAJ5w3CdBMZFo1MwUTAdBgNVHQ4EFgQUJ9Xi\nYOgnJn8BV/yHfFoRm1GBRN0wHwYDVR0jBBgwFoAUJ9XiYOgnJn8BV/yHfFoRm1GB\nRN0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAa6hsc1tumjZ47\nCI6cmgo0rMMBB4g43NcZPlpVUCr4FAIgXv8E0zt+D/AOpzdcFXNp/YdsL+H87Cmj\nRaa4N45/YA0=\n-----END CERTIFICATE-----\n";
 
-    fn test_dir(tag: &str) -> String {
+    fn test_dir(tag: &str) -> (String, crate::dirs::SecureDir) {
         let d = std::env::temp_dir().join(format!("sluice-acme-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
-        d.to_str().unwrap().to_string()
+        let path = d.to_str().unwrap().to_string();
+        let sd = crate::dirs::SecureDir::provision(&path).unwrap();
+        (path, sd)
     }
 
     fn set_mtime_secs_ago(path: &str, secs: u64) {
@@ -462,69 +482,69 @@ mod tests {
 
     #[test]
     fn migrates_legacy_pair_and_preserves_renewal_clock() {
-        let dir = test_dir("mig");
+        let (path, dir) = test_dir("mig");
         let cfg = AcmeCfg {
             contact: "t@example.com".into(),
             staging: false,
-            cache_dir: dir.clone(),
+            cache_dir: path.clone(),
         };
-        let (crt, key) = legacy_cert_paths(&cfg, "legacy.test");
-        std::fs::write(&crt, CERT_PEM).unwrap();
-        std::fs::write(&key, KEY_PEM).unwrap();
+        let (crt, key) = legacy_names(&cfg, "legacy.test");
+        std::fs::write(format!("{path}/{crt}"), CERT_PEM).unwrap();
+        std::fs::write(format!("{path}/{key}"), KEY_PEM).unwrap();
         // A 70-day-old legacy cert: must keep serving AND be due for renewal.
-        set_mtime_secs_ago(&crt, 70 * 24 * 3600);
+        set_mtime_secs_ago(&format!("{path}/{crt}"), 70 * 24 * 3600);
 
-        let c = load_or_migrate(&cfg, "legacy.test");
+        let c = load_or_migrate(&cfg, &dir, "legacy.test");
         assert!(c.is_some(), "legacy pair must load and serve");
-        let pem = cert_path(&cfg, "legacy.test");
-        Cert::from_combined_file(&pem).expect("migrated combined file must load");
+        let pem = format!("{path}/{}", cert_name(&cfg, "legacy.test"));
+        Cert::from_combined_pem(&std::fs::read(&pem).unwrap())
+            .expect("migrated combined file must load");
         // The migrated file keeps the legacy mtime → the 60-day clock says renew.
-        let drift = mtime_unix(&pem).abs_diff(mtime_unix(&crt));
+        let drift = mtime_unix(&pem).abs_diff(mtime_unix(&format!("{path}/{crt}")));
         assert!(drift < 5, "migration must preserve mtime (drift {drift}s)");
-        assert!(needs_cert(&cfg, "legacy.test"), "70d-old cert must renew");
+        assert!(
+            needs_cert(&cfg, &dir, "legacy.test"),
+            "70d-old cert must renew"
+        );
 
         // A fresh legacy pair must NOT trigger an immediate CA round-trip.
         std::fs::remove_file(&pem).unwrap();
-        set_mtime_secs_ago(&crt, 5 * 24 * 3600);
-        load_or_migrate(&cfg, "legacy.test").unwrap();
-        assert!(!needs_cert(&cfg, "legacy.test"), "5d-old cert is fresh");
-        let _ = std::fs::remove_dir_all(&dir);
+        set_mtime_secs_ago(&format!("{path}/{crt}"), 5 * 24 * 3600);
+        load_or_migrate(&cfg, &dir, "legacy.test").unwrap();
+        assert!(
+            !needs_cert(&cfg, &dir, "legacy.test"),
+            "5d-old cert is fresh"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 
-    // (cache-dir owner/mode/symlink hardening is now shared and tested in
-    // crate::dirs; here we only cover the ACME-specific atomic secret write.)
-
+    // (dir owner/mode/symlink + openat safety is tested in crate::dirs; here we
+    // cover the ACME atomic secret write: 0600, mtime stamp, symlink-safe.)
     #[test]
-    fn write_private_atomic_0600_symlink_safe_and_stamps_mtime() {
+    fn write_secret_atomic_0600_and_stamps_mtime() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = test_dir("wpa");
-        let target = format!("{dir}/creds.json");
-        write_private_atomic(&target, b"secret", None).unwrap();
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        let (path, dir) = test_dir("wpa");
+        write_secret_atomic(&dir, "creds.json", b"secret", None).unwrap();
+        let target = format!("{path}/creds.json");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
         assert_eq!(std::fs::read(&target).unwrap(), b"secret");
-        // A symlink pre-planted at the FINAL path must be replaced (rename
-        // unlinks the name), never followed into its target.
-        let victim = format!("{dir}/victim");
-        std::fs::write(&victim, b"untouched").unwrap();
-        let attacked = format!("{dir}/attacked.json");
-        std::os::unix::fs::symlink(&victim, &attacked).unwrap();
-        write_private_atomic(&attacked, b"new-secret", None).unwrap();
-        assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
-        assert_eq!(std::fs::read(&attacked).unwrap(), b"new-secret");
-        assert!(!std::fs::symlink_metadata(&attacked)
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        // Overwrite in place (rename replaces the name).
+        write_secret_atomic(&dir, "creds.json", b"new-secret", None).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"new-secret");
         // An explicit mtime is stamped atomically with the content.
         let old = std::time::SystemTime::now() - Duration::from_secs(90 * 24 * 3600);
-        let stamped = format!("{dir}/stamped.pem");
-        write_private_atomic(&stamped, b"x", Some(old)).unwrap();
-        let got = std::fs::metadata(&stamped).unwrap().modified().unwrap();
+        write_secret_atomic(&dir, "stamped.pem", b"x", Some(old)).unwrap();
+        let got = std::fs::metadata(format!("{path}/stamped.pem"))
+            .unwrap()
+            .modified()
+            .unwrap();
         assert!(
             got.duration_since(old).unwrap_or_default() < Duration::from_secs(5),
             "mtime must be the stamped value, not now"
         );
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

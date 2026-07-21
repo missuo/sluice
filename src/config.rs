@@ -1204,22 +1204,20 @@ impl Config {
                                 let dir = child_arg(node, "cache-dir")
                                     .unwrap_or("/var/lib/sluice/acme")
                                     .to_string();
-                                // Fail at --check/startup, not silently in the
-                                // background thread: the dir must be a real,
-                                // owned, 0700 directory (keys live there). The
-                                // stored path is CANONICAL so later opens can't
-                                // be re-routed via a parent symlink. Run
-                                // --check as the service user.
-                                match crate::dirs::secure_owned_dir(&dir) {
-                                    Ok(canon) => {
-                                        acme = Some(AcmeCfg {
-                                            contact: c.to_string(),
-                                            staging: child_bool(node, "staging").unwrap_or(false),
-                                            cache_dir: canon,
-                                        });
-                                    }
-                                    Err(e) => errs.push(format!("acme cache-dir: {e}")),
+                                // READ-ONLY validation here (parse runs for
+                                // `--check`, which must not touch the FS): if the
+                                // dir already exists it must be a non-symlink dir
+                                // owned by us. Startup does the create + 0700 +
+                                // fd-pinning via dirs::SecureDir. Run `--check` as
+                                // the service user for it to be meaningful.
+                                if let Err(e) = crate::dirs::validate(&dir) {
+                                    errs.push(format!("acme cache-dir: {e}"));
                                 }
+                                acme = Some(AcmeCfg {
+                                    contact: c.to_string(),
+                                    staging: child_bool(node, "staging").unwrap_or(false),
+                                    cache_dir: dir,
+                                });
                             }
                             None => errs.push("acme: `contact` (an email) is required".to_string()),
                         }
@@ -1242,23 +1240,19 @@ impl Config {
                         let max_files = child_int(node, "max-files")
                             .map(|v| v.max(1) as u64)
                             .unwrap_or(1_000_000);
-                        // Surface an unusable dir now (create it if missing)
-                        // rather than silently failing every cache write later,
-                        // and lock it down: a cache root another local user can
-                        // write lets them plant symlinks under the shard dirs.
-                        // The stored path is CANONICAL (parent symlinks resolved
-                        // once, here).
-                        match crate::dirs::secure_owned_dir(dir) {
-                            Ok(canon) => {
-                                disk_cache = Some(DiskCacheCfg {
-                                    dir: canon,
-                                    max_size,
-                                    max_files,
-                                    min_free,
-                                });
-                            }
-                            Err(e) => errs.push(format!("cache-store dir: {e}")),
+                        // READ-ONLY validation (see the acme note above): startup
+                        // creates + locks + fd-pins the dir via dirs::SecureDir,
+                        // and every cache write is done relative to that fd, so a
+                        // local user can't reroute a shard via a swapped symlink.
+                        if let Err(e) = crate::dirs::validate(dir) {
+                            errs.push(format!("cache-store dir: {e}"));
                         }
+                        disk_cache = Some(DiskCacheCfg {
+                            dir: dir.to_string(),
+                            max_size,
+                            max_files,
+                            min_free,
+                        });
                     }
                     None => errs.push("cache-store: `dir` is required".to_string()),
                 },
@@ -1662,6 +1656,22 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
                 ));
             }
             let index = child_arg(f, "index").unwrap_or("index.html").to_string();
+            // The index is appended as a path component when a directory is
+            // requested, so it MUST be a single, plain basename — `index
+            // "../Cargo.toml"` (or an absolute path) would otherwise escape the
+            // docroot. (open_regular_under also rejects bad components at
+            // request time; this is the first line of defense, at config load.)
+            if index.is_empty()
+                || index == "."
+                || index == ".."
+                || index.contains('/')
+                || index.contains('\\')
+                || index.contains('\0')
+            {
+                return Err(format!(
+                    "site `{host}`: file-server index must be a plain filename, not {index:?}"
+                ));
+            }
             Ok(Handler::File { root, index })
         }
         (None, None) => Err(format!("site `{host}`: needs an upstream or a file-server")),
@@ -1888,7 +1898,13 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
     }
 
     // Content-affecting fingerprint → cache namespace (see `Site.cache_epoch`).
-    let mut fp = String::new();
+    // Every field that can change what bytes an origin returns (or whether they
+    // were trust-verified) MUST be included, so a reload that changes it can't
+    // keep serving the old config's cached responses. The leading `v2` is a
+    // version tag: bump it whenever this format changes to force a clean
+    // namespace across an upgrade. (Missing `verify` here was a review finding —
+    // switching upstream-verify false→true kept serving unverified content.)
+    let mut fp = String::from("v2\u{1f}");
     {
         use std::fmt::Write;
         for loc in &locations {
@@ -1905,8 +1921,8 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
                     for sv in &g.servers {
                         let _ = write!(
                             fp,
-                            "U{}:{}:{}:{}:{:?}\u{1f}",
-                            sv.host, sv.port, sv.tls, sv.sni, sv.host_header
+                            "U{}:{}:tls={}:sni={}:verify={}:host={:?}\u{1f}",
+                            sv.host, sv.port, sv.tls, sv.sni, sv.verify, sv.host_header
                         );
                     }
                 }
@@ -1914,6 +1930,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
                     let _ = write!(fp, "F{root}:{index}\u{1f}");
                 }
             }
+            let _ = write!(fp, "ws={}:rt={:?}\u{1f}", loc.websocket, loc.read_timeout);
             for sf in &loc.sub_filters {
                 let _ = write!(fp, "S{:?}>{:?}\u{1f}", sf.from, sf.to);
             }
@@ -2175,6 +2192,32 @@ mod tests {
         )
         .unwrap();
         assert_ne!(same.sites[0].cache_epoch, filtered.sites[0].cache_epoch);
+        // upstream-verify false→true MUST change the epoch (was a review gap:
+        // switching to cert-verifying kept serving previously-unverified cache).
+        let mk = |verify: bool| {
+            Config::parse(&format!(
+                "listener \"0.0.0.0:80\" {{\n redirect-to-https true\n}}\nsite \"x\" {{\n upstream \"https://api.test\"\n upstream-verify {verify}\n}}\n",
+            ))
+            .unwrap()
+        };
+        assert_ne!(
+            mk(false).sites[0].cache_epoch,
+            mk(true).sites[0].cache_epoch,
+            "upstream-verify must be part of the cache namespace"
+        );
+    }
+
+    #[test]
+    fn file_server_index_must_be_a_basename() {
+        // `index "../Cargo.toml"` used to pass --check and escape the docroot.
+        let bad = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n file-server {\n root \".\"\n index \"../Cargo.toml\"\n }\n}\n";
+        assert!(
+            parse_err(bad).contains("plain filename"),
+            "{}",
+            parse_err(bad)
+        );
+        let abs = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n file-server {\n root \".\"\n index \"/etc/passwd\"\n }\n}\n";
+        assert!(parse_err(abs).contains("plain filename"));
     }
 
     #[test]

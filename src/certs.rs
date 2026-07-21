@@ -58,11 +58,6 @@ impl Cert {
     pub fn from_combined_pem(pem: &[u8]) -> Result<Cert, String> {
         Cert::from_pem(pem, pem)
     }
-
-    pub fn from_combined_file(path: &str) -> Result<Cert, String> {
-        let b = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-        Cert::from_combined_pem(&b)
-    }
 }
 
 /// SNI hostname → cert. The first-inserted cert is the fallback for an unknown SNI.

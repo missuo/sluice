@@ -141,21 +141,38 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   structurally impossible (the earlier two-file layout could produce exactly
   that if it crashed between its two renames with an equal-length body; a
   review caught the then-overstated claim). A file whose length doesn't match
-  its stamped sizes is treated as a miss. Files from the old two-file layout
-  are deleted by the reaper on sight.
+  its stamped sizes is treated as a miss. The reaper walks the tree via the
+  pinned root fd and only ever acts on files matching the cache's EXACT naming
+  (`<32hex>.ent`, a strictly-numeric `.tmp.<pid>.<seq>.<nanos>`, legacy
+  `<32hex>.meta`/`.body`) — a user's stray `keep.txt` or `.tmp.notes` is never
+  counted or deleted.
 - **Response cache is namespaced by a per-site config epoch.** The cache key
-  includes a fingerprint of the site's content-affecting config (location
-  matchers, upstream servers + Host rewrites, file roots, sub-filters). A
-  reload/restart/upgrade that repoints a site at a different upstream therefore
-  gets a fresh namespace and can never serve the OLD config's cached bodies;
-  identical config keeps the namespace, so the persistent disk cache still
-  survives a plain restart.
-- **Rate-limit table is hard-capped and fails open when full.** Buckets are keyed
-  by (host, client) with IPv6 collapsed to its /64, and the table is capped at
-  256k buckets. If an address-rotation flood fills it, NEW keys pass **un-limited**
-  (memory safety over strict limiting — such a flood already defeats a per-IP
-  limit) and a one-shot warning is logged; the 10-minute idle sweep then frees
-  space. Not a general high-cardinality limiter (no global request ceiling).
+  includes a versioned (`v2`) fingerprint of the site's content-affecting config:
+  location matchers, upstream host/port/TLS/SNI/**verify**/Host-rewrite, file
+  roots, websocket/read-timeout, and sub-filters. A reload/restart/upgrade that
+  changes ANY of these (e.g. flipping `upstream-verify` false→true — a review
+  gap that previously kept serving unverified content) gets a fresh namespace
+  and can never serve the OLD config's cached bodies; identical config keeps the
+  namespace, so the persistent disk cache still survives a plain restart. Bump
+  the `v2` tag whenever the fingerprint format changes.
+- **Private dirs (ACME store, disk cache) are pinned by fd, not path.** After
+  `dirs::SecureDir::provision` validates a directory (created 0700 if missing,
+  owner checked via `fstat`, locked with `fchmod` on the fd), EVERY later
+  operation is done relative to that fd via `openat`/`mkdirat`/`renameat`/
+  `unlinkat`, one component at a time with `O_NOFOLLOW`. So a local user who can
+  write a parent directory can neither reroute a key/cache write by swapping a
+  component for a symlink (the open fails) nor make the reaper delete outside the
+  tree. Provisioning (which mutates) happens only at startup; `--check` runs a
+  read-only `validate` and never creates or chmods anything.
+- **Rate-limit table is hard-capped with a per-host overflow bucket.** Buckets
+  are keyed by (host, client) with IPv6 collapsed to its /64; the per-client
+  table is capped at 256k. When full, a NEW client is throttled against a single
+  shared **per-host** bucket instead of getting its own entry — memory stays
+  bounded (one overflow bucket per configured host) AND rotating clients are
+  still limited (collectively), not fail-open. A one-shot warning is logged. It
+  is still not a general high-cardinality DDoS limiter (no global request
+  ceiling / eviction of the 256k live buckets); a determined flood degrades
+  legitimate new clients to the shared bucket's rate.
 - **Access log is a fixed line format (no JSON).** The access log emits a fixed
   field layout; there is no `json` access-log mode yet. Tracked as a "still
   later" item in DESIGN.
@@ -163,9 +180,17 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   `<prefix>-<sub>` to `<sub>` for routing/cache-keying while the bare upstream
   still received the client's original Host — a cross-Host cache-mixing bug. The
   feature is gone rather than patched; use a real `site` per host.
-- **No load/perf benchmark in-repo.** Correctness is covered by unit tests + live
-  manual verification; there is no committed throughput/latency benchmark or
-  load test yet.
+- **Benchmarks: micro yes, macro not committed.** `cargo bench` (benches/hot.rs)
+  measures the CPU-bound hot path deterministically (normalize_path ~0.15 µs,
+  accept_encoding_key ~0.3 µs, ketama_pick ~20 ns, stable_hash ~8 ns, a 2-site
+  config parse ~0.1 ms — indicative, machine-dependent). There is NO committed
+  end-to-end throughput / P50-P99 number: `scripts/loadtest.sh` (needs `oha`)
+  drives a running server for that, but the results aren't checked in, and the
+  reaper's full-scan cost at the million-file ceiling is still un-benchmarked.
+- **CI actions are major-tag pinned, not SHA-pinned.** All actions run on Node 24
+  (no deprecated Node-20 actions), but they use `@v5`/`@v2`-style tags. Full
+  commit-SHA pinning (a moved tag can't inject code) is the stricter posture and
+  is not yet applied.
 - **`protobuf` 2.28 has a CURRENT RustSec advisory —
   [RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437.html)
   (uncontrolled recursion → crash), fixed only in protobuf >= 3.7.** It reaches

@@ -9,6 +9,12 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# All actions are current majors running on Node 24 (checkout@v5,
+# Swatinem/rust-cache@v2, dtolnay/rust-toolchain@stable, taiki-e/install-action@v2)
+# — no Node 20 actions remain. NOTE: they are pinned to major-version tags, not
+# full commit SHAs; SHA-pinning is stricter (a moved tag can't inject code) and
+# is tracked in KNOWN_ISSUES.md rather than applied here with unverified SHAs.
+
 jobs:
   test:
     name: build / test / lint
@@ -22,14 +28,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Cache cargo registry and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      # Swatinem/rust-cache (Node 24) instead of actions/cache@v4 (Node 20).
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -50,34 +51,49 @@ jobs:
         # example below, whose absent cert/static paths force a non-zero exit.
         run: ./target/debug/sluice --check -c examples/smoke.kdl
 
-      - name: Validate full example config
-        # The example references paths that don't exist in CI (certs, static
-        # roots), so a non-zero exit with EXACTLY those filesystem errors is the
-        # expected outcome — and is asserted. A zero exit, empty output, panic,
-        # or any schema/type error line is a real regression and fails the job.
+      - name: Validate full example config (EXACT expected errors)
+        # The example references paths absent in CI (certs, static roots), so a
+        # non-zero exit is expected. We assert the output is EXACTLY the set of
+        # filesystem errors we expect — every non-header line must be a
+        # cert-not-found or root-not-a-directory error. Any OTHER line (a new bad
+        # regex, a semantic error, a panic, or a schema regression) fails the job,
+        # so this can't silently pass on a newly-introduced error.
         run: |
           set +e
           out=$(./target/debug/sluice --check -c examples/sluice.kdl 2>&1)
           rc=$?
           set -e
           echo "$out"
-          if [ "$rc" -eq 0 ]; then
-            echo "::error::expected a non-zero exit (missing cert/static paths)"; exit 1
-          fi
-          if [ -z "$out" ]; then
-            echo "::error::no output from --check"; exit 1
-          fi
-          if echo "$out" | grep -qi 'panic'; then
-            echo "::error::--check panicked"; exit 1
-          fi
-          echo "$out" | grep -q 'cert file not found' \
-            || { echo "::error::expected the missing-cert filesystem error"; exit 1; }
-          echo "$out" | grep -q 'file-server root not a directory' \
-            || { echo "::error::expected the missing-static-root filesystem error"; exit 1; }
-          if echo "$out" | grep -Ei 'unknown (property|directive)|takes no (properties|block)|given more than once|duplicate property|must be (an integer|a number|true|false|a quoted)|expected .* argument|not both|out of range|control character|not a valid hostname'; then
-            echo "::error::example config produced a schema/type error"
-            exit 1
-          fi
+          [ "$rc" -ne 0 ] || { echo "::error::expected non-zero exit"; exit 1; }
+          [ -n "$out" ] || { echo "::error::no output"; exit 1; }
+          bad=0
+          while IFS= read -r line; do
+            case "$line" in
+              "config error in "*) ;;                              # header
+              *"cert file not found:"*) ;;                         # expected
+              *"file-server root not a directory:"*) ;;            # expected
+              "") ;;
+              *) echo "::error::unexpected --check line: $line"; bad=1 ;;
+            esac
+          done <<< "$out"
+          [ "$bad" -eq 0 ] || exit 1
+
+  boringssl:
+    name: build / test (BoringSSL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: boringssl
+      # BoringSSL (boring-sys) needs these beyond the C toolchain on Ubuntu.
+      - name: Install BoringSSL build deps
+        run: sudo apt-get update && sudo apt-get install -y golang-go nasm ninja-build cmake clang
+      - name: Build (BoringSSL)
+        run: cargo build --no-default-features --features boringssl --verbose
+      - name: Test (BoringSSL)
+        run: cargo test --no-default-features --features boringssl --verbose
 
   audit:
     name: cargo audit (RustSec)

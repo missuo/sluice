@@ -396,31 +396,32 @@ benefit. Tracked as M5.
 - **M7 — production hardening — largely done, iterating under review:** zero-
   downtime binary upgrade (`-u` / SIGQUIT fd-handoff), weighted + Ketama +
   least-conn balancing, passive **and active** upstream health checks (probes
-  carry the site vhost, health state is scoped per pool and reset when the probe
-  config changes, a complete CRLF-terminated status line is required so a
-  fragmented/partial response can't fake an UP), a disk-backed cache (a custom
-  `pingora-cache` `Storage`: ONE file per entry, atomic single-rename publish,
-  size/count/free-space reaper that only ever touches cache-owned filenames,
-  cache key namespaced by a per-site config epoch so a reload can't serve a
-  retired upstream's entries), race-free static file serving (`openat`/
-  `O_NOFOLLOW` per component — no canonicalize→open TOCTOU), response-body
-  rewrite (`sub-filter`), six rounds of adversarial security review, and a
-  **declarative recursive config schema** — every node's positional args (count
-  + type + integer range), properties (names, types, duplicates), and children
-  (names, multiplicity, block-allowed) are validated at every nesting level.
-  This is a full *structural + value-range* schema (not yet a semantic model of
-  every cross-field invariant). Secrets (ACME keys, disk-cache temps) are
-  written via `O_EXCL` temps under owner-checked, canonicalized, 0700 dirs;
-  ACME certs are a single combined PEM (atomic publish, mtime stamped atomically
-  on migration) with legacy `.crt`/`.key` auto-migration. Verified live +
-  unit-tested; **not** claimed as "all blockers closed" — see KNOWN_ISSUES.md
-  for the standing gaps and the review-loop discipline.
+  carry the site vhost, state scoped per pool + reset on probe-config change, a
+  complete CRLF-terminated `HTTP/` status line required so a fragmented/partial
+  response can't fake an UP), a disk-backed cache (custom `pingora-cache`
+  `Storage`: ONE `.ent` file per entry, atomic single-rename publish, reaper that
+  only touches cache-owned names, key namespaced by a versioned per-site config
+  epoch — matchers/upstreams/**verify**/roots/sub-filters — so a reload can't
+  serve a retired upstream's entries), race-free static serving (`openat`/
+  `O_NOFOLLOW` per component; `Content-Length` from the streamed fd), response-
+  body rewrite (`sub-filter`), a rate limiter bounded by a 256k cap + per-host
+  overflow bucket (IPv6 /64), **seven** rounds of adversarial security review,
+  and a **declarative recursive config schema** validating every node's args
+  (count + type + integer range), properties (names/types/dups), and children
+  (names/multiplicity/block-allowed) at every level — a full *structural +
+  value-range* schema (not yet a model of every cross-field invariant). All
+  private directories (ACME keys, disk cache) are **pinned by fd** and every IO
+  is `openat`/`renameat`-relative with `O_NOFOLLOW`, so a swapped parent can't
+  reroute a secret write or a cache delete; secrets use `O_EXCL` temps; `--check`
+  is read-only. CPU hot-path micro-benchmarks live in `benches/`. Verified live +
+  unit-tested; **not** claimed as "all blockers closed" — see KNOWN_ISSUES.md for
+  standing gaps and the review-loop discipline.
 - **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
-  header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`,
-  rate-limit table hard cap tuning, load/perf benchmarks. See
-  **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items that are deliberately not
-  built or blocked upstream (notAfter-based ACME renewal, HTTP/3, Rustls,
-  full Lua/Rhai scripting) and why.
+  header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`, a
+  general high-cardinality rate limiter, committed end-to-end load/perf numbers
+  (P50/P99, million-file reaper), SHA-pinned CI actions. See
+  **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items deliberately not built or
+  blocked upstream (notAfter-based ACME renewal, HTTP/3, Rustls, full scripting).
 
 "nginx-like general tool" is explicitly out of scope (months, not weeks). By
 design, reload does not re-read `server{}`/listeners (those need a restart). The

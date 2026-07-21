@@ -159,7 +159,7 @@ fn decode_query_once(q: &str) -> String {
 /// matching can't be bypassed by encoding: percent-decode, collapse `//` and
 /// `.`, resolve `..`, and reject control/NUL bytes or non-UTF-8. Returns None
 /// for a malformed path (caller responds 400). Preserves a trailing slash.
-fn normalize_path(raw: &str) -> Option<String> {
+pub fn normalize_path(raw: &str) -> Option<String> {
     let b = raw.as_bytes();
     let mut dec = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -244,6 +244,18 @@ fn open_regular_under(
     let cstr = |b: &[u8]| {
         CString::new(b).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL"))
     };
+    // Defense in depth: reject any unsafe component here too, so this function is
+    // safe regardless of how comps were built (the caller already filters, and
+    // the file-server index is validated at config load).
+    let comp_cstr = |name: &str| -> std::io::Result<CString> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "unsafe path component",
+            ));
+        }
+        cstr(name.as_bytes())
+    };
     // The docroot itself is admin-controlled — open it following symlinks.
     let root_c = cstr(root.as_os_str().as_bytes())?;
     let base = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
@@ -253,7 +265,7 @@ fn open_regular_under(
     let mut dir = unsafe { OwnedFd::from_raw_fd(base) };
     let (parents, last) = comps.split_at(comps.len() - 1);
     for comp in parents {
-        let c = cstr(comp.as_bytes())?;
+        let c = comp_cstr(comp)?;
         // O_NOFOLLOW: a symlinked intermediate dir yields ELOOP → error.
         let fd = unsafe {
             libc::openat(
@@ -267,7 +279,7 @@ fn open_regular_under(
         }
         dir = unsafe { OwnedFd::from_raw_fd(fd) };
     }
-    let c = cstr(last[0].as_bytes())?;
+    let c = comp_cstr(&last[0])?;
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
@@ -589,7 +601,7 @@ fn weighted_random(servers: &[Upstream]) -> usize {
 }
 
 /// Ketama lookup: hash the key and take the first ring point clockwise.
-fn ketama_pick(ring: &[(u64, usize)], client_ip: &str) -> usize {
+pub fn ketama_pick(ring: &[(u64, usize)], client_ip: &str) -> usize {
     if ring.is_empty() {
         return 0;
     }
@@ -621,7 +633,7 @@ struct ActiveHealth {
 /// — q-values, client preference order, casing, duplicate lines — yields a
 /// distinct key, because the origin negotiates the encoding over the whole header
 /// and we don't parse it (see `cache_key_callback`).
-fn accept_encoding_key<'a>(lines: impl Iterator<Item = &'a [u8]>) -> String {
+pub fn accept_encoding_key<'a>(lines: impl Iterator<Item = &'a [u8]>) -> String {
     let mut ae: Vec<u8> = Vec::new();
     for l in lines {
         ae.extend_from_slice(l);
@@ -842,6 +854,10 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
 pub struct SluiceProxy {
     cfg: Arc<ArcSwap<Config>>,
     limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
+    /// One shared bucket per host, used when `limiter` is at capacity: new
+    /// clients are limited COLLECTIVELY (bounded memory — one entry per host —
+    /// but still limited, not fail-open).
+    overflow: Arc<DashMap<String, Bucket>>,
     /// One-shot flag so a full limiter table warns once, not per request.
     limiter_full_warned: std::sync::atomic::AtomicBool,
     /// Smooth-weighted-round-robin state (current weights) per (host, location).
@@ -877,25 +893,39 @@ impl SluiceProxy {
         let (storage, eviction): (
             &'static (dyn Storage + Sync),
             Option<&'static (dyn EvictionManager + Sync)>,
-        ) = if let Some(dc) = cfg.load().disk_cache.clone() {
-            let _ = std::fs::create_dir_all(&dc.dir);
-            crate::diskcache::spawn_reaper(
-                dc.dir.clone().into(),
-                dc.max_size,
-                dc.max_files,
-                dc.min_free,
-            );
-            let disk: &'static crate::diskcache::DiskCache =
-                Box::leak(Box::new(crate::diskcache::DiskCache::new(dc.dir)));
-            log::info!("sluice: response cache = disk");
-            (disk, None)
-        } else {
-            (&*CACHE_STORAGE, Some(&*CACHE_EVICTION))
+        ) = match cfg.load().disk_cache.clone() {
+            // Provision + pin the cache dir by fd ONCE at startup (create 0700,
+            // verify owner). All cache IO and the reaper operate relative to this
+            // fd, so a swapped parent/shard symlink can't reroute a write/delete.
+            Some(dc) => match crate::dirs::SecureDir::provision(&dc.dir) {
+                Ok(sd) => {
+                    let root = std::sync::Arc::new(sd);
+                    crate::diskcache::spawn_reaper(
+                        root.clone(),
+                        dc.max_size,
+                        dc.max_files,
+                        dc.min_free,
+                    );
+                    let disk: &'static crate::diskcache::DiskCache =
+                        Box::leak(Box::new(crate::diskcache::DiskCache::new(root)));
+                    log::info!("sluice: response cache = disk ({})", dc.dir);
+                    (disk, None)
+                }
+                Err(e) => {
+                    log::error!(
+                        "sluice: cache-store dir {}: {e}; falling back to in-memory cache",
+                        dc.dir
+                    );
+                    (&*CACHE_STORAGE as _, Some(&*CACHE_EVICTION as _))
+                }
+            },
+            None => (&*CACHE_STORAGE as _, Some(&*CACHE_EVICTION as _)),
         };
 
         SluiceProxy {
             cfg,
             limiter,
+            overflow: Arc::new(DashMap::new()),
             limiter_full_warned: std::sync::atomic::AtomicBool::new(false),
             rr: Arc::new(DashMap::new()),
             health: Arc::new(DashMap::new()),
@@ -1026,12 +1056,16 @@ impl SluiceProxy {
 
     /// Token bucket per (host, client-key). Returns true if allowed.
     ///
-    /// IPv6 clients are bucketed by their /64. The table is hard-capped: when
-    /// full, NEW keys pass un-limited (fail open) and a one-shot warning is
-    /// logged — bounding memory beats letting an address-rotation flood OOM the
-    /// proxy, and such a flood already evades a per-IP limit by construction.
+    /// IPv6 clients are bucketed by their /64. The per-client table is
+    /// hard-capped; when it is full, a NEW client is limited against a single
+    /// shared per-HOST overflow bucket instead of getting its own entry. That
+    /// bounds memory (one overflow bucket per configured host) under an
+    /// address-rotation flood WITHOUT failing open — rotating clients are then
+    /// throttled collectively rather than passing freely. A one-shot warning is
+    /// logged when overflow first engages.
     fn allow(&self, host: &str, ip: IpAddr, rl: RateLimit) -> bool {
         const LIMITER_MAX_ENTRIES: usize = 262_144;
+        let now = Instant::now();
         let key = (host.to_string(), limiter_key_ip(ip));
         if self.limiter.len() >= LIMITER_MAX_ENTRIES && !self.limiter.contains_key(&key) {
             if !self
@@ -1039,26 +1073,34 @@ impl SluiceProxy {
                 .swap(true, std::sync::atomic::Ordering::Relaxed)
             {
                 log::warn!(
-                    "rate-limit table full ({LIMITER_MAX_ENTRIES} buckets); new clients \
-                     pass unlimited until the 10-min sweep frees space"
+                    "rate-limit table full ({LIMITER_MAX_ENTRIES} buckets); new clients are \
+                     throttled against a shared per-host bucket until the 10-min sweep frees space"
                 );
             }
-            return true;
+            let mut b = self.overflow.entry(host.to_string()).or_insert(Bucket {
+                tokens: rl.burst,
+                last: now,
+            });
+            return take_token(&mut b, rl, now);
         }
-        let now = Instant::now();
         let mut b = self.limiter.entry(key).or_insert(Bucket {
             tokens: rl.burst,
             last: now,
         });
-        let elapsed = now.duration_since(b.last).as_secs_f64();
-        b.tokens = (b.tokens + elapsed * rl.rps).min(rl.burst);
-        b.last = now;
-        if b.tokens >= 1.0 {
-            b.tokens -= 1.0;
-            true
-        } else {
-            false
-        }
+        take_token(&mut b, rl, now)
+    }
+}
+
+/// Refill and try to spend one token. Returns true if the request is allowed.
+fn take_token(b: &mut Bucket, rl: RateLimit, now: Instant) -> bool {
+    let elapsed = now.duration_since(b.last).as_secs_f64();
+    b.tokens = (b.tokens + elapsed * rl.rps).min(rl.burst);
+    b.last = now;
+    if b.tokens >= 1.0 {
+        b.tokens -= 1.0;
+        true
+    } else {
+        false
     }
 }
 

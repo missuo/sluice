@@ -3,14 +3,6 @@
 //!   sluice -c /etc/sluice/sluice.kdl        # run
 //!   sluice --check -c sluice.kdl            # validate config and exit
 
-mod acme;
-mod certs;
-mod config;
-mod dirs;
-mod diskcache;
-mod metrics;
-mod proxy;
-
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -20,8 +12,9 @@ use pingora::server::configuration::{Opt, ServerConf};
 use pingora::server::Server;
 use pingora::services::listening::Service as ListeningService;
 
-use config::{Config, ListenerKind};
-use proxy::{RedirectProxy, SluiceProxy};
+use sluice::config::{Config, ListenerKind};
+use sluice::proxy::{RedirectProxy, SluiceProxy};
+use sluice::{acme, certs};
 
 const DEFAULT_CONFIG: &str = "/etc/sluice/sluice.kdl";
 

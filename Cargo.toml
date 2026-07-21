@@ -26,6 +26,21 @@ pingora-error = "0.8"
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "io-util", "net"] }
 
+[lib]
+name = "sluice"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sluice"
+path = "src/main.rs"
+
+[dev-dependencies]
+criterion = { version = "0.5", default-features = false }
+
+[[bench]]
+name = "hot"
+harness = false
+
 [features]
 # Default is OpenSSL — verified working behind Cloudflare (OpenSSL 3.5.x origin,
 # no 525). BoringSSL is an OPTIONAL alternative (Cloudflare's own stack, static

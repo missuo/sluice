@@ -2,28 +2,29 @@
 //!
 //! Cloudflare only ships an in-memory `MemCache` ("testing only, not for
 //! production"); this stores each entry as ONE file under a 2-level sharded
-//! directory (`<hash>.ent`):
+//! directory (`<ab>/<cd>/<hash>.ent`):
 //!
 //! ```text
 //! [u64 body-size][u32 internal-len][u32 header-len][internal][header][body]
 //! ```
 //!
-//! The entry is written to a unique temp file, fsync'd, and published with a
-//! SINGLE atomic rename (parent dir fsync'd after), so a crash at any point
-//! leaves either the previous complete entry or none. Meta and body live in the
-//! same file, so they can never disagree — the earlier two-file layout could
-//! pair an old meta with a new same-length body if it crashed between its two
-//! renames. The stored body-size doubles as the integrity check: a file whose
-//! length doesn't equal `16 + internal + header + body` is treated as a miss.
+//! Every filesystem operation is done relative to a pinned root directory FD
+//! (`crate::dirs::SecureDir`) via `openat`/`renameat`/`unlinkat`, one component
+//! at a time with `O_NOFOLLOW`. A local user who can write the cache dir can
+//! therefore neither reroute a write by swapping a shard for a symlink (the open
+//! fails) nor make the reaper delete a file outside the tree. The entry is
+//! written to an unpredictably-named `O_EXCL` temp, fsync'd, and published with
+//! a SINGLE `renameat`, so a crash leaves either the previous complete entry or
+//! none — meta and body share one file and can't disagree.
 //!
-//! Streaming partial writes are not supported (`support_streaming_partial_write`
-//! returns false), so a reader never sees an entry until the writer finishes.
-//! A background reaper bounds the total on-disk size / file count / free space,
-//! and also clears temp files and legacy two-file (`.meta`/`.body`) entries.
+//! Streaming partial writes are not supported, so a reader never sees an entry
+//! until the writer finishes. A background reaper bounds total size / file count
+//! / free space and clears temp files + legacy (`.meta`/`.body`) entries; it
+//! only ever touches files matching the cache's exact naming.
 
 use std::any::Any;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -37,6 +38,8 @@ use pingora_cache::{CacheKey, CacheMeta};
 use pingora_error::{Error, ErrorType, Result};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
+use crate::dirs::SecureDir;
+
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Sanity cap on the serialized meta (internal + header) length read back from
@@ -49,32 +52,18 @@ fn err(ctx: &'static str) -> impl FnOnce(std::io::Error) -> Box<Error> {
     move |e| Error::because(ErrorType::InternalError, ctx, e)
 }
 
-/// An unpredictable temp name in `dir`: `.tmp.<pid>.<seq>.<nanos>`. The nanos
-/// component means a local attacker who can write the shard directory can't
-/// pre-create the exact name to win the create race (combined with O_EXCL
-/// below, a losing race is an error, never a followed symlink).
-fn tmp_in(dir: &Path) -> PathBuf {
+/// An unpredictable temp name: `.tmp.<pid>.<seq>.<nanos>`. Combined with the
+/// `O_EXCL` create in `SecureDir`, a local attacker can't pre-create the name to
+/// win the race — a losing race is an error, never a followed symlink.
+fn tmp_name() -> String {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
         .unwrap_or(0);
-    dir.join(format!(".tmp.{}.{seq}.{nanos}", std::process::id()))
+    format!(".tmp.{}.{seq}.{nanos}", std::process::id())
 }
 
-/// Create a fresh file with O_CREAT|O_EXCL (`create_new`): it fails rather than
-/// follow a pre-planted symlink or truncate an existing file. The cache root is
-/// already validated (owned, 0700, canonical) at config load, so this closes
-/// the remaining shard-level symlink race.
-async fn create_new(path: &Path) -> std::io::Result<tokio::fs::File> {
-    tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .await
-}
-
-/// The 16-byte entry prefix.
 fn encode_prefix(body_size: u64, il: usize, hl: usize) -> [u8; PREFIX_LEN] {
     let mut p = [0u8; PREFIX_LEN];
     p[0..8].copy_from_slice(&body_size.to_le_bytes());
@@ -90,35 +79,24 @@ fn decode_prefix(p: &[u8; PREFIX_LEN]) -> (u64, usize, usize) {
     (body_size, il, hl)
 }
 
-/// fsync the directory holding `path` so a freshly renamed entry survives a
-/// power loss. Best-effort by design here: a cache entry that vanishes on crash
-/// is only a future miss, unlike the ACME store where durability is critical.
-fn sync_parent_dir(path: &Path) {
-    #[cfg(unix)]
-    if let Some(parent) = path.parent() {
-        if let Ok(d) = std::fs::File::open(parent) {
-            let _ = d.sync_all();
-        }
-    }
-}
-
 pub struct DiskCache {
-    root: PathBuf,
+    root: Arc<SecureDir>,
 }
 
 impl DiskCache {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        DiskCache { root: root.into() }
+    pub fn new(root: Arc<SecureDir>) -> Self {
+        DiskCache { root }
     }
 
-    /// Entry path for a key hash, sharded two directories deep.
-    fn entry_path(&self, hash: &str) -> PathBuf {
-        // `combined()` is a 32-char hex string, so [0..4] is always present.
-        self.root
-            .join(&hash[0..2])
-            .join(&hash[2..4])
-            .join(format!("{hash}.ent"))
+    /// Open (creating) the 2-level shard directory for a key hash, relative to
+    /// the pinned root fd. `combined()` is 32 hex chars so [0..4] is always hex.
+    fn shard(&self, hash: &str) -> std::io::Result<SecureDir> {
+        self.root.sub(&hash[0..2])?.sub(&hash[2..4])
     }
+}
+
+fn entry_file(hash: &str) -> String {
+    format!("{hash}.ent")
 }
 
 // ---- hit handler: stream the body out of the entry file ----
@@ -166,12 +144,13 @@ impl HandleHit for DiskHit {
     }
 }
 
-// ---- miss handler: build the whole entry in a temp, one rename on finish ----
+// ---- miss handler: build the whole entry in a temp, one renameat on finish ----
 
 struct DiskMiss {
     file: Option<tokio::fs::File>,
-    tmp: PathBuf,
-    entry_path: PathBuf,
+    shard: SecureDir,
+    tmp: String,
+    entry: String,
     written: usize,
     done: bool,
 }
@@ -194,8 +173,7 @@ impl HandleMiss for DiskMiss {
             .take()
             .ok_or_else(|| Error::new_str("disk cache: miss handler already finished"))?;
         f.flush().await.map_err(err("disk cache flush"))?;
-        // Patch the actual body size into the prefix (written as 0 at create
-        // time, before the body length was known).
+        // Patch the real body size into the prefix (written as 0 at create time).
         f.seek(std::io::SeekFrom::Start(0))
             .await
             .map_err(err("disk cache seek"))?;
@@ -204,12 +182,11 @@ impl HandleMiss for DiskMiss {
             .map_err(err("disk cache stamp size"))?;
         f.sync_all().await.map_err(err("disk cache fsync"))?;
         drop(f);
-        // ONE atomic publish — a reader sees the old entry or the new one,
-        // never a mixed or partial state.
-        tokio::fs::rename(&self.tmp, &self.entry_path)
-            .await
+        // ONE atomic publish via renameat within the pinned shard dir.
+        self.shard
+            .rename(&self.tmp, &self.entry)
             .map_err(err("disk cache publish"))?;
-        sync_parent_dir(&self.entry_path);
+        let _ = self.shard.sync();
         self.done = true;
         Ok(MissFinishType::Created(self.written))
     }
@@ -217,17 +194,16 @@ impl HandleMiss for DiskMiss {
 
 impl Drop for DiskMiss {
     fn drop(&mut self) {
-        // An abandoned write (client disconnected mid-fill) leaves a temp file.
         if !self.done {
-            let _ = std::fs::remove_file(&self.tmp);
+            let _ = self.shard.remove(&self.tmp);
         }
     }
 }
 
-/// Read and validate an entry file: returns the parsed meta and the file with
-/// its cursor at the body offset. Any IO/decode/length problem → None (a miss).
-async fn open_entry(path: &Path) -> Option<(CacheMeta, tokio::fs::File, u64)> {
-    let mut file = tokio::fs::File::open(path).await.ok()?;
+/// Read + validate an entry file (relative to `shard`): parsed meta + the file
+/// with its cursor at the body offset. Any IO/decode/length problem → None.
+async fn open_entry(shard: &SecureDir, name: &str) -> Option<(CacheMeta, tokio::fs::File, u64)> {
+    let mut file = tokio::fs::File::from_std(shard.open_read(name).ok()?);
     let mut prefix = [0u8; PREFIX_LEN];
     file.read_exact(&mut prefix).await.ok()?;
     let (body_size, il, hl) = decode_prefix(&prefix);
@@ -237,7 +213,6 @@ async fn open_entry(path: &Path) -> Option<(CacheMeta, tokio::fs::File, u64)> {
     let mut meta_buf = vec![0u8; il + hl];
     file.read_exact(&mut meta_buf).await.ok()?;
     let meta = CacheMeta::deserialize(&meta_buf[..il], &meta_buf[il..]).ok()?;
-    // Single integrity check: the file must be exactly prefix + meta + body.
     let actual = file.metadata().await.ok()?.len();
     if actual != (PREFIX_LEN + il + hl) as u64 + body_size {
         return None;
@@ -252,9 +227,12 @@ impl Storage for DiskCache {
         key: &CacheKey,
         _trace: &SpanHandle,
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
-        let path = self.entry_path(&key.combined());
-        // Any IO/parse problem is treated as a miss (robust, never fails a request).
-        let Some((meta, file, body_size)) = open_entry(&path).await else {
+        let hash = key.combined();
+        let Ok(shard) = self.shard(&hash) else {
+            return Ok(None);
+        };
+        // Any IO/parse problem is a miss (robust, never fails a request).
+        let Some((meta, file, body_size)) = open_entry(&shard, &entry_file(&hash)).await else {
             return Ok(None);
         };
         let hit = DiskHit {
@@ -271,17 +249,13 @@ impl Storage for DiskCache {
         meta: &CacheMeta,
         _trace: &SpanHandle,
     ) -> Result<MissHandler> {
-        let path = self.entry_path(&key.combined());
-        if let Some(dir) = path.parent() {
-            tokio::fs::create_dir_all(dir)
-                .await
-                .map_err(err("disk cache mkdir"))?;
-        }
+        let hash = key.combined();
+        let shard = self.shard(&hash).map_err(err("disk cache mkdir"))?;
         let (internal, header) = meta.serialize()?;
-        let dir = path.parent().unwrap_or(&self.root);
-        let tmp = tmp_in(dir);
-        let mut file = create_new(&tmp).await.map_err(err("disk cache create"))?;
-        // Body size is stamped at finish; 0 for now.
+        let tmp = tmp_name();
+        let mut file =
+            tokio::fs::File::from_std(shard.create_new(&tmp).map_err(err("disk cache create"))?);
+        // Body size stamped at finish; 0 for now.
         file.write_all(&encode_prefix(0, internal.len(), header.len()))
             .await
             .map_err(err("disk cache write prefix"))?;
@@ -293,8 +267,9 @@ impl Storage for DiskCache {
             .map_err(err("disk cache write meta"))?;
         Ok(Box::new(DiskMiss {
             file: Some(file),
+            shard,
             tmp,
-            entry_path: path,
+            entry: entry_file(&hash),
             written: 0,
             done: false,
         }))
@@ -306,8 +281,11 @@ impl Storage for DiskCache {
         _purge_type: PurgeType,
         _trace: &SpanHandle,
     ) -> Result<bool> {
-        let path = self.entry_path(&key.combined());
-        Ok(tokio::fs::remove_file(&path).await.is_ok())
+        let hash = key.combined();
+        let Ok(shard) = self.shard(&hash) else {
+            return Ok(false);
+        };
+        Ok(shard.remove(&entry_file(&hash)).is_ok())
     }
 
     async fn update_meta(
@@ -316,17 +294,20 @@ impl Storage for DiskCache {
         meta: &CacheMeta,
         _trace: &SpanHandle,
     ) -> Result<bool> {
-        // Rebuild the entry with the new meta and the existing body, then swap
-        // it in with the same single-rename publish as a fresh write.
-        let path = self.entry_path(&key.combined());
-        let Some((_, mut old, _)) = open_entry(&path).await else {
+        // Rebuild the entry with new meta + existing body, published by the same
+        // single-renameat swap as a fresh write.
+        let hash = key.combined();
+        let name = entry_file(&hash);
+        let Ok(shard) = self.shard(&hash) else {
+            return Ok(false);
+        };
+        let Some((_, mut old, _)) = open_entry(&shard, &name).await else {
             return Ok(false);
         };
         let (internal, header) = meta.serialize()?;
-        let dir = path.parent().unwrap_or(&self.root).to_path_buf();
-        let tmp = tmp_in(&dir);
-        let res: std::result::Result<u64, std::io::Error> = async {
-            let mut f = create_new(&tmp).await?;
+        let tmp = tmp_name();
+        let res: std::result::Result<(), std::io::Error> = async {
+            let mut f = tokio::fs::File::from_std(shard.create_new(&tmp)?);
             f.write_all(&encode_prefix(0, internal.len(), header.len()))
                 .await?;
             f.write_all(&internal).await?;
@@ -334,18 +315,19 @@ impl Storage for DiskCache {
             let copied = tokio::io::copy(&mut old, &mut f).await?;
             f.seek(std::io::SeekFrom::Start(0)).await?;
             f.write_all(&copied.to_le_bytes()).await?;
-            f.sync_all().await?;
-            tokio::fs::rename(&tmp, &path).await?;
-            Ok(copied)
+            f.sync_all().await
         }
         .await;
         match res {
-            Ok(_) => {
-                sync_parent_dir(&path);
+            Ok(()) => {
+                shard
+                    .rename(&tmp, &name)
+                    .map_err(err("disk cache update"))?;
+                let _ = shard.sync();
                 Ok(true)
             }
             Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
+                let _ = shard.remove(&tmp);
                 Err(err("disk cache update meta")(e))
             }
         }
@@ -365,50 +347,120 @@ impl Storage for DiskCache {
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Entry,  // <hash>.ent — an evictable cache entry
-    Tmp,    // .tmp.* — our own in-progress write (reaped only when stale)
+    Tmp,    // .tmp.<pid>.<seq>.<nanos> — our own in-progress write
     Legacy, // <hash>.meta / <hash>.body — retired layout, reaped on sight
 }
 
-type Entry = (PathBuf, u64, SystemTime, Kind); // (path, size, mtime, kind)
+// (l1 shard, l2 shard, filename, size, mtime, kind)
+type Entry = (String, String, String, u64, SystemTime, Kind);
 
-/// Every 30s, bound the cache: keep total size under `max_size`, file count under
-/// `max_files` (inode-exhaustion guard), and at least `min_free` bytes free on
-/// the filesystem — evicting the oldest entries when any is exceeded. Also reaps
-/// temp files leaked by a hard kill and legacy two-file (`.meta`/`.body`)
-/// entries from the pre-single-file layout (invisible to lookups, so they would
-/// otherwise squat in the cache until size pressure evicted them). Runs in a
-/// plain thread (blocking IO), and reclaims a previous run's files so the bound
-/// survives restarts.
-pub fn spawn_reaper(root: PathBuf, max_size: u64, max_files: u64, min_free: u64) {
+/// Is `s` a 32-char lowercase-hex cache hash (`CacheHashKey::combined()`)?
+fn is_hash(s: &str) -> bool {
+    s.len() == 32
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Is `s` a 2-char lowercase-hex shard name?
+fn is_shard(s: &str) -> bool {
+    s.len() == 2
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Classify a filename as one the cache OWNS, or `None` to leave it alone. A
+/// temp is STRICTLY `.tmp.<digits>.<digits>.<digits>` — a foreign `.tmp.notes`
+/// must NOT be treated as ours and deleted (a review finding).
+fn classify(name: &str) -> Option<Kind> {
+    if let Some(rest) = name.strip_prefix(".tmp.") {
+        let parts: Vec<&str> = rest.split('.').collect();
+        let ours = parts.len() == 3
+            && parts
+                .iter()
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+        return ours.then_some(Kind::Tmp);
+    }
+    let (stem, ext) = name.rsplit_once('.')?;
+    match ext {
+        "ent" if is_hash(stem) => Some(Kind::Entry),
+        "meta" | "body" if is_hash(stem) => Some(Kind::Legacy),
+        _ => None,
+    }
+}
+
+/// Every 30s, bound the cache (total size / file count / free space) by evicting
+/// oldest entries; reap stale temps and legacy files. Only ever touches
+/// cache-owned names, and does every delete via the pinned root fd, so a
+/// swapped-in symlink can't redirect a delete outside the tree.
+pub fn spawn_reaper(root: Arc<SecureDir>, max_size: u64, max_files: u64, min_free: u64) {
     std::thread::spawn(move || loop {
-        // 30s balances the enforcement window against the cost of the full
-        // directory walk + sort (which grows with the file count).
         std::thread::sleep(Duration::from_secs(30));
         reap(&root, max_size, max_files, min_free);
     });
 }
 
-fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
+/// Collect cache-owned files by walking `root` two shard levels deep, all via
+/// the pinned fd (`entries`/`sub`/`stat` are `*at`-relative + `O_NOFOLLOW`).
+fn collect(root: &SecureDir, out: &mut Vec<Entry>, total: &mut u64) {
+    let Ok(l1s) = root.entries() else { return };
+    for l1 in l1s {
+        if !is_shard(&l1) || !root.stat(&l1).map(|s| s.0 && !s.1).unwrap_or(false) {
+            continue;
+        }
+        let Ok(d1) = root.sub(&l1) else { continue };
+        let Ok(l2s) = d1.entries() else { continue };
+        for l2 in l2s {
+            if !is_shard(&l2) || !d1.stat(&l2).map(|s| s.0 && !s.1).unwrap_or(false) {
+                continue;
+            }
+            let Ok(d2) = d1.sub(&l2) else { continue };
+            let Ok(names) = d2.entries() else { continue };
+            for name in names {
+                let Some(kind) = classify(&name) else {
+                    continue;
+                };
+                // stat NOFOLLOW; skip anything that isn't a plain file.
+                let Ok((is_dir, is_link, size, mtime)) = d2.stat(&name) else {
+                    continue;
+                };
+                if is_dir || is_link {
+                    continue;
+                }
+                *total += size;
+                out.push((l1.clone(), l2.clone(), name, size, mtime, kind));
+            }
+        }
+    }
+}
+
+fn remove_entry(root: &SecureDir, e: &Entry) -> bool {
+    let Ok(d1) = root.sub(&e.0) else { return false };
+    let Ok(d2) = d1.sub(&e.1) else { return false };
+    let ok = d2.remove(&e.2).is_ok();
+    if ok {
+        let _ = d2.sync();
+    }
+    ok
+}
+
+fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
     let now = SystemTime::now();
     let mut entries: Vec<Entry> = Vec::new();
     let mut total_size: u64 = 0;
-    // collect() only gathers files the cache itself owns (see `classify`); any
-    // unrelated file a user left under the dir is never counted or deleted.
     collect(root, &mut entries, &mut total_size);
-    entries.sort_by_key(|e| e.2); // oldest first
+    entries.sort_by_key(|e| e.4); // oldest first
 
-    // 1) Always delete leaked temp files (a hard kill left them behind; a fresh
-    //    temp is an in-progress write and is kept, but still counted) and
-    //    legacy-format files (unreadable by the single-file layout).
-    entries.retain(|(p, sz, mtime, kind)| {
-        let stale_tmp = *kind == Kind::Tmp
+    // 1) Delete stale temps (a hard kill left them; a fresh temp is an
+    //    in-progress write, kept but counted) and legacy files on sight.
+    entries.retain(|e| {
+        let stale_tmp = e.5 == Kind::Tmp
             && now
-                .duration_since(*mtime)
+                .duration_since(e.4)
                 .map(|d| d > Duration::from_secs(300))
                 .unwrap_or(false);
-        if stale_tmp || *kind == Kind::Legacy {
-            if std::fs::remove_file(p).is_ok() {
-                total_size = total_size.saturating_sub(*sz);
+        if stale_tmp || e.5 == Kind::Legacy {
+            if remove_entry(root, e) {
+                total_size = total_size.saturating_sub(e.3);
             }
             false
         } else {
@@ -422,99 +474,42 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
     if total_size <= max_size && count <= max_files && avail >= min_free {
         return;
     }
-    // Evict to ~90% of the cap, but never below 1 — for a tiny `max-files` (e.g.
-    // 5) `max_files / 10 * 9` rounds to 0, which would wipe the whole cache.
+    // Evict to ~90% of the cap but never below 1 (a tiny `max-files` would
+    // otherwise round its target to 0 and wipe the whole cache).
     let size_target = (max_size / 10 * 9).max(1);
     let count_target = (max_files - max_files / 10).max(1);
     let mut to_free_for_space = min_free.saturating_sub(avail);
-    // If freeing the ENTIRE cache still wouldn't reach min_free, the floor is
-    // unachievable (other data on the volume holds the space) — don't pointlessly
-    // wipe the whole cache; just enforce the size/count caps.
     if to_free_for_space > total_size {
-        to_free_for_space = 0;
+        to_free_for_space = 0; // floor unachievable — don't wipe the cache
     }
-    for (p, sz, _, kind) in entries {
+    for e in entries {
         if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
             break;
         }
-        if kind == Kind::Tmp {
+        if e.5 == Kind::Tmp {
             continue; // never delete an in-progress write
         }
-        if std::fs::remove_file(&p).is_ok() {
-            total_size = total_size.saturating_sub(sz);
+        if remove_entry(root, &e) {
+            total_size = total_size.saturating_sub(e.3);
             count = count.saturating_sub(1);
-            to_free_for_space = to_free_for_space.saturating_sub(sz);
+            to_free_for_space = to_free_for_space.saturating_sub(e.3);
         }
     }
 }
 
-/// Is `stem` a 32-char lowercase-hex cache hash (`CacheHashKey::combined()`)?
-fn is_hash_stem(stem: &str) -> bool {
-    stem.len() == 32
-        && stem
-            .bytes()
-            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-}
-
-/// Classify a filename as one the cache OWNS, or `None` for an unrelated file
-/// the reaper must leave completely alone. The cache only ever creates:
-/// `<32-hex>.ent` (entries), `.tmp.<pid>.<seq>.<nanos>` (its own temps), and —
-/// from the retired layout — `<32-hex>.meta` / `<32-hex>.body`.
-fn classify(name: &str) -> Option<Kind> {
-    if name.starts_with(".tmp.") {
-        return Some(Kind::Tmp);
-    }
-    let (stem, ext) = name.rsplit_once('.')?;
-    match ext {
-        "ent" if is_hash_stem(stem) => Some(Kind::Entry),
-        "meta" | "body" if is_hash_stem(stem) => Some(Kind::Legacy),
-        _ => None,
-    }
-}
-
-fn collect(dir: &Path, out: &mut Vec<Entry>, total: &mut u64) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let p = e.path();
-        let Ok(ft) = e.file_type() else { continue };
-        if ft.is_dir() {
-            collect(&p, out, total);
-            continue;
-        }
-        // Only files the cache itself created are eligible — a user's stray
-        // file (`notes.txt`, `important.meta` with a non-hash name) is ignored,
-        // never counted toward the caps and never deleted.
-        let name = e.file_name();
-        let Some(kind) = classify(&name.to_string_lossy()) else {
-            continue;
-        };
-        let Ok(md) = e.metadata() else { continue };
-        *total += md.len();
-        out.push((
-            p,
-            md.len(),
-            md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-            kind,
-        ));
-    }
-}
-
-/// Free bytes on the filesystem holding `path` (via statvfs). None on failure.
+/// Free bytes on the filesystem holding the cache (via fstatvfs on the root fd).
 #[cfg(unix)]
-fn avail_bytes(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+fn avail_bytes(root: &SecureDir) -> Option<u64> {
+    use std::os::unix::io::AsRawFd;
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0 {
+    if unsafe { libc::fstatvfs(root.as_raw_fd(), &mut st) } == 0 {
         Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
     } else {
         None
     }
 }
 #[cfg(not(unix))]
-fn avail_bytes(_path: &Path) -> Option<u64> {
+fn avail_bytes(_root: &SecureDir) -> Option<u64> {
     None
 }
 
@@ -523,6 +518,7 @@ mod tests {
     use super::*;
     use pingora::http::ResponseHeader;
     use pingora_cache::trace::Span;
+    use std::path::PathBuf;
 
     fn meta(server_tag: &str) -> CacheMeta {
         let mut h = ResponseHeader::build(200, None).unwrap();
@@ -531,11 +527,12 @@ mod tests {
         CacheMeta::new(now + Duration::from_secs(60), now, 0, 0, h)
     }
 
-    fn test_cache(tag: &str) -> &'static DiskCache {
+    fn test_cache(tag: &str) -> (&'static DiskCache, PathBuf) {
         let dir = std::env::temp_dir().join(format!("sluice-disk-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        Box::leak(Box::new(DiskCache::new(dir)))
+        let sd = Arc::new(SecureDir::provision(dir.to_str().unwrap()).unwrap());
+        (Box::leak(Box::new(DiskCache::new(sd))), dir)
     }
 
     async fn write_entry(cache: &'static DiskCache, key: &CacheKey, m: &CacheMeta, body: &[u8]) {
@@ -558,56 +555,43 @@ mod tests {
     }
 
     #[test]
-    fn classify_only_recognizes_cache_owned_files() {
-        let h = "0123456789abcdef0123456789abcdef"; // 32 hex
+    fn classify_strict_tmp_and_hash_names() {
+        let h = "0123456789abcdef0123456789abcdef";
         assert!(matches!(classify(&format!("{h}.ent")), Some(Kind::Entry)));
         assert!(matches!(classify(&format!("{h}.meta")), Some(Kind::Legacy)));
-        assert!(matches!(classify(&format!("{h}.body")), Some(Kind::Legacy)));
         assert!(matches!(classify(".tmp.123.4.5"), Some(Kind::Tmp)));
-        // A user's own files are NOT owned — reaper must ignore them.
-        assert!(classify("keep-1.txt").is_none());
+        // Foreign files (incl. a non-numeric .tmp.*) are NOT owned.
+        assert!(classify(".tmp.notes").is_none());
+        assert!(classify(".tmp.important").is_none());
+        assert!(classify(".tmp.1.2").is_none()); // wrong arity
+        assert!(classify(".tmp.a.b.c").is_none()); // non-numeric
+        assert!(classify("keep.txt").is_none());
         assert!(classify("important.meta").is_none()); // non-hash stem
-        assert!(classify("notes.body").is_none());
-        assert!(classify(&format!("{h}.txt")).is_none());
-        assert!(classify("0123.ent").is_none()); // wrong hash length
-        assert!(classify(&format!("{}.ent", h.to_uppercase())).is_none()); // uppercase
+        assert!(classify(&format!("{}.ent", h.to_uppercase())).is_none());
     }
 
     #[test]
     fn reaper_never_touches_foreign_files() {
         let dir = std::env::temp_dir().join(format!("sluice-reap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // Foreign files a user might have left in (or pointed) the cache dir.
+        std::fs::create_dir_all(dir.join("01").join("23")).unwrap();
         std::fs::write(dir.join("keep-1.txt"), b"important").unwrap();
-        std::fs::write(dir.join("important.meta"), b"user data").unwrap();
+        std::fs::write(dir.join(".tmp.important"), b"foreign tmp").unwrap();
+        std::fs::write(dir.join("01").join("keep.dat"), b"user").unwrap();
         let h = "0123456789abcdef0123456789abcdef";
-        std::fs::write(dir.join(format!("{h}.ent")), vec![0u8; 100]).unwrap();
-        // Aggressive bounds (max-files 1) would evict everything it OWNS…
-        reap(&dir, 0, 1, 0);
-        // …but foreign files survive untouched.
-        assert_eq!(std::fs::read(dir.join("keep-1.txt")).unwrap(), b"important");
-        assert_eq!(
-            std::fs::read(dir.join("important.meta")).unwrap(),
-            b"user data"
+        std::fs::write(
+            dir.join("01").join("23").join(format!("{h}.ent")),
+            vec![0u8; 100],
+        )
+        .unwrap();
+        let root = SecureDir::provision(dir.to_str().unwrap()).unwrap();
+        reap(&root, 0, 1, 0); // aggressive — would evict everything it OWNS
+        assert!(dir.join("keep-1.txt").exists(), "foreign file must survive");
+        assert!(
+            dir.join(".tmp.important").exists(),
+            "foreign tmp must survive"
         );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn reaper_tiny_max_files_keeps_at_least_one() {
-        let dir = std::env::temp_dir().join(format!("sluice-reap2-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        // 6 entries, max-files 5 → count_target = 5 - 0 = 5 (NOT 0). The old
-        // `max_files/10*9` rounded to 0 and wiped the whole cache.
-        for i in 0..6 {
-            let name = format!("{:032x}.ent", i);
-            std::fs::write(dir.join(name), vec![0u8; 10]).unwrap();
-        }
-        reap(&dir, u64::MAX, 5, 0);
-        let remaining = std::fs::read_dir(&dir).unwrap().count();
-        assert!(remaining >= 4, "must not wipe the cache (kept {remaining})");
+        assert!(dir.join("01").join("keep.dat").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -618,22 +602,23 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let cache = test_cache("rt");
+            let (cache, dir) = test_cache("rt");
             let key = CacheKey::new("host", "GET:/x", "");
             write_entry(cache, &key, &meta("v1"), b"hello disk cache").await;
             let (m, body) = read_entry(cache, &key).await.expect("entry must hit");
             assert_eq!(body, b"hello disk cache");
             assert_eq!(m.headers().get("server").unwrap().to_str().unwrap(), "v1");
 
-            // Corrupt the entry (truncate one byte) → the length check fails →
-            // treated as a miss, never a wrong body.
-            let path = cache.entry_path(&key.combined());
-            let data = std::fs::read(&path).unwrap();
-            std::fs::write(&path, &data[..data.len() - 1]).unwrap();
-            assert!(
-                read_entry(cache, &key).await.is_none(),
-                "torn entry must be a miss"
-            );
+            // Truncate one byte → length check fails → miss (never a wrong body).
+            let hash = key.combined();
+            let ent = dir
+                .join(&hash[0..2])
+                .join(&hash[2..4])
+                .join(entry_file(&hash));
+            let data = std::fs::read(&ent).unwrap();
+            std::fs::write(&ent, &data[..data.len() - 1]).unwrap();
+            assert!(read_entry(cache, &key).await.is_none(), "torn entry = miss");
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
@@ -644,7 +629,7 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
-            let cache = test_cache("um");
+            let (cache, dir) = test_cache("um");
             let key = CacheKey::new("host", "GET:/y", "");
             let span = Span::inactive().handle();
             write_entry(cache, &key, &meta("v1"), b"body stays").await;
@@ -652,6 +637,7 @@ mod tests {
             let (m, body) = read_entry(cache, &key).await.expect("still a hit");
             assert_eq!(body, b"body stays");
             assert_eq!(m.headers().get("server").unwrap().to_str().unwrap(), "v2");
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 }
