@@ -17,15 +17,19 @@ cargo clippy --all-targets       # lint before committing
 ./target/release/sluice -c cfg.kdl -u                    # zero-downtime upgrade (see below)
 ```
 
-- **`cargo test`** runs a unit suite (config parsing/validation + strict-schema
-  rejection, `parse_size`, path normalization, query decode, Accept-Encoding
-  cache-key isolation, active-health key scoping, sub-filter carry-over, Ketama
-  distribution). It is NOT end-to-end — also validate with `--check` and manual
-  testing against a local backend + a self-signed cert. Never test against a
-  production/live host unless that is explicitly the task.
+- **`cargo test`** runs a unit suite (declarative-schema rejection, `parse_size`,
+  path normalization, query decode, Accept-Encoding cache-key isolation,
+  active-health key scoping, fragmented health-probe reads, combined-PEM certs,
+  ACME legacy migration + cache-dir hardening, disk-cache roundtrip/torn-entry,
+  sub-filter carry-over, Ketama distribution). It is NOT end-to-end — also
+  validate with `--check` and manual testing against a local backend + a
+  self-signed cert. Never test against a production/live host unless that is
+  explicitly the task.
 - **CI** (`.github/workflows/ci.yml`) runs fmt, `clippy -D warnings`, build,
   test, a strict `--check` on the self-contained `examples/smoke.kdl` (must exit
-  0), and a schema-regression grep over the full `examples/sluice.kdl`.
+  0), an asserted-failure check on the full `examples/sluice.kdl` (must fail
+  with exactly the expected filesystem errors, no schema errors, no panic), and
+  `cargo audit` (one documented ignore: RUSTSEC-2024-0437, see KNOWN_ISSUES.md).
 - The **BoringSSL** feature (`boring-sys`) needs extra tools beyond a C toolchain
   on a fresh Debian: `git golang-go nasm ninja-build`.
 
@@ -45,7 +49,11 @@ blocked upstream (Pingora has no QUIC transport).
   `:80` redirect), Prometheus service, and the SIGHUP reload thread.
 - **`config.rs`** — the KDL parser and *all* validation. `Config::parse` does
   syntax + semantic checks and is the single gate for both `--check` and hot
-  reload. Every new directive is parsed and validated here.
+  reload. Validation is a **declarative recursive schema** (`Spec` tree +
+  `walk`): every node's positional args (count+type), properties (names+types,
+  duplicates), and children (names+multiplicity, block-allowed) are checked at
+  every level. Adding a directive means adding it to the `Spec` tree AND
+  consuming it in the parse functions.
 - **`proxy.rs`** — the `ProxyHttp` implementation (the request path) plus the
   `:80` `RedirectProxy`. Load-balancer selection, rate limiting, WAF, caching
   hooks, health state, and the access log all live here.
@@ -53,9 +61,13 @@ blocked upstream (Pingora has no QUIC transport).
   callback (used by `cert-dir` and ACME); hot-swappable via `ArcSwap`.
 - **`acme.rs`** — ACME/Let's Encrypt HTTP-01 auto-TLS (background thread,
   `instant-acme` 0.8). Account is created once and persisted per environment.
+  Each cert is ONE combined key+chain PEM installed by a single atomic rename;
+  legacy `.crt`/`.key` pairs are served and migrated on startup. The cache dir
+  is verified (real dir, owned, 0700) before any secret is written.
 - **`diskcache.rs`** — a disk-backed `pingora_cache::Storage` implementation
-  (Pingora only ships an in-memory `MemCache`). Sharded files, atomic writes,
-  background size reaper.
+  (Pingora only ships an in-memory `MemCache`). ONE sharded file per entry
+  (meta prefix + body), fsync'd temp + single atomic rename, background size
+  reaper.
 - **`metrics.rs`** — Prometheus metric definitions.
 
 ### Config hot-reload model (do not break this)
@@ -104,6 +116,14 @@ These were fixed after review; a change that reverts any of them is a bug:
 - **Metric label cardinality** is bounded: unmatched Host → `-`, country is
   validated, only `country` is allowed as a geo metric label.
 - Disk-cache `lookup` treats any IO/parse error as a miss — never fail a request.
+- **Cache entries and ACME certs are single-file + one atomic rename** — never
+  split state across two files whose renames can be separated by a crash.
+- **ACME cache-dir is fail-closed**: refused if it's a symlink, wrongly owned,
+  or can't be chmod'd 0700; secret writes use `create_new` (O_EXCL) temps with
+  unpredictable names so a pre-planted symlink can't capture or truncate.
+- **The config schema is strict at every level** (`Spec` tree in `config.rs`):
+  never add a directive without its full Spec (args/props/children/types) — a
+  lenient node re-opens silent-typo config bugs.
 
 ## Conventions
 

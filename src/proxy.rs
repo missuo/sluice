@@ -505,6 +505,11 @@ struct ActiveHealth {
     ok_streak: u32,
     fail_streak: u32,
     last_probe: Instant,
+    /// Fingerprint of the probe config (path/intervals/thresholds/Host/TLS) that
+    /// produced this state. When a reload changes the probe config for the same
+    /// (site, location, addr), stale streaks and a stale DOWN verdict from the
+    /// OLD config must not carry over — the state is reset instead.
+    fp: u64,
 }
 
 /// Hex-encode the EXACT bytes of every `Accept-Encoding` request line (in order,
@@ -560,7 +565,7 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                 let snap = cfg.load();
                 let mut targets: std::collections::HashMap<
                     String,
-                    (String, HealthCheck, bool, String),
+                    (String, HealthCheck, bool, String, u64),
                 > = std::collections::HashMap::new();
                 for site in &snap.sites {
                     for (li, loc) in site.locations.iter().enumerate() {
@@ -581,9 +586,23 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                                             (!site.host.contains('*')).then(|| site.host.clone())
                                         })
                                         .unwrap_or_else(|| s.host.clone());
+                                    // Fingerprint the effective probe config so a
+                                    // reload that changes it resets the state.
+                                    let fp = str_hash(&format!(
+                                        "{:?}|{:?}|{:?}|{}|{}|{:?}|{}|{probe_host}",
+                                        hc.path,
+                                        hc.interval,
+                                        hc.timeout,
+                                        hc.healthy,
+                                        hc.unhealthy,
+                                        hc.expect_status,
+                                        s.tls,
+                                    ));
                                     targets
                                         .entry(active_health_key(&site.host, li, &addr))
-                                        .or_insert_with(|| (addr, hc.clone(), s.tls, probe_host));
+                                        .or_insert_with(|| {
+                                            (addr, hc.clone(), s.tls, probe_host, fp)
+                                        });
                                 }
                             }
                         }
@@ -597,21 +616,21 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                 // not delay the others — one cycle is bounded by one timeout, not
                 // by the sum over the pool).
                 let mut tasks = Vec::new();
-                for (key, (addr, hc, tls, host)) in targets {
+                for (key, (addr, hc, tls, host, fp)) in targets {
                     let due = health
                         .get(&key)
-                        .map(|h| now.duration_since(h.last_probe) >= hc.interval)
+                        .map(|h| h.fp != fp || now.duration_since(h.last_probe) >= hc.interval)
                         .unwrap_or(true);
                     if !due {
                         continue;
                     }
                     tasks.push(tokio::spawn(async move {
                         let ok = probe(&addr, &hc, tls, &host).await;
-                        (key, hc.healthy, hc.unhealthy, ok)
+                        (key, hc.healthy, hc.unhealthy, ok, fp)
                     }));
                 }
                 for t in tasks {
-                    let Ok((key, healthy_thr, unhealthy_thr, ok)) = t.await else {
+                    let Ok((key, healthy_thr, unhealthy_thr, ok, fp)) = t.await else {
                         continue;
                     };
                     let mut e = health.entry(key.clone()).or_insert(ActiveHealth {
@@ -619,7 +638,20 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                         ok_streak: 0,
                         fail_streak: 0,
                         last_probe: now,
+                        fp,
                     });
+                    if e.fp != fp {
+                        // Probe config changed on reload — drop the old config's
+                        // verdict and streaks rather than inheriting them.
+                        *e = ActiveHealth {
+                            healthy: true,
+                            ok_streak: 0,
+                            fail_streak: 0,
+                            last_probe: now,
+                            fp,
+                        };
+                        log::info!("health: {key} probe config changed; state reset");
+                    }
                     e.last_probe = now;
                     if ok {
                         e.fail_streak = 0;
@@ -665,13 +697,32 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
     {
         return false;
     }
-    let mut buf = [0u8; 256];
-    let n = match tokio::time::timeout(hc.timeout, stream.read(&mut buf)).await {
-        Ok(Ok(n)) if n > 0 => n,
-        _ => return false,
-    };
-    // Parse the status code from "HTTP/1.x NNN ...".
-    let head = String::from_utf8_lossy(&buf[..n]);
+    // Read until the status line is complete (first CRLF), EOF, a 1 KiB cap, or
+    // the timeout — a backend that flushes the status line in fragments (e.g.
+    // "HTTP/1." then "1 200 OK\r\n") must not be misread as DOWN off a single
+    // short read().
+    let mut buf: Vec<u8> = Vec::with_capacity(256);
+    let _ = tokio::time::timeout(hc.timeout, async {
+        let mut chunk = [0u8; 256];
+        loop {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.windows(2).any(|w| w == b"\r\n") || buf.len() >= 1024 {
+                        break;
+                    }
+                }
+            }
+        }
+    })
+    .await; // on timeout, parse whatever arrived (usually nothing → DOWN)
+            // Parse the status code from the first line: "HTTP/1.x NNN ...".
+    let line_end = buf
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .unwrap_or(buf.len());
+    let head = String::from_utf8_lossy(&buf[..line_end]);
     match head
         .split_whitespace()
         .nth(1)
@@ -1686,6 +1737,54 @@ mod tests {
             active_health_key("a.example", 0, addr),
             active_health_key("a.example", 0, addr)
         );
+    }
+
+    #[test]
+    fn probe_handles_fragmented_status_line() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            // Backend flushes the status line in two fragments with a pause — a
+            // single read() would see only "HTTP/1.1 2" and misjudge DOWN.
+            tokio::spawn(async move {
+                loop {
+                    let (mut s, _) = listener.accept().await.unwrap();
+                    let mut sink = [0u8; 512];
+                    let _ = s.read(&mut sink).await;
+                    s.write_all(b"HTTP/1.1 2").await.unwrap();
+                    s.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    s.write_all(b"00 OK\r\nConnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            });
+            let hc = crate::config::HealthCheck {
+                path: Some("/health".into()),
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_secs(2),
+                healthy: 1,
+                unhealthy: 1,
+                expect_status: (200, 200),
+            };
+            assert!(
+                probe(&addr, &hc, false, "vhost.test").await,
+                "fragmented 200 status line must count as UP"
+            );
+            let miss = crate::config::HealthCheck {
+                expect_status: (204, 204),
+                ..hc
+            };
+            assert!(
+                !probe(&addr, &miss, false, "vhost.test").await,
+                "status outside the expected range must count as DOWN"
+            );
+        });
     }
 
     #[test]

@@ -395,14 +395,19 @@ benefit. Tracked as M5.
   no-store, WAF blocks).
 - **M7 — production hardening — DONE:** zero-downtime binary upgrade (`-u` /
   SIGQUIT fd-handoff), weighted + Ketama + least-conn balancing, passive **and
-  active** upstream health checks, disk-backed cache (a custom `pingora-cache`
-  `Storage` with a size/count/free-space reaper), response-body rewrite
-  (`sub-filter`), four rounds of adversarial security review, and a config
-  validator that, per node, rejects unknown/duplicate directives and unknown or
-  stray properties, type-checks leaf values (integer/bool/string, rejecting
-  non-finite numbers), and checks positional-argument counts at `--check` time.
-  It is a per-node schema (not yet a single declarative table), but the covered
-  node set is now the full config surface. All verified live.
+  active** upstream health checks (probes carry the site vhost, health state is
+  scoped per pool and reset when the probe config changes, status lines are
+  read to CRLF so fragmented writes don't fake a DOWN), a disk-backed cache (a
+  custom `pingora-cache` `Storage`: ONE file per entry, atomic single-rename
+  publish, size/count/free-space reaper), response-body rewrite (`sub-filter`),
+  five rounds of adversarial security review, and a **declarative recursive
+  config schema** — every node's positional args (count + type), properties
+  (names, types, duplicates), and children (names, multiplicity, block-allowed)
+  are validated at every nesting level, with non-finite numbers rejected, so
+  `--check` accepts exactly what the server consumes. ACME certs are stored as
+  a single combined PEM (atomic publish; legacy `.crt`/`.key` pairs are served
+  and auto-migrated on upgrade) in a hardened cache dir (no symlink, owner
+  checked, 0700, O_EXCL temp writes). All verified live.
 - **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
   header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`. See
   **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items that are deliberately not

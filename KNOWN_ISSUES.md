@@ -131,17 +131,27 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   enforce the under-root containment check (the traversal defense). That's a
   `stat`-per-request cost; it is deliberate (correctness over caching the root),
   not yet optimised with a cached canonical root.
-- **Disk cache pairs body+meta by a stamped size, not a transactional write.**
-  The disk `Storage` stamps the body length into the meta header and verifies it
-  on lookup (a torn/half-written entry is treated as a miss), but body and meta
-  are separate files without a two-phase commit — the size stamp is the integrity
-  check, not a transaction. A crash mid-write yields a miss, never a wrong body.
+- **Disk cache: one file per entry, published by a single atomic rename.** Meta
+  (prefix + serialized headers) and body live in the SAME `.ent` file, written
+  to a fsync'd temp and installed with one `rename` — a crash at any point
+  leaves the previous complete entry or nothing, so "old meta + new body" is
+  structurally impossible (the earlier two-file layout could produce exactly
+  that if it crashed between its two renames with an equal-length body; a
+  review caught the then-overstated claim). A file whose length doesn't match
+  its stamped sizes is treated as a miss. Files from the old two-file layout
+  are deleted by the reaper on sight.
 - **Access log is a fixed line format (no JSON).** The access log emits a fixed
   field layout; there is no `json` access-log mode yet. Tracked as a "still
   later" item in DESIGN.
-- **`protobuf` is pulled in transitively** (via a dependency) and has carried
-  advisories in the past; it is not used on the request path. Watch `cargo audit`
-  on dependency bumps.
+- **`protobuf` 2.28 has a CURRENT RustSec advisory —
+  [RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437.html)
+  (uncontrolled recursion → crash), fixed only in protobuf >= 3.7.** It reaches
+  us transitively (`prometheus` ← both sluice and `pingora-core`), so the
+  upgrade is blocked on upstream pingora/prometheus bumps. The risk is
+  **accepted**, not merely historical: Sluice never parses attacker-controlled
+  protobuf on the request path (the crate only serves Prometheus text/protobuf
+  *encoding*). CI runs `cargo audit` with exactly this one advisory ignored —
+  any other advisory fails the build. Re-evaluate on every pingora bump.
 
 ---
 

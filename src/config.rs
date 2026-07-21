@@ -411,31 +411,6 @@ fn prop_f64(node: &KdlNode, key: &str) -> Option<f64> {
     v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
 }
 
-/// Push an error for any child directive whose name isn't in `allowed` — so a
-/// typo (`threds`, `cahce`, `interval-sec`) is a config error, not a silent
-/// no-op. This is the nested-block equivalent of the top-level unknown check.
-fn reject_unknown_children(node: &KdlNode, ctx: &str, allowed: &[&str], errs: &mut Vec<String>) {
-    if let Some(ch) = node.children() {
-        for n in ch.nodes() {
-            let name = n.name().value();
-            if !allowed.contains(&name) {
-                errs.push(format!("{ctx}: unknown directive `{name}`"));
-            }
-        }
-    }
-}
-/// Push an error for any `key=value` property whose key isn't in `allowed`.
-fn reject_unknown_props(node: &KdlNode, ctx: &str, allowed: &[&str], errs: &mut Vec<String>) {
-    for e in node.entries() {
-        if let Some(k) = e.name() {
-            let name = k.value();
-            if !allowed.contains(&name) {
-                errs.push(format!("{ctx}: unknown property `{name}`"));
-            }
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 enum Ty {
     Int,
@@ -471,89 +446,6 @@ impl Ty {
 /// properties.
 fn positional_count(node: &KdlNode) -> usize {
     node.entries().iter().filter(|e| e.name().is_none()).count()
-}
-
-/// Error if a node's positional-argument count isn't in `min..=max`. Catches a
-/// stray extra arg like `listener "a" "b"` or `max-body "1mb" "2mb"`.
-fn check_arg_count(node: &KdlNode, ctx: &str, min: usize, max: usize, errs: &mut Vec<String>) {
-    let n = positional_count(node);
-    if n < min || n > max {
-        let want = if min == max {
-            format!("exactly {min}")
-        } else {
-            format!("{min} to {max}")
-        };
-        errs.push(format!("{ctx}: expected {want} argument(s), found {n}"));
-    }
-}
-
-/// Reject `key=value` properties on any value-only child of `node` (i.e. a child
-/// whose name is NOT in `prop_bearing`). Catches `threads 2 typo=true`.
-fn reject_child_leaf_props(
-    node: &KdlNode,
-    ctx: &str,
-    prop_bearing: &[&str],
-    errs: &mut Vec<String>,
-) {
-    if let Some(ch) = node.children() {
-        for c in ch.nodes() {
-            let cn = c.name().value();
-            if prop_bearing.contains(&cn) {
-                continue;
-            }
-            if c.entries().iter().any(|e| e.name().is_some()) {
-                errs.push(format!("{ctx}: `{cn}` takes no properties"));
-            }
-        }
-    }
-}
-
-/// Error when a known child directive is present but its value is the wrong type
-/// (e.g. `threads "four"`, `max-body 1024`) — which otherwise silently defaults.
-fn check_child_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut Vec<String>) {
-    for (name, ty) in specs {
-        let Some(c) = child(node, name) else { continue };
-        let val = c
-            .entries()
-            .iter()
-            .find(|e| e.name().is_none())
-            .map(|e| e.value());
-        let ok = matches!(val, Some(v) if ty.matches(v));
-        if !ok {
-            errs.push(format!("{ctx}: `{name}` must be {}", ty.describe()));
-        }
-    }
-}
-
-/// Error when a known property is present but its value is the wrong type
-/// (e.g. `cloudflare-only="true"`, a string where a bool is meant).
-fn check_prop_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut Vec<String>) {
-    for (name, ty) in specs {
-        let Some(v) = node.get(*name) else { continue };
-        if !ty.matches(v) {
-            errs.push(format!(
-                "{ctx}: property `{name}` must be {}",
-                ty.describe()
-            ));
-        }
-    }
-}
-
-/// Error when a directive that may appear at most once is repeated.
-fn reject_dup_children(node: &KdlNode, ctx: &str, singletons: &[&str], errs: &mut Vec<String>) {
-    if let Some(ch) = node.children() {
-        for name in singletons {
-            if ch
-                .nodes()
-                .iter()
-                .filter(|n| n.name().value() == *name)
-                .count()
-                > 1
-            {
-                errs.push(format!("{ctx}: `{name}` given more than once"));
-            }
-        }
-    }
 }
 
 /// `32MiB` / `1024` / `512KB` -> bytes.
@@ -694,456 +586,448 @@ pub fn build_ketama_ring(servers: &[Upstream]) -> Vec<(u64, usize)> {
     ring
 }
 
-// ---- unknown-directive validation (nested blocks; top level is checked inline) ----
+// ---- declarative config schema ----
+//
+// Every node is validated against a `Spec`: how many positional arguments it
+// takes (and their type), which `key=value` properties it accepts (and their
+// types), which children its block may contain (and how often), and whether it
+// may carry a block at all. The walk is fully recursive, so an unknown
+// directive, stray property, duplicate property or singleton, extra argument,
+// wrong type, or unexpected block is an error at EVERY level — `--check`
+// accepts exactly the shapes the server consumes, nothing more. Adding a
+// directive means adding it here AND consuming it in the parse functions.
 
-fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
-    // Only one of each of these top-level blocks makes sense; a second silently
-    // won last-wins (or merged) before.
-    const SINGLETONS: &[&str] = &[
-        "server",
-        "client-ip",
-        "geoip",
-        "acme",
-        "cache-store",
-        "alias",
-        "defaults",
-    ];
+#[derive(Clone, Copy, PartialEq)]
+enum Rep {
+    Once,
+    Many,
+}
+
+struct Spec {
+    /// Inclusive (min, max) positional-argument count.
+    args: (usize, usize),
+    /// Type every positional argument must have.
+    arg_ty: Ty,
+    /// Allowed `key=value` properties and their types.
+    props: &'static [(&'static str, Ty)],
+    /// `None` = leaf (having a `{ }` block is an error); `Some` = the allowed
+    /// children with their multiplicity.
+    children: Option<&'static [(&'static str, Rep, &'static Spec)]>,
+    /// Structural rule that doesn't fit the table (e.g. upstream's two forms).
+    extra: Option<fn(&KdlNode, &str, &mut Vec<String>)>,
+}
+
+const fn leaf(min: usize, max: usize, ty: Ty) -> Spec {
+    Spec {
+        args: (min, max),
+        arg_ty: ty,
+        props: &[],
+        children: None,
+        extra: None,
+    }
+}
+
+static INT1: Spec = leaf(1, 1, Ty::Int);
+static STR1: Spec = leaf(1, 1, Ty::Str);
+static BOOL1: Spec = leaf(1, 1, Ty::Bool);
+/// One or more string arguments (list leaves like `trusted-proxies`).
+static STRS: Spec = leaf(1, usize::MAX, Ty::Str);
+
+static SERVER_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("threads", Rep::Once, &INT1),
+        ("metrics-addr", Rep::Once, &STR1),
+        ("grace-period-secs", Rep::Once, &INT1),
+        ("graceful-shutdown-secs", Rep::Once, &INT1),
+        ("upstream-keepalive-pool", Rep::Once, &INT1),
+        ("upgrade-sock", Rep::Once, &STR1),
+    ]),
+    extra: None,
+};
+
+static CLIENT_IP_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("trusted-header", Rep::Once, &STR1),
+        ("trusted-proxies", Rep::Once, &STRS),
+    ]),
+    extra: None,
+};
+
+static GEOIP_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("enabled", Rep::Once, &BOOL1),
+        ("country-header", Rep::Once, &STR1),
+        ("mmdb-asn", Rep::Once, &STR1),
+        ("mmdb-city", Rep::Once, &STR1),
+        ("log-fields", Rep::Once, &STRS),
+        ("metric-labels", Rep::Once, &STRS),
+    ]),
+    extra: None,
+};
+
+static ACME_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("enabled", Rep::Once, &BOOL1),
+        ("contact", Rep::Once, &STR1),
+        ("staging", Rep::Once, &BOOL1),
+        ("cache-dir", Rep::Once, &STR1),
+    ]),
+    extra: None,
+};
+
+static CACHE_STORE_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("dir", Rep::Once, &STR1),
+        ("max-size", Rep::Once, &STR1),
+        ("max-files", Rep::Once, &INT1),
+        ("min-free", Rep::Once, &STR1),
+    ]),
+    extra: None,
+};
+
+static ALIAS_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[("prefix", Ty::Str)],
+    children: None,
+    extra: None,
+};
+
+static DEFAULTS_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("hsts", Rep::Once, &STR1),
+        ("unknown-host", Rep::Once, &INT1),
+    ]),
+    extra: None,
+};
+
+static TLS_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[
+        ("cert", Ty::Str),
+        ("key", Ty::Str),
+        ("cert-dir", Ty::Str),
+        ("acme", Ty::Bool),
+    ],
+    children: None,
+    extra: None,
+};
+
+static LISTENER_SPEC: Spec = Spec {
+    args: (1, 1),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("http2", Rep::Once, &BOOL1),
+        ("redirect-to-https", Rep::Once, &BOOL1),
+        ("tls", Rep::Once, &TLS_SPEC),
+    ]),
+    extra: None,
+};
+
+static UPSTREAM_SERVER_SPEC: Spec = Spec {
+    args: (1, 1),
+    arg_ty: Ty::Str,
+    props: &[("weight", Ty::Int)],
+    children: None,
+    extra: None,
+};
+
+static HEALTH_CHECK_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("path", Rep::Once, &STR1),
+        ("interval-secs", Rep::Once, &INT1),
+        ("timeout-secs", Rep::Once, &INT1),
+        ("healthy", Rep::Once, &INT1),
+        ("unhealthy", Rep::Once, &INT1),
+        ("expect-status", Rep::Once, &INT1),
+    ]),
+    extra: None,
+};
+
+static UPSTREAM_SPEC: Spec = Spec {
+    args: (0, 1),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("server", Rep::Many, &UPSTREAM_SERVER_SPEC),
+        ("balance", Rep::Once, &STR1),
+        ("health-check", Rep::Once, &HEALTH_CHECK_SPEC),
+    ]),
+    extra: Some(upstream_one_form),
+};
+
+/// `upstream` has two forms — the `upstream "host:port"` shorthand or a block
+/// with `server` lines. Mixing them (a positional arg AND a block) silently
+/// merged both before; require exactly one form.
+fn upstream_one_form(node: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
+    let has_arg = positional_count(node) > 0;
+    let has_block = node.children().is_some_and(|c| !c.nodes().is_empty());
+    if has_arg && has_block {
+        errs.push(format!(
+            "{ctx}: use either the `upstream \"host:port\"` shorthand or a block \
+             with `server` lines, not both"
+        ));
+    }
+}
+
+static FILE_SERVER_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[("root", Rep::Once, &STR1), ("index", Rep::Once, &STR1)]),
+    extra: None,
+};
+
+static CACHE_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("ttl-secs", Rep::Once, &INT1),
+        ("max-object", Rep::Once, &STR1),
+    ]),
+    extra: None,
+};
+
+static RATE_LIMIT_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[("rps", Ty::Num), ("burst", Ty::Num)],
+    children: None,
+    extra: None,
+};
+
+static ACCESS_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[("cloudflare-only", Ty::Bool)],
+    children: None,
+    extra: None,
+};
+
+static REDIRECT_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[("match", Ty::Str), ("target", Ty::Str), ("status", Ty::Int)],
+    children: None,
+    extra: None,
+};
+
+static SUB_FILTER_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[("from", Ty::Str), ("to", Ty::Str)],
+    children: None,
+    extra: None,
+};
+
+static WAF_BLOCK_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[("field", Ty::Str), ("match", Ty::Str), ("status", Ty::Int)],
+    children: None,
+    extra: None,
+};
+
+static WAF_SPEC: Spec = Spec {
+    args: (0, 0),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[("block", Rep::Many, &WAF_BLOCK_SPEC)]),
+    extra: None,
+};
+
+static DENY_SPEC: Spec = leaf(1, 1, Ty::Str);
+
+static LOCATION_SPEC: Spec = Spec {
+    args: (1, 1),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("upstream", Rep::Once, &UPSTREAM_SPEC),
+        ("file-server", Rep::Once, &FILE_SERVER_SPEC),
+        ("websocket", Rep::Once, &BOOL1),
+        ("max-body", Rep::Once, &STR1),
+        ("read-timeout-secs", Rep::Once, &INT1),
+        ("deny", Rep::Many, &DENY_SPEC),
+        ("cache", Rep::Once, &CACHE_SPEC),
+        ("sub-filter", Rep::Many, &SUB_FILTER_SPEC),
+        ("upstream-host", Rep::Once, &STR1),
+        ("upstream-verify", Rep::Once, &BOOL1),
+    ]),
+    extra: None,
+};
+
+static SITE_SPEC: Spec = Spec {
+    args: (1, 1),
+    arg_ty: Ty::Str,
+    props: &[],
+    children: Some(&[
+        ("location", Rep::Many, &LOCATION_SPEC),
+        ("upstream", Rep::Once, &UPSTREAM_SPEC),
+        ("file-server", Rep::Once, &FILE_SERVER_SPEC),
+        ("deny", Rep::Many, &DENY_SPEC),
+        ("redirect", Rep::Many, &REDIRECT_SPEC),
+        ("rate-limit", Rep::Once, &RATE_LIMIT_SPEC),
+        ("access", Rep::Once, &ACCESS_SPEC),
+        ("waf", Rep::Once, &WAF_SPEC),
+        ("hsts", Rep::Once, &STR1),
+        ("acme", Rep::Once, &BOOL1),
+        ("websocket", Rep::Once, &BOOL1),
+        ("max-body", Rep::Once, &STR1),
+        ("read-timeout-secs", Rep::Once, &INT1),
+        ("upstream-host", Rep::Once, &STR1),
+        ("upstream-verify", Rep::Once, &BOOL1),
+        ("sub-filter", Rep::Many, &SUB_FILTER_SPEC),
+        ("cache", Rep::Once, &CACHE_SPEC),
+    ]),
+    extra: None,
+};
+
+static ROOT_CHILDREN: &[(&str, Rep, &Spec)] = &[
+    ("server", Rep::Once, &SERVER_SPEC),
+    ("client-ip", Rep::Once, &CLIENT_IP_SPEC),
+    ("geoip", Rep::Once, &GEOIP_SPEC),
+    ("acme", Rep::Once, &ACME_SPEC),
+    ("cache-store", Rep::Once, &CACHE_STORE_SPEC),
+    ("alias", Rep::Once, &ALIAS_SPEC),
+    ("defaults", Rep::Once, &DEFAULTS_SPEC),
+    ("listener", Rep::Many, &LISTENER_SPEC),
+    ("site", Rep::Many, &SITE_SPEC),
+];
+
+/// Label a node for error messages: a `site` carries its host so several sites'
+/// errors stay distinguishable; everything else is `parent name`.
+fn node_label(parent: &str, name: &str, node: &KdlNode) -> String {
+    let own = if name == "site" {
+        format!("site `{}`", first_arg(node).unwrap_or("?"))
+    } else {
+        name.to_string()
+    };
+    if parent.is_empty() {
+        own
+    } else {
+        format!("{parent} {own}")
+    }
+}
+
+/// Validate one node against its spec (args, props, block, children), recursing
+/// into children. `ctx` is this node's own label.
+fn walk(node: &KdlNode, spec: &Spec, ctx: &str, errs: &mut Vec<String>) {
+    // Positional arguments: count and type.
+    let n = positional_count(node);
+    let (min, max) = spec.args;
+    if n < min || n > max {
+        let want = if min == max {
+            format!("exactly {min}")
+        } else if max == usize::MAX {
+            format!("at least {min}")
+        } else {
+            format!("{min} to {max}")
+        };
+        errs.push(format!("{ctx}: expected {want} argument(s), found {n}"));
+    }
+    if max > 0 {
+        for e in node.entries().iter().filter(|e| e.name().is_none()) {
+            if !spec.arg_ty.matches(e.value()) {
+                errs.push(format!(
+                    "{ctx}: argument must be {}",
+                    spec.arg_ty.describe()
+                ));
+            }
+        }
+    }
+    // Properties: unknown, wrong type, duplicated.
+    let mut seen_props: Vec<&str> = Vec::new();
+    for e in node.entries() {
+        let Some(k) = e.name() else { continue };
+        let kname = k.value();
+        match spec.props.iter().find(|(p, _)| *p == kname) {
+            None => errs.push(format!("{ctx}: unknown property `{kname}`")),
+            Some((_, ty)) if !ty.matches(e.value()) => {
+                errs.push(format!(
+                    "{ctx}: property `{kname}` must be {}",
+                    ty.describe()
+                ));
+            }
+            Some(_) => {}
+        }
+        if seen_props.contains(&kname) {
+            errs.push(format!("{ctx}: duplicate property `{kname}`"));
+        } else {
+            seen_props.push(kname);
+        }
+    }
+    // Block and children.
+    match spec.children {
+        None => {
+            if node.children().is_some() {
+                errs.push(format!("{ctx}: takes no block"));
+            }
+        }
+        Some(allowed) => {
+            if let Some(ch) = node.children() {
+                let mut seen: Vec<&str> = Vec::new();
+                for c in ch.nodes() {
+                    let cname = c.name().value();
+                    let Some((_, rep, cspec)) = allowed.iter().find(|(a, _, _)| *a == cname) else {
+                        errs.push(format!("{ctx}: unknown directive `{cname}`"));
+                        continue;
+                    };
+                    if *rep == Rep::Once && seen.contains(&cname) {
+                        errs.push(format!("{ctx}: `{cname}` given more than once"));
+                    }
+                    seen.push(cname);
+                    let cctx = node_label(ctx, cname, c);
+                    walk(c, cspec, &cctx, errs);
+                }
+            }
+        }
+    }
+    if let Some(f) = spec.extra {
+        f(node, ctx, errs);
+    }
+}
+
+/// Validate the whole document against the schema. Unknown TOP-LEVEL directives
+/// are reported by the parse loop (which skips them), so they aren't duplicated
+/// here; everything else — including a duplicate top-level singleton block — is.
+fn validate_schema(doc: &KdlDocument, errs: &mut Vec<String>) {
     let mut seen: Vec<&str> = Vec::new();
     for node in doc.nodes() {
         let name = node.name().value();
-        if SINGLETONS.contains(&name) {
-            if seen.contains(&name) {
-                errs.push(format!("duplicate `{name}` block (only one allowed)"));
-            } else {
-                seen.push(name);
-            }
+        let Some((_, rep, spec)) = ROOT_CHILDREN.iter().find(|(a, _, _)| *a == name) else {
+            continue; // reported as "unknown top-level directive" by the parser
+        };
+        if *rep == Rep::Once && seen.contains(&name) {
+            errs.push(format!("duplicate `{name}` block (only one allowed)"));
         }
-        match name {
-            "server" => {
-                const SERVER_LEAVES: &[&str] = &[
-                    "threads",
-                    "metrics-addr",
-                    "grace-period-secs",
-                    "graceful-shutdown-secs",
-                    "upstream-keepalive-pool",
-                    "upgrade-sock",
-                ];
-                reject_unknown_props(node, "server", &[], errs);
-                reject_unknown_children(node, "server", SERVER_LEAVES, errs);
-                reject_dup_children(node, "server", SERVER_LEAVES, errs);
-                reject_child_leaf_props(node, "server", &[], errs);
-                check_child_types(
-                    node,
-                    "server",
-                    &[
-                        ("threads", Ty::Int),
-                        ("metrics-addr", Ty::Str),
-                        ("grace-period-secs", Ty::Int),
-                        ("graceful-shutdown-secs", Ty::Int),
-                        ("upstream-keepalive-pool", Ty::Int),
-                        ("upgrade-sock", Ty::Str),
-                    ],
-                    errs,
-                );
-            }
-            "client-ip" => {
-                const CIP_LEAVES: &[&str] = &["trusted-header", "trusted-proxies"];
-                reject_unknown_props(node, "client-ip", &[], errs);
-                reject_unknown_children(node, "client-ip", CIP_LEAVES, errs);
-                reject_dup_children(node, "client-ip", CIP_LEAVES, errs);
-                reject_child_leaf_props(node, "client-ip", &[], errs);
-                check_child_types(node, "client-ip", &[("trusted-header", Ty::Str)], errs);
-            }
-            "geoip" => {
-                const GEOIP_LEAVES: &[&str] = &[
-                    "enabled",
-                    "country-header",
-                    "mmdb-asn",
-                    "mmdb-city",
-                    "log-fields",
-                    "metric-labels",
-                ];
-                reject_unknown_props(node, "geoip", &[], errs);
-                reject_unknown_children(node, "geoip", GEOIP_LEAVES, errs);
-                reject_dup_children(node, "geoip", GEOIP_LEAVES, errs);
-                reject_child_leaf_props(node, "geoip", &[], errs);
-                check_child_types(
-                    node,
-                    "geoip",
-                    &[
-                        ("enabled", Ty::Bool),
-                        ("country-header", Ty::Str),
-                        ("mmdb-asn", Ty::Str),
-                        ("mmdb-city", Ty::Str),
-                    ],
-                    errs,
-                );
-            }
-            "acme" => {
-                const ACME_LEAVES: &[&str] = &["enabled", "contact", "staging", "cache-dir"];
-                reject_unknown_props(node, "acme", &[], errs);
-                reject_unknown_children(node, "acme", ACME_LEAVES, errs);
-                reject_dup_children(node, "acme", ACME_LEAVES, errs);
-                reject_child_leaf_props(node, "acme", &[], errs);
-                check_child_types(
-                    node,
-                    "acme",
-                    &[
-                        ("enabled", Ty::Bool),
-                        ("staging", Ty::Bool),
-                        ("contact", Ty::Str),
-                        ("cache-dir", Ty::Str),
-                    ],
-                    errs,
-                );
-            }
-            "cache-store" => {
-                const CS_LEAVES: &[&str] = &["dir", "max-size", "max-files", "min-free"];
-                reject_unknown_props(node, "cache-store", &[], errs);
-                reject_unknown_children(node, "cache-store", CS_LEAVES, errs);
-                reject_dup_children(node, "cache-store", CS_LEAVES, errs);
-                reject_child_leaf_props(node, "cache-store", &[], errs);
-                check_child_types(
-                    node,
-                    "cache-store",
-                    &[
-                        ("dir", Ty::Str),
-                        ("max-size", Ty::Str),
-                        ("max-files", Ty::Int),
-                        ("min-free", Ty::Str),
-                    ],
-                    errs,
-                );
-            }
-            "defaults" => {
-                const DEF_LEAVES: &[&str] = &["hsts", "unknown-host"];
-                reject_unknown_props(node, "defaults", &[], errs);
-                reject_unknown_children(node, "defaults", DEF_LEAVES, errs);
-                reject_dup_children(node, "defaults", DEF_LEAVES, errs);
-                reject_child_leaf_props(node, "defaults", &[], errs);
-                check_child_types(
-                    node,
-                    "defaults",
-                    &[("hsts", Ty::Str), ("unknown-host", Ty::Int)],
-                    errs,
-                );
-            }
-            "alias" => {
-                check_arg_count(node, "alias", 0, 0, errs);
-                reject_unknown_props(node, "alias", &["prefix"], errs);
-                check_prop_types(node, "alias", &[("prefix", Ty::Str)], errs);
-            }
-            "listener" => {
-                const LIS_LEAVES: &[&str] = &["http2", "tls", "redirect-to-https"];
-                // A listener takes only its bind-address argument — reject
-                // `typo=true` and a stray second positional.
-                check_arg_count(node, "listener", 1, 1, errs);
-                reject_unknown_props(node, "listener", &[], errs);
-                reject_unknown_children(node, "listener", LIS_LEAVES, errs);
-                reject_dup_children(node, "listener", LIS_LEAVES, errs);
-                // `tls` bears properties; http2/redirect-to-https are value-only.
-                reject_child_leaf_props(node, "listener", &["tls"], errs);
-                check_child_types(
-                    node,
-                    "listener",
-                    &[("http2", Ty::Bool), ("redirect-to-https", Ty::Bool)],
-                    errs,
-                );
-                if let Some(tls) = child(node, "tls") {
-                    reject_unknown_props(
-                        tls,
-                        "listener tls",
-                        &["cert", "key", "cert-dir", "acme"],
-                        errs,
-                    );
-                    check_prop_types(
-                        tls,
-                        "listener tls",
-                        &[
-                            ("cert", Ty::Str),
-                            ("key", Ty::Str),
-                            ("cert-dir", Ty::Str),
-                            ("acme", Ty::Bool),
-                        ],
-                        errs,
-                    );
-                }
-            }
-            "site" => validate_site_unknowns(node, errs),
-            _ => {}
-        }
-    }
-}
-
-const SITE_CHILDREN: &[&str] = &[
-    "location",
-    "upstream",
-    "file-server",
-    "deny",
-    "redirect",
-    "rate-limit",
-    "access",
-    "waf",
-    "hsts",
-    "acme",
-    "websocket",
-    "max-body",
-    "read-timeout-secs",
-    "upstream-host",
-    "upstream-verify",
-    "sub-filter",
-    "cache",
-];
-const LOCATION_CHILDREN: &[&str] = &[
-    "upstream",
-    "file-server",
-    "websocket",
-    "max-body",
-    "read-timeout-secs",
-    "deny",
-    "cache",
-    "sub-filter",
-    "upstream-host",
-    "upstream-verify",
-];
-
-/// Directives shared by a site and a location that must appear at most once.
-const SINGLE_HANDLER_CHILDREN: &[&str] = &[
-    "upstream",
-    "file-server",
-    "cache",
-    "rate-limit",
-    "access",
-    "waf",
-    "max-body",
-    "websocket",
-    "read-timeout-secs",
-    "hsts",
-    "upstream-host",
-    "upstream-verify",
-    "acme",
-];
-/// Typed leaf fields shared by a site and a location.
-const HANDLER_FIELD_TYPES: &[(&str, Ty)] = &[
-    ("websocket", Ty::Bool),
-    ("max-body", Ty::Str),
-    ("read-timeout-secs", Ty::Int),
-    ("upstream-host", Ty::Str),
-    ("upstream-verify", Ty::Bool),
-    ("hsts", Ty::Str),
-    ("acme", Ty::Bool),
-];
-
-fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
-    let host = first_arg(node).unwrap_or("?");
-    let ctx = format!("site `{host}`");
-    reject_unknown_children(node, &ctx, SITE_CHILDREN, errs);
-    // A site takes exactly one host argument — reject stray props like
-    // `typo=true` and a stray second positional.
-    check_arg_count(node, &ctx, 1, 1, errs);
-    reject_unknown_props(node, &ctx, &[], errs);
-    reject_dup_children(node, &ctx, SINGLE_HANDLER_CHILDREN, errs);
-    check_child_types(node, &ctx, HANDLER_FIELD_TYPES, errs);
-    let Some(children) = node.children() else {
-        return;
-    };
-    for n in children.nodes() {
-        match n.name().value() {
-            "location" => {
-                let lctx = format!("{ctx} location");
-                reject_unknown_children(n, &lctx, LOCATION_CHILDREN, errs);
-                // A location takes exactly one matcher argument — reject
-                // `typo=true` and a stray second positional.
-                check_arg_count(n, &lctx, 1, 1, errs);
-                reject_unknown_props(n, &lctx, &[], errs);
-                reject_dup_children(n, &lctx, SINGLE_HANDLER_CHILDREN, errs);
-                check_child_types(n, &lctx, HANDLER_FIELD_TYPES, errs);
-                if let Some(lch) = n.children() {
-                    for c in lch.nodes() {
-                        let cn = c.name().value();
-                        if VALUE_ONLY_LEAVES.contains(&cn) {
-                            reject_unknown_props(c, &format!("{lctx} {cn}"), &[], errs);
-                            check_arg_count(c, &format!("{lctx} {cn}"), 1, 1, errs);
-                        }
-                    }
-                }
-                validate_backend_unknowns(n, &ctx, errs);
-            }
-            "upstream" | "file-server" | "cache" | "rate-limit" | "access" | "waf" | "redirect"
-            | "sub-filter" => validate_backend_child(n, &ctx, errs),
-            name if VALUE_ONLY_LEAVES.contains(&name) => {
-                // e.g. `max-body "10mb" typo=true` — the leaf takes only its value.
-                reject_unknown_props(n, &format!("{ctx} {name}"), &[], errs);
-                check_arg_count(n, &format!("{ctx} {name}"), 1, 1, errs);
-            }
-            _ => {}
-        }
-    }
-    // The site-level backend sugar (upstream/file-server/cache/...) at the site node.
-    validate_backend_unknowns(node, &ctx, errs);
-}
-
-/// Value-only leaf directives: they take exactly one argument and no properties.
-const VALUE_ONLY_LEAVES: &[&str] = &[
-    "max-body",
-    "websocket",
-    "read-timeout-secs",
-    "hsts",
-    "upstream-host",
-    "upstream-verify",
-    "acme",
-];
-
-/// Validate the backend/handler-shaped children shared by a site and a location.
-fn validate_backend_unknowns(node: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
-    if let Some(u) = child(node, "upstream") {
-        validate_backend_child(u, ctx, errs);
-    }
-    if let Some(f) = child(node, "file-server") {
-        validate_backend_child(f, ctx, errs);
-    }
-    if let Some(c) = child(node, "cache") {
-        validate_backend_child(c, ctx, errs);
-    }
-}
-
-fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
-    match n.name().value() {
-        "upstream" => {
-            let uctx = format!("{ctx} upstream");
-            reject_unknown_props(n, &uctx, &[], errs);
-            reject_unknown_children(n, &uctx, &["server", "balance", "health-check"], errs);
-            // `server` repeats; `balance`/`health-check` are singletons.
-            reject_dup_children(n, &uctx, &["balance", "health-check"], errs);
-            // `balance` is a value-only leaf; `server` bears `weight`.
-            reject_child_leaf_props(n, &uctx, &["server", "health-check"], errs);
-            check_child_types(n, &uctx, &[("balance", Ty::Str)], errs);
-            if let Some(ch) = n.children() {
-                for s in ch.nodes().iter().filter(|x| x.name().value() == "server") {
-                    reject_unknown_props(s, &format!("{ctx} upstream server"), &["weight"], errs);
-                    check_prop_types(
-                        s,
-                        &format!("{ctx} upstream server"),
-                        &[("weight", Ty::Int)],
-                        errs,
-                    );
-                }
-            }
-            if let Some(hc) = child(n, "health-check") {
-                const HC_LEAVES: &[&str] = &[
-                    "path",
-                    "interval-secs",
-                    "timeout-secs",
-                    "healthy",
-                    "unhealthy",
-                    "expect-status",
-                ];
-                let hctx = format!("{ctx} health-check");
-                reject_unknown_props(hc, &hctx, &[], errs);
-                reject_unknown_children(hc, &hctx, HC_LEAVES, errs);
-                reject_dup_children(hc, &hctx, HC_LEAVES, errs);
-                reject_child_leaf_props(hc, &hctx, &[], errs);
-                check_child_types(
-                    hc,
-                    &hctx,
-                    &[
-                        ("path", Ty::Str),
-                        ("interval-secs", Ty::Int),
-                        ("timeout-secs", Ty::Int),
-                        ("healthy", Ty::Int),
-                        ("unhealthy", Ty::Int),
-                        ("expect-status", Ty::Int),
-                    ],
-                    errs,
-                );
-            }
-        }
-        "file-server" => {
-            let fctx = format!("{ctx} file-server");
-            reject_unknown_children(n, &fctx, &["root", "index"], errs);
-            reject_dup_children(n, &fctx, &["root", "index"], errs);
-            reject_unknown_props(n, &fctx, &[], errs);
-            check_child_types(n, &fctx, &[("root", Ty::Str), ("index", Ty::Str)], errs);
-            // `root "/tmp" typo=true` — root/index take only their value.
-            if let Some(ch) = n.children() {
-                for c in ch.nodes() {
-                    let cn = c.name().value();
-                    if cn == "root" || cn == "index" {
-                        reject_unknown_props(c, &format!("{fctx} {cn}"), &[], errs);
-                    }
-                }
-            }
-        }
-        "cache" => {
-            let cctx = format!("{ctx} cache");
-            reject_unknown_props(n, &cctx, &[], errs);
-            reject_unknown_children(n, &cctx, &["ttl-secs", "max-object"], errs);
-            reject_dup_children(n, &cctx, &["ttl-secs", "max-object"], errs);
-            reject_child_leaf_props(n, &cctx, &[], errs);
-            check_child_types(
-                n,
-                &cctx,
-                &[("ttl-secs", Ty::Int), ("max-object", Ty::Str)],
-                errs,
-            );
-        }
-        "rate-limit" => {
-            reject_unknown_props(n, &format!("{ctx} rate-limit"), &["rps", "burst"], errs);
-            check_prop_types(
-                n,
-                &format!("{ctx} rate-limit"),
-                &[("rps", Ty::Num), ("burst", Ty::Num)],
-                errs,
-            );
-        }
-        "access" => {
-            reject_unknown_props(n, &format!("{ctx} access"), &["cloudflare-only"], errs);
-            check_prop_types(
-                n,
-                &format!("{ctx} access"),
-                &[("cloudflare-only", Ty::Bool)],
-                errs,
-            );
-        }
-        "redirect" => {
-            reject_unknown_props(
-                n,
-                &format!("{ctx} redirect"),
-                &["match", "target", "status"],
-                errs,
-            );
-            check_prop_types(
-                n,
-                &format!("{ctx} redirect"),
-                &[("match", Ty::Str), ("target", Ty::Str), ("status", Ty::Int)],
-                errs,
-            );
-        }
-        "sub-filter" => {
-            reject_unknown_props(n, &format!("{ctx} sub-filter"), &["from", "to"], errs)
-        }
-        "waf" => {
-            // A `waf` block contains only `block` directives — catch e.g. `blok`,
-            // which would otherwise leave the WAF with no rules.
-            reject_unknown_children(n, &format!("{ctx} waf"), &["block"], errs);
-            if let Some(ch) = n.children() {
-                for b in ch.nodes().iter().filter(|x| x.name().value() == "block") {
-                    reject_unknown_props(
-                        b,
-                        &format!("{ctx} waf block"),
-                        &["field", "match", "status"],
-                        errs,
-                    );
-                    check_prop_types(
-                        b,
-                        &format!("{ctx} waf block"),
-                        &[("field", Ty::Str), ("match", Ty::Str), ("status", Ty::Int)],
-                        errs,
-                    );
-                }
-            }
-        }
-        _ => {}
+        seen.push(name);
+        let ctx = node_label("", name, node);
+        walk(node, spec, &ctx, errs);
     }
 }
 
@@ -1343,9 +1227,9 @@ impl Config {
             }
         }
 
-        // Reject mistyped directives/props inside blocks (typos → errors, not
-        // silent no-ops) — the nested-block counterpart to the top-level check.
-        validate_unknowns(&doc, &mut errs);
+        // Validate the whole document against the declarative schema (typos,
+        // stray props/args, duplicates, wrong types → errors, not silent no-ops).
+        validate_schema(&doc, &mut errs);
 
         // apply default hsts to sites that didn't set their own
         for s in &mut sites {
@@ -1497,9 +1381,12 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
 
     // ACME-managed certs (needs a top-level `acme {}` block).
     if prop_bool(tls, "acme").unwrap_or(false) {
-        if prop_str(tls, "cert").is_some() || prop_str(tls, "cert-dir").is_some() {
+        if prop_str(tls, "cert").is_some()
+            || prop_str(tls, "key").is_some()
+            || prop_str(tls, "cert-dir").is_some()
+        {
             return Err(format!(
-                "listener {addr:?}: `tls acme=true` can't be combined with cert/cert-dir"
+                "listener {addr:?}: `tls acme=true` can't be combined with cert/key/cert-dir"
             ));
         }
         return Ok(Listener {
@@ -2001,7 +1888,7 @@ mod tests {
     #[test]
     fn strict_schema_rejects_stray_props_and_dups() {
         // Props on value-only leaves / blocks.
-        assert!(parse_err("server {\n threads 2 typo=true\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("takes no properties"));
+        assert!(parse_err("server {\n threads 2 typo=true\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("unknown property"));
         assert!(parse_err(&cfg_with(
             " max-body \"1MiB\" typo=true\n upstream \"127.0.0.1:9\""
         ))
@@ -2037,6 +1924,57 @@ mod tests {
             " upstream \"127.0.0.1:9\"\n rate-limit rps=1.0e999 burst=1.0e999"
         ))
         .contains("must be a number"));
+    }
+
+    #[test]
+    fn strict_schema_rejects_round5_cases() {
+        // server block takes no positional; threads takes exactly one arg.
+        let e = parse_err("server \"ignored\" {\n threads 2 3\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n");
+        assert!(e.contains("server: expected exactly 0"), "{e}");
+        assert!(e.contains("threads: expected exactly 1"), "{e}");
+        // upstream shorthand with an extra positional / mixed with a block.
+        assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:9\" \"ignored\"")).contains("argument"));
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\" {\n server \"127.0.0.1:10\"\n }"
+        ))
+        .contains("not both"));
+        // health-check takes no positional; path takes exactly one.
+        let e = parse_err(&cfg_with(
+            " upstream {\n server \"127.0.0.1:9\"\n health-check \"ignored\" {\n path \"/health\" \"ignored\"\n }\n }"
+        ));
+        assert!(e.contains("health-check: expected exactly 0"), "{e}");
+        assert!(e.contains("path: expected exactly 1"), "{e}");
+        // rate-limit takes neither positionals nor a block.
+        let e = parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n rate-limit \"ignored\" rps=1 burst=1 {\n typo true\n }",
+        ));
+        assert!(e.contains("argument"), "{e}");
+        assert!(e.contains("takes no block"), "{e}");
+        // tls: no positionals; `acme=true` conflicts with `key=`.
+        assert!(parse_err("listener \"0.0.0.0:443\" {\n tls \"ignored\" acme=true\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("argument"));
+        assert!(parse_err("listener \"0.0.0.0:443\" {\n tls acme=true key=\"/missing.key\"\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("can't be combined"));
+        // sub-filter to= must be a string (was silently coerced to "").
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n sub-filter from=\"a\" to=123"
+        ))
+        .contains("must be a quoted string"));
+        // waf takes no props; a waf block takes no children.
+        let e = parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n waf typo=true {\n block field=\"query\" match=\"x\" {\n typo true\n }\n }"
+        ));
+        assert!(e.contains("waf: unknown property"), "{e}");
+        assert!(e.contains("takes no block"), "{e}");
+        // duplicate property on one node.
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n rate-limit rps=1 rps=2 burst=2"
+        ))
+        .contains("duplicate property"));
+        // alias never takes a block; deny takes exactly one regex.
+        assert!(parse_err("alias prefix=\"s\" {\n x\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("takes no block"));
+        assert!(
+            parse_err(&cfg_with(" upstream \"127.0.0.1:9\"\n deny \"a\" \"b\""))
+                .contains("argument")
+        );
     }
 
     #[test]

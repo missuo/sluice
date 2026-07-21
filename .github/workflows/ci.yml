@@ -52,13 +52,45 @@ jobs:
 
       - name: Validate full example config
         # The example references paths that don't exist in CI (certs, static
-        # roots), so a non-zero exit is expected. We assert only that the binary
-        # gets far enough to report those *filesystem* errors and emits no
-        # schema/type error line — those would be real regressions.
+        # roots), so a non-zero exit with EXACTLY those filesystem errors is the
+        # expected outcome — and is asserted. A zero exit, empty output, panic,
+        # or any schema/type error line is a real regression and fails the job.
         run: |
-          out=$(./target/debug/sluice --check -c examples/sluice.kdl 2>&1 || true)
+          set +e
+          out=$(./target/debug/sluice --check -c examples/sluice.kdl 2>&1)
+          rc=$?
+          set -e
           echo "$out"
-          if echo "$out" | grep -Ei 'unknown (property|directive|child)|takes no properties|given more than once|must be (an integer|a number|true|false|a quoted)|expected .* argument'; then
+          if [ "$rc" -eq 0 ]; then
+            echo "::error::expected a non-zero exit (missing cert/static paths)"; exit 1
+          fi
+          if [ -z "$out" ]; then
+            echo "::error::no output from --check"; exit 1
+          fi
+          if echo "$out" | grep -qi 'panic'; then
+            echo "::error::--check panicked"; exit 1
+          fi
+          echo "$out" | grep -q 'cert file not found' \
+            || { echo "::error::expected the missing-cert filesystem error"; exit 1; }
+          echo "$out" | grep -q 'file-server root not a directory' \
+            || { echo "::error::expected the missing-static-root filesystem error"; exit 1; }
+          if echo "$out" | grep -Ei 'unknown (property|directive)|takes no (properties|block)|given more than once|duplicate property|must be (an integer|a number|true|false|a quoted)|expected .* argument|not both'; then
             echo "::error::example config produced a schema/type error"
             exit 1
           fi
+
+  audit:
+    name: cargo audit (RustSec)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      # RUSTSEC-2024-0437 (protobuf 2.28, transitive via `prometheus` which both
+      # sluice and pingora-core depend on) is ACCEPTED: the fix (protobuf >=3.7)
+      # requires a prometheus/pingora upgrade upstream, and Sluice never parses
+      # attacker-controlled protobuf on the request path. Documented in
+      # KNOWN_ISSUES.md — re-evaluate on every pingora bump. Any OTHER advisory
+      # fails this job.
+      - run: cargo audit --ignore RUSTSEC-2024-0437
