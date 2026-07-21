@@ -65,9 +65,13 @@ blocked upstream (Pingora has no QUIC transport).
   legacy `.crt`/`.key` pairs are served and migrated on startup. The cache dir
   is verified (real dir, owned, 0700) before any secret is written.
 - **`diskcache.rs`** — a disk-backed `pingora_cache::Storage` implementation
-  (Pingora only ships an in-memory `MemCache`). ONE sharded file per entry
-  (meta prefix + body), fsync'd temp + single atomic rename, background size
-  reaper.
+  (Pingora only ships an in-memory `MemCache`). ONE sharded `.ent` file per
+  entry (meta prefix + body), `O_EXCL` temp + single atomic rename, background
+  reaper that only ever touches cache-owned filenames (`<32hex>.ent`, `.tmp.*`,
+  legacy `.meta`/`.body`) — never a user's stray file.
+- **`dirs.rs`** — `secure_owned_dir`: shared owner/mode/symlink validation for
+  the private ACME and disk-cache directories. Returns the CANONICAL path;
+  callers store that so later opens can't be re-routed via a parent symlink.
 - **`metrics.rs`** — Prometheus metric definitions.
 
 ### Config hot-reload model (do not break this)
@@ -118,12 +122,24 @@ These were fixed after review; a change that reverts any of them is a bug:
 - Disk-cache `lookup` treats any IO/parse error as a miss — never fail a request.
 - **Cache entries and ACME certs are single-file + one atomic rename** — never
   split state across two files whose renames can be separated by a crash.
-- **ACME cache-dir is fail-closed**: refused if it's a symlink, wrongly owned,
-  or can't be chmod'd 0700; secret writes use `create_new` (O_EXCL) temps with
+- **Private dirs (ACME, disk cache) are fail-closed** via `dirs::secure_owned_dir`:
+  refused if a symlink / wrongly owned / not chmod-able to 0700; the stored path
+  is canonical. Secret and cache writes use `create_new` (O_EXCL) temps with
   unpredictable names so a pre-planted symlink can't capture or truncate.
-- **The config schema is strict at every level** (`Spec` tree in `config.rs`):
-  never add a directive without its full Spec (args/props/children/types) — a
-  lenient node re-opens silent-typo config bugs.
+- **Static files are served race-free**: descend from the docroot with
+  `openat`/`O_NOFOLLOW` per component; never `canonicalize`→`open` (TOCTOU), and
+  take `Content-Length` from `fstat` on the streamed fd. Symlinks under the root
+  are not followed.
+- **Cache entries and ACME certs are single-file + one atomic rename** — never
+  split state across two files whose renames can be separated by a crash. The
+  cache key is namespaced by a per-site config epoch (a reload can't serve a
+  retired upstream's entries); the reaper only touches cache-owned filenames.
+- **The config schema is strict at every level** (`Spec` tree + `walk` in
+  `config.rs`): args (count/type/int-range), props (names/types/dups), children
+  (names/multiplicity/block-allowed). Never add a directive without its full
+  Spec — a lenient node re-opens silent-typo config bugs. Header-bound config
+  values (hsts, upstream-host, health path, redirect target, site host) reject
+  control characters, and site hosts are lowercased + charset-checked.
 
 ## Conventions
 

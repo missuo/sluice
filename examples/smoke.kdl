@@ -16,6 +16,11 @@ client-ip {
 acme {
     contact "ops@smoke.example"
     staging true
+    // The cache-dir holds private keys, so `--check` verifies it is a real,
+    // owner-only (0700) directory it can create. Point the smoke config at a
+    // gitignored path under target/ so `--check` passes anywhere (CI, a dev box)
+    // without needing /var/lib. A real deployment uses /var/lib/sluice/acme.
+    cache-dir "target/smoke-acme"
 }
 
 listener "0.0.0.0:80" {

@@ -88,7 +88,6 @@ pub struct Config {
     pub trusted_proxies: Vec<IpNet>,
     pub geoip: Option<GeoipCfg>,
     pub listeners: Vec<Listener>,
-    pub alias_prefix: Option<String>,
     pub acme: Option<AcmeCfg>,
     /// Disk-backed response cache (None = the default in-memory LRU).
     pub disk_cache: Option<DiskCacheCfg>,
@@ -339,6 +338,13 @@ pub struct Site {
     /// a `tls acme=true` listener). Off by default so CF-fronted hosts, which
     /// can't pass HTTP-01, don't trigger endless failed validations.
     pub acme: bool,
+    /// Fingerprint of this site's content-affecting config (matchers, upstream
+    /// servers + Host rewrites, file roots, sub-filters). It namespaces the
+    /// response-cache key, so a reload/restart/upgrade that points the site at
+    /// a different upstream cannot keep serving the OLD config's cached
+    /// responses. Identical config → identical epoch → the persistent disk
+    /// cache still survives restarts.
+    pub cache_epoch: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -608,6 +614,10 @@ struct Spec {
     args: (usize, usize),
     /// Type every positional argument must have.
     arg_ty: Ty,
+    /// For `Ty::Int` arguments: the inclusive value range. Catches negatives
+    /// that were silently clamped and huge values that silently narrowed
+    /// (`healthy 4294967296` used to truncate to 0 via `as u32`).
+    int_range: Option<(i128, i128)>,
     /// Allowed `key=value` properties and their types.
     props: &'static [(&'static str, Ty)],
     /// `None` = leaf (having a `{ }` block is an error); `Some` = the allowed
@@ -621,28 +631,51 @@ const fn leaf(min: usize, max: usize, ty: Ty) -> Spec {
     Spec {
         args: (min, max),
         arg_ty: ty,
+        int_range: None,
         props: &[],
         children: None,
         extra: None,
     }
 }
 
-static INT1: Spec = leaf(1, 1, Ty::Int);
+/// An integer leaf whose single argument must lie in `lo..=hi`.
+const fn int_leaf(lo: i128, hi: i128) -> Spec {
+    Spec {
+        args: (1, 1),
+        arg_ty: Ty::Int,
+        int_range: Some((lo, hi)),
+        props: &[],
+        children: None,
+        extra: None,
+    }
+}
+
 static STR1: Spec = leaf(1, 1, Ty::Str);
 static BOOL1: Spec = leaf(1, 1, Ty::Bool);
 /// One or more string arguments (list leaves like `trusted-proxies`).
 static STRS: Spec = leaf(1, usize::MAX, Ty::Str);
 
+// Integer leaves with semantic ranges (negatives were silently clamped and
+// oversized values silently narrowed before — now they're config errors).
+static SECS0: Spec = int_leaf(0, 31_536_000); // durations that may be 0 (ttl, grace)
+static SECS1: Spec = int_leaf(1, 86_400); // durations that must be >= 1s
+static STREAK: Spec = int_leaf(1, 100_000); // health up/down thresholds
+static HTTP_STATUS: Spec = int_leaf(100, 599);
+static THREADS: Spec = int_leaf(0, 4096);
+static POOL0: Spec = int_leaf(0, 1_000_000); // upstream-keepalive-pool
+static FILES1: Spec = int_leaf(1, 1_000_000_000_000); // cache-store max-files
+
 static SERVER_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
-        ("threads", Rep::Once, &INT1),
+        ("threads", Rep::Once, &THREADS),
         ("metrics-addr", Rep::Once, &STR1),
-        ("grace-period-secs", Rep::Once, &INT1),
-        ("graceful-shutdown-secs", Rep::Once, &INT1),
-        ("upstream-keepalive-pool", Rep::Once, &INT1),
+        ("grace-period-secs", Rep::Once, &SECS0),
+        ("graceful-shutdown-secs", Rep::Once, &SECS0),
+        ("upstream-keepalive-pool", Rep::Once, &POOL0),
         ("upgrade-sock", Rep::Once, &STR1),
     ]),
     extra: None,
@@ -651,6 +684,7 @@ static SERVER_SPEC: Spec = Spec {
 static CLIENT_IP_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("trusted-header", Rep::Once, &STR1),
@@ -662,6 +696,7 @@ static CLIENT_IP_SPEC: Spec = Spec {
 static GEOIP_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("enabled", Rep::Once, &BOOL1),
@@ -677,6 +712,7 @@ static GEOIP_SPEC: Spec = Spec {
 static ACME_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("enabled", Rep::Once, &BOOL1),
@@ -690,31 +726,25 @@ static ACME_SPEC: Spec = Spec {
 static CACHE_STORE_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("dir", Rep::Once, &STR1),
         ("max-size", Rep::Once, &STR1),
-        ("max-files", Rep::Once, &INT1),
+        ("max-files", Rep::Once, &FILES1),
         ("min-free", Rep::Once, &STR1),
     ]),
-    extra: None,
-};
-
-static ALIAS_SPEC: Spec = Spec {
-    args: (0, 0),
-    arg_ty: Ty::Str,
-    props: &[("prefix", Ty::Str)],
-    children: None,
     extra: None,
 };
 
 static DEFAULTS_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("hsts", Rep::Once, &STR1),
-        ("unknown-host", Rep::Once, &INT1),
+        ("unknown-host", Rep::Once, &HTTP_STATUS),
     ]),
     extra: None,
 };
@@ -722,6 +752,7 @@ static DEFAULTS_SPEC: Spec = Spec {
 static TLS_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[
         ("cert", Ty::Str),
         ("key", Ty::Str),
@@ -735,6 +766,7 @@ static TLS_SPEC: Spec = Spec {
 static LISTENER_SPEC: Spec = Spec {
     args: (1, 1),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("http2", Rep::Once, &BOOL1),
@@ -747,6 +779,7 @@ static LISTENER_SPEC: Spec = Spec {
 static UPSTREAM_SERVER_SPEC: Spec = Spec {
     args: (1, 1),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[("weight", Ty::Int)],
     children: None,
     extra: None,
@@ -755,14 +788,15 @@ static UPSTREAM_SERVER_SPEC: Spec = Spec {
 static HEALTH_CHECK_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("path", Rep::Once, &STR1),
-        ("interval-secs", Rep::Once, &INT1),
-        ("timeout-secs", Rep::Once, &INT1),
-        ("healthy", Rep::Once, &INT1),
-        ("unhealthy", Rep::Once, &INT1),
-        ("expect-status", Rep::Once, &INT1),
+        ("interval-secs", Rep::Once, &SECS1),
+        ("timeout-secs", Rep::Once, &SECS1),
+        ("healthy", Rep::Once, &STREAK),
+        ("unhealthy", Rep::Once, &STREAK),
+        ("expect-status", Rep::Once, &HTTP_STATUS),
     ]),
     extra: None,
 };
@@ -770,6 +804,7 @@ static HEALTH_CHECK_SPEC: Spec = Spec {
 static UPSTREAM_SPEC: Spec = Spec {
     args: (0, 1),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("server", Rep::Many, &UPSTREAM_SERVER_SPEC),
@@ -796,6 +831,7 @@ fn upstream_one_form(node: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
 static FILE_SERVER_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[("root", Rep::Once, &STR1), ("index", Rep::Once, &STR1)]),
     extra: None,
@@ -804,9 +840,10 @@ static FILE_SERVER_SPEC: Spec = Spec {
 static CACHE_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
-        ("ttl-secs", Rep::Once, &INT1),
+        ("ttl-secs", Rep::Once, &SECS0),
         ("max-object", Rep::Once, &STR1),
     ]),
     extra: None,
@@ -815,6 +852,7 @@ static CACHE_SPEC: Spec = Spec {
 static RATE_LIMIT_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[("rps", Ty::Num), ("burst", Ty::Num)],
     children: None,
     extra: None,
@@ -823,6 +861,7 @@ static RATE_LIMIT_SPEC: Spec = Spec {
 static ACCESS_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[("cloudflare-only", Ty::Bool)],
     children: None,
     extra: None,
@@ -831,6 +870,7 @@ static ACCESS_SPEC: Spec = Spec {
 static REDIRECT_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[("match", Ty::Str), ("target", Ty::Str), ("status", Ty::Int)],
     children: None,
     extra: None,
@@ -839,6 +879,7 @@ static REDIRECT_SPEC: Spec = Spec {
 static SUB_FILTER_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[("from", Ty::Str), ("to", Ty::Str)],
     children: None,
     extra: None,
@@ -847,6 +888,7 @@ static SUB_FILTER_SPEC: Spec = Spec {
 static WAF_BLOCK_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[("field", Ty::Str), ("match", Ty::Str), ("status", Ty::Int)],
     children: None,
     extra: None,
@@ -855,6 +897,7 @@ static WAF_BLOCK_SPEC: Spec = Spec {
 static WAF_SPEC: Spec = Spec {
     args: (0, 0),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[("block", Rep::Many, &WAF_BLOCK_SPEC)]),
     extra: None,
@@ -865,13 +908,14 @@ static DENY_SPEC: Spec = leaf(1, 1, Ty::Str);
 static LOCATION_SPEC: Spec = Spec {
     args: (1, 1),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("upstream", Rep::Once, &UPSTREAM_SPEC),
         ("file-server", Rep::Once, &FILE_SERVER_SPEC),
         ("websocket", Rep::Once, &BOOL1),
         ("max-body", Rep::Once, &STR1),
-        ("read-timeout-secs", Rep::Once, &INT1),
+        ("read-timeout-secs", Rep::Once, &SECS1),
         ("deny", Rep::Many, &DENY_SPEC),
         ("cache", Rep::Once, &CACHE_SPEC),
         ("sub-filter", Rep::Many, &SUB_FILTER_SPEC),
@@ -884,6 +928,7 @@ static LOCATION_SPEC: Spec = Spec {
 static SITE_SPEC: Spec = Spec {
     args: (1, 1),
     arg_ty: Ty::Str,
+    int_range: None,
     props: &[],
     children: Some(&[
         ("location", Rep::Many, &LOCATION_SPEC),
@@ -898,7 +943,7 @@ static SITE_SPEC: Spec = Spec {
         ("acme", Rep::Once, &BOOL1),
         ("websocket", Rep::Once, &BOOL1),
         ("max-body", Rep::Once, &STR1),
-        ("read-timeout-secs", Rep::Once, &INT1),
+        ("read-timeout-secs", Rep::Once, &SECS1),
         ("upstream-host", Rep::Once, &STR1),
         ("upstream-verify", Rep::Once, &BOOL1),
         ("sub-filter", Rep::Many, &SUB_FILTER_SPEC),
@@ -913,7 +958,6 @@ static ROOT_CHILDREN: &[(&str, Rep, &Spec)] = &[
     ("geoip", Rep::Once, &GEOIP_SPEC),
     ("acme", Rep::Once, &ACME_SPEC),
     ("cache-store", Rep::Once, &CACHE_STORE_SPEC),
-    ("alias", Rep::Once, &ALIAS_SPEC),
     ("defaults", Rep::Once, &DEFAULTS_SPEC),
     ("listener", Rep::Many, &LISTENER_SPEC),
     ("site", Rep::Many, &SITE_SPEC),
@@ -957,6 +1001,10 @@ fn walk(node: &KdlNode, spec: &Spec, ctx: &str, errs: &mut Vec<String>) {
                     "{ctx}: argument must be {}",
                     spec.arg_ty.describe()
                 ));
+            } else if let (Some((lo, hi)), Some(v)) = (spec.int_range, e.value().as_integer()) {
+                if v < lo || v > hi {
+                    errs.push(format!("{ctx}: value {v} out of range ({lo}..={hi})"));
+                }
             }
         }
     }
@@ -1038,7 +1086,6 @@ const TOP_LEVEL: &[&str] = &[
     "acme",
     "cache-store",
     "listener",
-    "alias",
     "defaults",
     "site",
 ];
@@ -1063,7 +1110,6 @@ impl Config {
         let mut trusted_proxies_set = false;
         let mut geoip = None;
         let mut listeners = Vec::new();
-        let mut alias_prefix = None;
         let mut acme: Option<AcmeCfg> = None;
         let mut disk_cache: Option<DiskCacheCfg> = None;
         let mut default_hsts = None;
@@ -1150,26 +1196,30 @@ impl Config {
                     Ok(l) => listeners.push(l),
                     Err(e) => errs.push(e),
                 },
-                "alias" => match prop_str(node, "prefix").filter(|p| !p.is_empty()) {
-                    Some(p) => alias_prefix = Some(p.to_string()),
-                    // `alias "staging"` (positional) or `alias prefix=""` silently
-                    // disabled aliasing before — make it an explicit error.
-                    None => {
-                        errs.push("alias: needs a non-empty prefix=\"...\" property".to_string())
-                    }
-                },
                 "acme" => {
                     let enabled = child_bool(node, "enabled").unwrap_or(true);
                     if enabled {
                         match child_arg(node, "contact") {
                             Some(c) => {
-                                acme = Some(AcmeCfg {
-                                    contact: c.to_string(),
-                                    staging: child_bool(node, "staging").unwrap_or(false),
-                                    cache_dir: child_arg(node, "cache-dir")
-                                        .unwrap_or("/var/lib/sluice/acme")
-                                        .to_string(),
-                                });
+                                let dir = child_arg(node, "cache-dir")
+                                    .unwrap_or("/var/lib/sluice/acme")
+                                    .to_string();
+                                // Fail at --check/startup, not silently in the
+                                // background thread: the dir must be a real,
+                                // owned, 0700 directory (keys live there). The
+                                // stored path is CANONICAL so later opens can't
+                                // be re-routed via a parent symlink. Run
+                                // --check as the service user.
+                                match crate::dirs::secure_owned_dir(&dir) {
+                                    Ok(canon) => {
+                                        acme = Some(AcmeCfg {
+                                            contact: c.to_string(),
+                                            staging: child_bool(node, "staging").unwrap_or(false),
+                                            cache_dir: canon,
+                                        });
+                                    }
+                                    Err(e) => errs.push(format!("acme cache-dir: {e}")),
+                                }
                             }
                             None => errs.push("acme: `contact` (an email) is required".to_string()),
                         }
@@ -1192,22 +1242,33 @@ impl Config {
                         let max_files = child_int(node, "max-files")
                             .map(|v| v.max(1) as u64)
                             .unwrap_or(1_000_000);
-                        // Surface an unusable dir now (create it if missing),
-                        // rather than silently failing every cache write later.
-                        if let Err(e) = std::fs::create_dir_all(dir) {
-                            errs.push(format!("cache-store dir {dir:?}: {e}"));
+                        // Surface an unusable dir now (create it if missing)
+                        // rather than silently failing every cache write later,
+                        // and lock it down: a cache root another local user can
+                        // write lets them plant symlinks under the shard dirs.
+                        // The stored path is CANONICAL (parent symlinks resolved
+                        // once, here).
+                        match crate::dirs::secure_owned_dir(dir) {
+                            Ok(canon) => {
+                                disk_cache = Some(DiskCacheCfg {
+                                    dir: canon,
+                                    max_size,
+                                    max_files,
+                                    min_free,
+                                });
+                            }
+                            Err(e) => errs.push(format!("cache-store dir: {e}")),
                         }
-                        disk_cache = Some(DiskCacheCfg {
-                            dir: dir.to_string(),
-                            max_size,
-                            max_files,
-                            min_free,
-                        });
                     }
                     None => errs.push("cache-store: `dir` is required".to_string()),
                 },
                 "defaults" => {
                     if let Some(v) = child_arg(node, "hsts") {
+                        if v.chars().any(|c| c.is_control()) {
+                            errs.push(
+                                "defaults hsts: must not contain control characters".to_string(),
+                            );
+                        }
                         default_hsts = Some(v.to_string());
                     }
                     if let Some(v) = child_int(node, "unknown-host") {
@@ -1327,7 +1388,6 @@ impl Config {
                 trusted_proxies,
                 geoip,
                 listeners,
-                alias_prefix,
                 acme,
                 disk_cache,
                 unknown_host,
@@ -1337,21 +1397,6 @@ impl Config {
         } else {
             Err(errs.join("\n"))
         }
-    }
-
-    /// Resolve a request Host to a canonical site host. The migration alias
-    /// `<prefix>-<sub>` maps to `<sub>` ONLY when `<sub>` is a configured site —
-    /// otherwise the host is returned unchanged, so a genuinely separate
-    /// `staging-foo` host is never silently hijacked.
-    pub fn canonical(&self, host: &str) -> String {
-        if let Some(prefix) = &self.alias_prefix {
-            if let Some(rest) = host.strip_prefix(&format!("{prefix}-")) {
-                if self.index.contains_key(rest) {
-                    return rest.to_string();
-                }
-            }
-        }
-        host.to_string()
     }
 }
 
@@ -1551,6 +1596,14 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
 
 fn parse_health_check(node: &KdlNode, host: &str) -> Result<HealthCheck, String> {
     let path = child_arg(node, "path").map(str::to_owned);
+    if let Some(p) = &path {
+        reject_ctl("health-check path", p, host)?;
+        if !p.starts_with('/') || p.contains(' ') {
+            return Err(format!(
+                "site `{host}`: health-check path must start with '/' and contain no spaces"
+            ));
+        }
+    }
     let interval = Duration::from_secs(child_int(node, "interval-secs").unwrap_or(5).max(1) as u64);
     let timeout = Duration::from_secs(child_int(node, "timeout-secs").unwrap_or(2).max(1) as u64);
     let healthy = child_int(node, "healthy").unwrap_or(2).max(1) as u32;
@@ -1584,6 +1637,10 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
         (Some(u), None) => {
             let mut group = parse_upstream_group(u, host)?;
             if let Some(h) = child_arg(node, "upstream-host") {
+                reject_ctl("upstream-host", h, host)?;
+                if h.is_empty() {
+                    return Err(format!("site `{host}`: upstream-host must not be empty"));
+                }
                 for s in &mut group.servers {
                     s.host_header = Some(h.to_string());
                 }
@@ -1711,10 +1768,37 @@ fn parse_waf(node: &KdlNode, host: &str) -> Result<Vec<WafRule>, String> {
     Ok(rules)
 }
 
+/// Reject values that get embedded into HTTP header lines (HSTS, Host, probe
+/// request line, Location) if they carry control bytes — header injection from
+/// a config file is still header injection.
+fn reject_ctl(what: &str, v: &str, host: &str) -> Result<(), String> {
+    if v.chars().any(|c| c.is_control()) {
+        return Err(format!(
+            "site `{host}`: {what} must not contain control characters"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_site(node: &KdlNode) -> Result<Site, String> {
-    let host = first_arg(node)
+    let raw_host = first_arg(node)
         .ok_or("site needs a host, e.g. site \"app.example.com\"")?
         .to_string();
+    // Requests arrive with the Host lowercased, so normalize here — an
+    // uppercase site would never match (and two case-variant sites would dodge
+    // duplicate detection). Validate the charset so a host can't smuggle
+    // whitespace/CRLF into the :80 redirect Location or the index key.
+    let host = raw_host.to_ascii_lowercase();
+    if host.is_empty() {
+        return Err("site: host must not be empty".to_string());
+    }
+    if host.len() > 253
+        || !host
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '-' | '_'))
+    {
+        return Err(format!("site {raw_host:?}: not a valid hostname"));
+    }
 
     // Locations: explicit `location` blocks first (matched in order), then any
     // site-level bare `upstream`/`file-server` as an implicit catch-all "/".
@@ -1752,6 +1836,9 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
     let waf = parse_waf(node, &host)?;
     let acme = child_bool(node, "acme").unwrap_or(false);
     let hsts = child_arg(node, "hsts").map(str::to_owned);
+    if let Some(h) = &hsts {
+        reject_ctl("hsts", h, &host)?;
+    }
     let cloudflare_only = child(node, "access")
         .and_then(|a| prop_bool(a, "cloudflare-only"))
         .unwrap_or(false);
@@ -1788,6 +1875,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
             let target = prop_str(r, "target")
                 .ok_or_else(|| format!("site `{host}`: redirect missing target"))?
                 .to_string();
+            reject_ctl("redirect target", &target, &host)?;
             let raw_status = prop_int(r, "status").unwrap_or(301);
             let status = u16::try_from(raw_status)
                 .ok()
@@ -1799,6 +1887,40 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         }
     }
 
+    // Content-affecting fingerprint → cache namespace (see `Site.cache_epoch`).
+    let mut fp = String::new();
+    {
+        use std::fmt::Write;
+        for loc in &locations {
+            match &loc.matcher {
+                Matcher::Prefix(p) => {
+                    let _ = write!(fp, "P{p}\u{1f}");
+                }
+                Matcher::Regex(r) => {
+                    let _ = write!(fp, "R{}\u{1f}", r.as_str());
+                }
+            }
+            match &loc.handler {
+                Handler::Proxy(g) => {
+                    for sv in &g.servers {
+                        let _ = write!(
+                            fp,
+                            "U{}:{}:{}:{}:{:?}\u{1f}",
+                            sv.host, sv.port, sv.tls, sv.sni, sv.host_header
+                        );
+                    }
+                }
+                Handler::File { root, index } => {
+                    let _ = write!(fp, "F{root}:{index}\u{1f}");
+                }
+            }
+            for sf in &loc.sub_filters {
+                let _ = write!(fp, "S{:?}>{:?}\u{1f}", sf.from, sf.to);
+            }
+        }
+    }
+    let cache_epoch = stable_hash(&fp);
+
     Ok(Site {
         host,
         locations,
@@ -1809,6 +1931,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         rate_limit,
         redirects,
         acme,
+        cache_epoch,
     })
 }
 
@@ -1969,12 +2092,89 @@ mod tests {
             " upstream \"127.0.0.1:9\"\n rate-limit rps=1 rps=2 burst=2"
         ))
         .contains("duplicate property"));
-        // alias never takes a block; deny takes exactly one regex.
-        assert!(parse_err("alias prefix=\"s\" {\n x\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("takes no block"));
+        // alias was removed entirely (its canonicalization leaked cache entries
+        // across Hosts) — it is now an unknown directive.
+        assert!(parse_err("alias prefix=\"s\"\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("unknown top-level directive"));
         assert!(
             parse_err(&cfg_with(" upstream \"127.0.0.1:9\"\n deny \"a\" \"b\""))
                 .contains("argument")
         );
+    }
+
+    #[test]
+    fn strict_schema_rejects_round6_value_semantics() {
+        // Negative / oversized integers were silently clamped or narrowed.
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n cache {\n ttl-secs -1\n }"
+        ))
+        .contains("out of range"));
+        assert!(parse_err(&cfg_with(
+            " upstream {\n server \"127.0.0.1:9\"\n health-check {\n interval-secs -1\n }\n }"
+        ))
+        .contains("out of range"));
+        // healthy 4294967296 used to narrow to 0 via `as u32` → instant-UP.
+        assert!(parse_err(&cfg_with(
+            " upstream {\n server \"127.0.0.1:9\"\n health-check {\n healthy 4294967296\n }\n }"
+        ))
+        .contains("out of range"));
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n read-timeout-secs -1"
+        ))
+        .contains("out of range"));
+        assert!(
+            parse_err("server {\n upstream-keepalive-pool -1\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n")
+                .contains("out of range")
+        );
+        // Host semantics: empty is rejected; case variants normalize and so
+        // collide as duplicates.
+        assert!(parse_err(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"\" {\n upstream \"127.0.0.1:9\"\n}\n"
+        )
+        .contains("host must not be empty"));
+        let e = parse_err(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"App.Test\" {\n upstream \"127.0.0.1:9\"\n}\nsite \"app.test\" {\n upstream \"127.0.0.1:9\"\n}\n",
+        );
+        assert!(e.contains("duplicate site host"), "{e}");
+        // Uppercase alone is accepted but normalized to lowercase.
+        let c = Config::parse(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"SMOKE.Example\" {\n upstream \"127.0.0.1:9\"\n}\n",
+        )
+        .expect("uppercase host should normalize");
+        assert!(c.index.contains_key("smoke.example"));
+        // CRLF / control bytes in header-bound values.
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n hsts \"max-age=1\\r\\nSet-Cookie: x\""
+        ))
+        .contains("control characters"));
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n upstream-host \"evil\\r\\nX: y\""
+        ))
+        .contains("control characters"));
+        assert!(parse_err(&cfg_with(
+            " upstream {\n server \"127.0.0.1:9\"\n health-check {\n path \"no-slash\"\n }\n }"
+        ))
+        .contains("must start with '/'"));
+    }
+
+    #[test]
+    fn cache_epoch_tracks_content_affecting_config() {
+        let base = "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        let same = Config::parse(base).unwrap();
+        let again = Config::parse(base).unwrap();
+        // Identical config → identical epoch (disk cache survives restarts).
+        assert_eq!(same.sites[0].cache_epoch, again.sites[0].cache_epoch);
+        // A different upstream → different epoch (old entries unreachable).
+        let moved = Config::parse(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9002\"\n}\n",
+        )
+        .unwrap();
+        assert_ne!(same.sites[0].cache_epoch, moved.sites[0].cache_epoch);
+        // A different sub-filter → different epoch (bodies are transformed).
+        let filtered = Config::parse(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n sub-filter from=\"a\" to=\"b\"\n}\n",
+        )
+        .unwrap();
+        assert_ne!(same.sites[0].cache_epoch, filtered.sites[0].cache_epoch);
     }
 
     #[test]

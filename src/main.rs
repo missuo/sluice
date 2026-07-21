@@ -6,6 +6,7 @@
 mod acme;
 mod certs;
 mod config;
+mod dirs;
 mod diskcache;
 mod metrics;
 mod proxy;

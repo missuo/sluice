@@ -126,11 +126,14 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   (`https://…`) upstream it falls back to a **TCP-connect** check (no TLS
   handshake, no HTTP status assertion). A TLS backend that accepts connections
   but returns errors won't be marked down by the path check.
-- **Static-file root is canonicalized per request.** `file-server` calls
-  `canonicalize()` on the resolved path and the root on **every** request to
-  enforce the under-root containment check (the traversal defense). That's a
-  `stat`-per-request cost; it is deliberate (correctness over caching the root),
-  not yet optimised with a cached canonical root.
+- **Static-file serving does not follow symlinks under the root.** The file is
+  opened race-free by descending from the docroot one component at a time with
+  `openat`/`O_NOFOLLOW` (no `canonicalize`→`open` TOCTOU that a writable docroot
+  could exploit), and the `Content-Length` is taken by `fstat` on the very fd
+  that streams the bytes (length and body can't disagree). The trade-off is
+  nginx-`disable_symlinks` semantics: a symlink anywhere **under** the root is
+  not served (the docroot itself may be a symlink — it's admin-controlled). Per
+  request this is a few `openat` syscalls rather than two `canonicalize` calls.
 - **Disk cache: one file per entry, published by a single atomic rename.** Meta
   (prefix + serialized headers) and body live in the SAME `.ent` file, written
   to a fsync'd temp and installed with one `rename` — a crash at any point
@@ -140,9 +143,29 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   review caught the then-overstated claim). A file whose length doesn't match
   its stamped sizes is treated as a miss. Files from the old two-file layout
   are deleted by the reaper on sight.
+- **Response cache is namespaced by a per-site config epoch.** The cache key
+  includes a fingerprint of the site's content-affecting config (location
+  matchers, upstream servers + Host rewrites, file roots, sub-filters). A
+  reload/restart/upgrade that repoints a site at a different upstream therefore
+  gets a fresh namespace and can never serve the OLD config's cached bodies;
+  identical config keeps the namespace, so the persistent disk cache still
+  survives a plain restart.
+- **Rate-limit table is hard-capped and fails open when full.** Buckets are keyed
+  by (host, client) with IPv6 collapsed to its /64, and the table is capped at
+  256k buckets. If an address-rotation flood fills it, NEW keys pass **un-limited**
+  (memory safety over strict limiting — such a flood already defeats a per-IP
+  limit) and a one-shot warning is logged; the 10-minute idle sweep then frees
+  space. Not a general high-cardinality limiter (no global request ceiling).
 - **Access log is a fixed line format (no JSON).** The access log emits a fixed
   field layout; there is no `json` access-log mode yet. Tracked as a "still
   later" item in DESIGN.
+- **`alias` (migration host aliasing) was removed.** It canonicalized
+  `<prefix>-<sub>` to `<sub>` for routing/cache-keying while the bare upstream
+  still received the client's original Host — a cross-Host cache-mixing bug. The
+  feature is gone rather than patched; use a real `site` per host.
+- **No load/perf benchmark in-repo.** Correctness is covered by unit tests + live
+  manual verification; there is no committed throughput/latency benchmark or
+  load test yet.
 - **`protobuf` 2.28 has a CURRENT RustSec advisory —
   [RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437.html)
   (uncontrolled recursion → crash), fixed only in protobuf >= 3.7.** It reaches

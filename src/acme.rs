@@ -53,12 +53,19 @@ pub fn spawn(
                 return;
             }
         };
-        // Fail closed: never write account keys / cert keys into a directory an
-        // attacker could have planted (symlink, other owner, world-writable).
-        if let Err(e) = secure_cache_dir(&cfg.cache_dir) {
-            log::error!("acme: cache-dir {}: {e}; ACME disabled", cfg.cache_dir);
-            return;
-        }
+        // The cache dir was already validated + canonicalized at config load
+        // (crate::dirs::secure_owned_dir, so `--check` and startup fail loudly
+        // rather than the background thread silently disabling ACME). Re-verify
+        // here as defense in depth (TOCTOU between load and now) and re-canonical
+        // in case the config path was relative.
+        let cache_dir = match crate::dirs::secure_owned_dir(&cfg.cache_dir) {
+            Ok(canon) => canon,
+            Err(e) => {
+                log::error!("acme: cache-dir {}: {e}; ACME disabled", cfg.cache_dir);
+                return;
+            }
+        };
+        let cfg = AcmeCfg { cache_dir, ..cfg };
         load_cached(&cfg, &domains, &cert_store);
         rt.block_on(async move {
             // One ACME account, created once and reused for every domain and every
@@ -143,16 +150,24 @@ fn publish_cert(cfg: &AcmeCfg, domain: &str, cert_pem: &str, key_pem: &str) -> R
     combined.push_str(cert_pem);
     // Prove the bytes load as a matching pair before anything durable is written.
     Cert::from_combined_pem(combined.as_bytes()).map_err(|e| format!("verify new pair: {e}"))?;
-    write_private_atomic(&path, combined.as_bytes()).map_err(|e| format!("install: {e}"))
+    write_private_atomic(&path, combined.as_bytes(), None).map_err(|e| format!("install: {e}"))
 }
 
 /// Write secret material to `path` atomically: a unique temp sibling opened with
 /// `create_new` (O_CREAT|O_EXCL — refuses to follow a pre-planted symlink and
-/// never truncates an existing file), mode 0600 from birth, fsync'd, then
-/// renamed over `path` (rename replaces a symlink at the destination rather
-/// than following it), then the parent directory is fsync'd so the new name
-/// survives a power loss. Any failure cleans up the temp and propagates.
-fn write_private_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
+/// never truncates an existing file), mode 0600 from birth. If `mtime` is given
+/// it is stamped on the TEMP fd BEFORE the fsync+rename — so the freshness
+/// timestamp is durable atomically with the content, closing the crash window
+/// where a rename could land before a separate post-rename `utimensat` ran (a
+/// migrated old cert would otherwise look freshly written and skip renewal). The
+/// temp is fsync'd, renamed over `path` (rename replaces a symlink at the
+/// destination rather than following it), then the parent dir is fsync'd. Any
+/// failure cleans up the temp and propagates.
+fn write_private_atomic(
+    path: &str,
+    data: &[u8],
+    mtime: Option<std::time::SystemTime>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -173,6 +188,9 @@ fn write_private_atomic(path: &str, data: &[u8]) -> std::io::Result<()> {
         }
         let mut f = opts.open(&tmp)?;
         f.write_all(data)?;
+        if let Some(t) = mtime {
+            f.set_modified(t)?; // stamped BEFORE sync+rename → durable with content
+        }
         f.sync_all()?;
         drop(f);
         std::fs::rename(&tmp, path)?;
@@ -195,76 +213,15 @@ fn sync_parent_dir(path: &str) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Ensure the cache dir is safe to hold private keys, failing closed otherwise:
-/// created 0700 if missing; must be a REAL directory (not a symlink — a local
-/// attacker who plants one would receive every key we write), owned by the
-/// running user, and is chmod'd to 0700 even if it pre-existed with looser
-/// permissions (mode(0o700) on DirBuilder only applies at creation).
-#[cfg(unix)]
-fn secure_cache_dir(dir: &str) -> Result<(), String> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let _ = std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir); // ok if it already exists — verified below
-    let md = std::fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
-    if md.file_type().is_symlink() {
-        return Err("is a symlink; refusing to store keys behind one".to_string());
-    }
-    if !md.is_dir() {
-        return Err("not a directory".to_string());
-    }
-    let euid = unsafe { libc::geteuid() };
-    if md.uid() != euid {
-        return Err(format!(
-            "owned by uid {} but sluice runs as uid {euid}",
-            md.uid()
-        ));
-    }
-    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot chmod 0700: {e}"))?;
-    Ok(())
-}
-#[cfg(not(unix))]
-fn secure_cache_dir(dir: &str) -> Result<(), String> {
-    std::fs::create_dir_all(dir).map_err(|e| e.to_string())
-}
-
-/// Copy `src`'s (atime, mtime) onto `dst`. Used by the legacy migration so the
-/// 60-day renewal clock keeps running from the ORIGINAL issue-era mtime — a
-/// migrated 80-day-old cert must renew now, not 60 days after the migration.
-#[cfg(unix)]
-fn copy_mtime(src: &str, dst: &str) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    let Ok(md) = std::fs::metadata(src) else {
-        return false;
-    };
-    let times = [
-        libc::timespec {
-            tv_sec: md.atime() as libc::time_t,
-            tv_nsec: md.atime_nsec() as _,
-        },
-        libc::timespec {
-            tv_sec: md.mtime() as libc::time_t,
-            tv_nsec: md.mtime_nsec() as _,
-        },
-    ];
-    let Ok(cpath) = std::ffi::CString::new(dst) else {
-        return false;
-    };
-    unsafe { libc::utimensat(libc::AT_FDCWD, cpath.as_ptr(), times.as_ptr(), 0) == 0 }
-}
-#[cfg(not(unix))]
-fn copy_mtime(_src: &str, _dst: &str) -> bool {
-    false
-}
-
 /// Load a domain's cached cert: the combined `.pem` if present, else a legacy
 /// `.crt`/`.key` pair — which keeps serving across an upgrade AND is converted
-/// to the combined layout on the spot (preserving the legacy mtime so renewal
-/// timing is unchanged). If the conversion can't be written, the pair is still
-/// served from memory and `needs_cert` will re-issue via the CA instead.
-/// Legacy files are left in place so a rollback to the old binary still works.
+/// to the combined layout on the spot. The legacy file's mtime is stamped onto
+/// the migrated file ATOMICALLY (on the temp, before rename — see
+/// `write_private_atomic`), so a crash can't leave a migrated cert that looks
+/// freshly written and skips renewal past its real expiry. If the conversion
+/// can't be written, the pair is still served from memory and `needs_cert`
+/// re-issues via the CA. Legacy files are left in place so a rollback to the
+/// old binary still works.
 fn load_or_migrate(cfg: &AcmeCfg, domain: &str) -> Option<Cert> {
     let path = cert_path(cfg, domain);
     if let Ok(c) = Cert::from_combined_file(&path) {
@@ -272,23 +229,19 @@ fn load_or_migrate(cfg: &AcmeCfg, domain: &str) -> Option<Cert> {
     }
     let (crt, key) = legacy_cert_paths(cfg, domain);
     let cert = Cert::from_files(&crt, &key).ok()?; // also verifies the pair matches
+    let legacy_mtime = std::fs::metadata(&crt).and_then(|m| m.modified()).ok();
     match (std::fs::read_to_string(&crt), std::fs::read_to_string(&key)) {
-        (Ok(cert_pem), Ok(key_pem)) => match publish_cert(cfg, domain, &cert_pem, &key_pem) {
-            Ok(()) => {
-                if copy_mtime(&crt, &path) {
-                    log::info!("acme: {domain}: migrated legacy .crt/.key to combined {path}");
-                } else {
-                    // Freshness would be overstated (mtime = now on an old cert
-                    // could push renewal past expiry) — drop the migrated file
-                    // and let the CA re-issue while the legacy pair serves.
-                    let _ = std::fs::remove_file(&path);
-                    log::warn!("acme: {domain}: migrated file lost legacy mtime; will re-issue");
-                }
+        (Ok(cert_pem), Ok(key_pem)) => {
+            let combined = format!("{}\n{cert_pem}", key_pem.trim_end());
+            let ok = Cert::from_combined_pem(combined.as_bytes()).is_ok()
+                && write_private_atomic(&path, combined.as_bytes(), legacy_mtime).is_ok();
+            if ok {
+                log::info!("acme: {domain}: migrated legacy .crt/.key to combined {path}");
+            } else {
+                let _ = std::fs::remove_file(&path);
+                log::warn!("acme: {domain}: cannot migrate legacy pair; will re-issue");
             }
-            Err(e) => {
-                log::warn!("acme: {domain}: cannot migrate legacy pair ({e}); will re-issue")
-            }
-        },
+        }
         _ => log::warn!("acme: {domain}: legacy pair unreadable; will re-issue"),
     }
     Some(cert)
@@ -374,7 +327,7 @@ async fn get_account(cfg: &AcmeCfg) -> Result<Account, String> {
     // atomic rename (a predictable-path symlink can't capture or truncate).
     match serde_json::to_vec(&creds) {
         Ok(json) => {
-            if let Err(e) = write_private_atomic(&creds_path, &json) {
+            if let Err(e) = write_private_atomic(&creds_path, &json, None) {
                 log::warn!("acme: could not cache account credentials to {creds_path}: {e}");
             }
         }
@@ -538,30 +491,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn secure_cache_dir_rejects_symlink_and_fixes_mode() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = test_dir("sec");
-        // Pre-existing world-writable dir → must be tightened to 0700.
-        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
-        secure_cache_dir(&dir).expect("owned real dir must be accepted");
-        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o7777;
-        assert_eq!(mode, 0o700, "must chmod an existing dir to 0700");
-        // A symlinked cache-dir must be refused outright.
-        let link = format!("{dir}-link");
-        let _ = std::fs::remove_file(&link);
-        std::os::unix::fs::symlink(&dir, &link).unwrap();
-        assert!(secure_cache_dir(&link).is_err(), "symlink dir must fail");
-        let _ = std::fs::remove_file(&link);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    // (cache-dir owner/mode/symlink hardening is now shared and tested in
+    // crate::dirs; here we only cover the ACME-specific atomic secret write.)
 
     #[test]
-    fn write_private_atomic_is_0600_and_replaces_symlink_name() {
+    fn write_private_atomic_0600_symlink_safe_and_stamps_mtime() {
         use std::os::unix::fs::PermissionsExt;
         let dir = test_dir("wpa");
         let target = format!("{dir}/creds.json");
-        write_private_atomic(&target, b"secret").unwrap();
+        write_private_atomic(&target, b"secret", None).unwrap();
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert_eq!(std::fs::read(&target).unwrap(), b"secret");
@@ -571,13 +509,22 @@ mod tests {
         std::fs::write(&victim, b"untouched").unwrap();
         let attacked = format!("{dir}/attacked.json");
         std::os::unix::fs::symlink(&victim, &attacked).unwrap();
-        write_private_atomic(&attacked, b"new-secret").unwrap();
+        write_private_atomic(&attacked, b"new-secret", None).unwrap();
         assert_eq!(std::fs::read(&victim).unwrap(), b"untouched");
         assert_eq!(std::fs::read(&attacked).unwrap(), b"new-secret");
         assert!(!std::fs::symlink_metadata(&attacked)
             .unwrap()
             .file_type()
             .is_symlink());
+        // An explicit mtime is stamped atomically with the content.
+        let old = std::time::SystemTime::now() - Duration::from_secs(90 * 24 * 3600);
+        let stamped = format!("{dir}/stamped.pem");
+        write_private_atomic(&stamped, b"x", Some(old)).unwrap();
+        let got = std::fs::metadata(&stamped).unwrap().modified().unwrap();
+        assert!(
+            got.duration_since(old).unwrap_or_default() < Duration::from_secs(5),
+            "mtime must be the stamped value, not now"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

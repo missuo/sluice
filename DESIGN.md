@@ -45,7 +45,7 @@ wrong, Caddy is the fallback.
 - GeoIP enrichment: country (free, via `CF-IPCountry`) + optional city/ASN (MaxMind).
 - Everything a typical vhost proxy needs, expressed as config: host routing, TLS, HTTP/2,
   SSE/streaming, websockets, per-route body limits, header injection, regex redirects,
-  trusted client-IP, migration test-host aliasing, graceful drain.
+  trusted client-IP, graceful drain.
 - Single static binary (BoringSSL), systemd-friendly.
 
 **Non-goals (v1)**
@@ -54,7 +54,9 @@ wrong, Caddy is the fallback.
 - ~~No automatic ACME/TLS issuance in v1~~ — **now implemented (M5)** and
   live-verified; behind Cloudflare an Origin CA cert is still the recommended path.
 - No Lua/JS scripting layer. Programmable behaviour = Rust plugins compiled in, not runtime scripts.
-- No built-in WAF, no load-balancing across many upstream replicas in v1 (single upstream per route; add pools later).
+- Not a general-purpose scripting host. (The original v1 non-goals of "no WAF"
+  and "single upstream per route" have since been **delivered** — a regex WAF and
+  weighted multi-upstream pools with active health checks now ship; see §8.)
 
 ## 3. Architecture
 
@@ -87,8 +89,8 @@ wrong, Caddy is the fallback.
   (never take down a running proxy with a bad edit).
 
 ### Reload scope (be honest about limits)
-Hot-reloadable: sites, upstreams, timeouts, body limits, headers, redirects, alias
-prefix, rate limits, geoip settings. **Not** hot-reloadable in v1: listener
+Hot-reloadable: sites, upstreams, timeouts, body limits, headers, redirects,
+rate limits, geoip settings. **Not** hot-reloadable in v1: listener
 addresses and TLS listener setup (socket-level) — those need a graceful restart
 (Pingora's SIGQUIT fd-handoff, or systemd restart with drain). nginx has the same
 practical split. Cert *file* rotation can be picked up by re-reading on reload if we
@@ -145,8 +147,6 @@ listener "0.0.0.0:443" {
 listener "0.0.0.0:80" {
     redirect-to-https true             // unconditional 301, all hosts
 }
-
-alias prefix="staging"                 // staging-<sub>.example.com == <sub>.example.com
 
 defaults {
     hsts "max-age=31536000"
@@ -351,7 +351,7 @@ benefit. Tracked as M5.
 ## 8. Milestones
 
 - **M0 — core — DONE:** KDL `Config` loader + `--check`; config-driven `ProxyHttp`
-  (host routing, redirects, timeouts, body limits, client-IP, HSTS, alias); listeners
+  (host routing, redirects, timeouts, body limits, client-IP, HSTS); listeners
   from config; Prometheus + access log.
 - **M1 — reload — DONE:** ArcSwap + SIGHUP + fail-safe (bad config keeps old). File-watch
   not done (SIGHUP only).
@@ -393,23 +393,31 @@ benefit. Tracked as M5.
   path/query/method/header). Static files now stream off the async runtime. All
   verified live on the test box (routing, RR distribution, failover, cache HIT vs
   no-store, WAF blocks).
-- **M7 — production hardening — DONE:** zero-downtime binary upgrade (`-u` /
-  SIGQUIT fd-handoff), weighted + Ketama + least-conn balancing, passive **and
-  active** upstream health checks (probes carry the site vhost, health state is
-  scoped per pool and reset when the probe config changes, status lines are
-  read to CRLF so fragmented writes don't fake a DOWN), a disk-backed cache (a
-  custom `pingora-cache` `Storage`: ONE file per entry, atomic single-rename
-  publish, size/count/free-space reaper), response-body rewrite (`sub-filter`),
-  five rounds of adversarial security review, and a **declarative recursive
-  config schema** — every node's positional args (count + type), properties
-  (names, types, duplicates), and children (names, multiplicity, block-allowed)
-  are validated at every nesting level, with non-finite numbers rejected, so
-  `--check` accepts exactly what the server consumes. ACME certs are stored as
-  a single combined PEM (atomic publish; legacy `.crt`/`.key` pairs are served
-  and auto-migrated on upgrade) in a hardened cache dir (no symlink, owner
-  checked, 0700, O_EXCL temp writes). All verified live.
+- **M7 — production hardening — largely done, iterating under review:** zero-
+  downtime binary upgrade (`-u` / SIGQUIT fd-handoff), weighted + Ketama +
+  least-conn balancing, passive **and active** upstream health checks (probes
+  carry the site vhost, health state is scoped per pool and reset when the probe
+  config changes, a complete CRLF-terminated status line is required so a
+  fragmented/partial response can't fake an UP), a disk-backed cache (a custom
+  `pingora-cache` `Storage`: ONE file per entry, atomic single-rename publish,
+  size/count/free-space reaper that only ever touches cache-owned filenames,
+  cache key namespaced by a per-site config epoch so a reload can't serve a
+  retired upstream's entries), race-free static file serving (`openat`/
+  `O_NOFOLLOW` per component — no canonicalize→open TOCTOU), response-body
+  rewrite (`sub-filter`), six rounds of adversarial security review, and a
+  **declarative recursive config schema** — every node's positional args (count
+  + type + integer range), properties (names, types, duplicates), and children
+  (names, multiplicity, block-allowed) are validated at every nesting level.
+  This is a full *structural + value-range* schema (not yet a semantic model of
+  every cross-field invariant). Secrets (ACME keys, disk-cache temps) are
+  written via `O_EXCL` temps under owner-checked, canonicalized, 0700 dirs;
+  ACME certs are a single combined PEM (atomic publish, mtime stamped atomically
+  on migration) with legacy `.crt`/`.key` auto-migration. Verified live +
+  unit-tested; **not** claimed as "all blockers closed" — see KNOWN_ISSUES.md
+  for the standing gaps and the review-loop discipline.
 - **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
-  header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`. See
+  header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`,
+  rate-limit table hard cap tuning, load/perf benchmarks. See
   **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items that are deliberately not
   built or blocked upstream (notAfter-based ACME renewal, HTTP/3, Rustls,
   full Lua/Rhai scripting) and why.

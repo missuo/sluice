@@ -57,8 +57,6 @@ listener "0.0.0.0:80" {
 //     min-free "1GiB"                 // …or when the filesystem drops below this
 // }
 
-alias prefix="staging"                 // staging-app.example.com == app.example.com
-
 defaults {
     hsts "max-age=31536000"
     unknown-host 404

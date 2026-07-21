@@ -49,12 +49,29 @@ fn err(ctx: &'static str) -> impl FnOnce(std::io::Error) -> Box<Error> {
     move |e| Error::because(ErrorType::InternalError, ctx, e)
 }
 
-/// `<path>` → `<path>.tmp.<pid>.<seq>` in the same directory (a unique temp name).
-fn tmp_sibling(path: &Path) -> PathBuf {
+/// An unpredictable temp name in `dir`: `.tmp.<pid>.<seq>.<nanos>`. The nanos
+/// component means a local attacker who can write the shard directory can't
+/// pre-create the exact name to win the create race (combined with O_EXCL
+/// below, a losing race is an error, never a followed symlink).
+fn tmp_in(dir: &Path) -> PathBuf {
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".tmp.{}.{}", std::process::id(), seq));
-    path.with_file_name(name)
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    dir.join(format!(".tmp.{}.{seq}.{nanos}", std::process::id()))
+}
+
+/// Create a fresh file with O_CREAT|O_EXCL (`create_new`): it fails rather than
+/// follow a pre-planted symlink or truncate an existing file. The cache root is
+/// already validated (owned, 0700, canonical) at config load, so this closes
+/// the remaining shard-level symlink race.
+async fn create_new(path: &Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .await
 }
 
 /// The 16-byte entry prefix.
@@ -261,10 +278,9 @@ impl Storage for DiskCache {
                 .map_err(err("disk cache mkdir"))?;
         }
         let (internal, header) = meta.serialize()?;
-        let tmp = tmp_sibling(&path);
-        let mut file = tokio::fs::File::create(&tmp)
-            .await
-            .map_err(err("disk cache create"))?;
+        let dir = path.parent().unwrap_or(&self.root);
+        let tmp = tmp_in(dir);
+        let mut file = create_new(&tmp).await.map_err(err("disk cache create"))?;
         // Body size is stamped at finish; 0 for now.
         file.write_all(&encode_prefix(0, internal.len(), header.len()))
             .await
@@ -307,9 +323,10 @@ impl Storage for DiskCache {
             return Ok(false);
         };
         let (internal, header) = meta.serialize()?;
-        let tmp = tmp_sibling(&path);
+        let dir = path.parent().unwrap_or(&self.root).to_path_buf();
+        let tmp = tmp_in(&dir);
         let res: std::result::Result<u64, std::io::Error> = async {
-            let mut f = tokio::fs::File::create(&tmp).await?;
+            let mut f = create_new(&tmp).await?;
             f.write_all(&encode_prefix(0, internal.len(), header.len()))
                 .await?;
             f.write_all(&internal).await?;
@@ -345,7 +362,14 @@ impl Storage for DiskCache {
 
 // ---- background reaper: bound total on-disk size ----
 
-type Entry = (PathBuf, u64, SystemTime, bool, bool); // (path, size, mtime, is_tmp, is_legacy)
+#[derive(Clone, Copy, PartialEq)]
+enum Kind {
+    Entry,  // <hash>.ent — an evictable cache entry
+    Tmp,    // .tmp.* — our own in-progress write (reaped only when stale)
+    Legacy, // <hash>.meta / <hash>.body — retired layout, reaped on sight
+}
+
+type Entry = (PathBuf, u64, SystemTime, Kind); // (path, size, mtime, kind)
 
 /// Every 30s, bound the cache: keep total size under `max_size`, file count under
 /// `max_files` (inode-exhaustion guard), and at least `min_free` bytes free on
@@ -368,19 +392,21 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
     let now = SystemTime::now();
     let mut entries: Vec<Entry> = Vec::new();
     let mut total_size: u64 = 0;
+    // collect() only gathers files the cache itself owns (see `classify`); any
+    // unrelated file a user left under the dir is never counted or deleted.
     collect(root, &mut entries, &mut total_size);
     entries.sort_by_key(|e| e.2); // oldest first
 
     // 1) Always delete leaked temp files (a hard kill left them behind; a fresh
     //    temp is an in-progress write and is kept, but still counted) and
     //    legacy-format files (unreadable by the single-file layout).
-    entries.retain(|(p, sz, mtime, is_tmp, is_legacy)| {
-        let stale_tmp = *is_tmp
+    entries.retain(|(p, sz, mtime, kind)| {
+        let stale_tmp = *kind == Kind::Tmp
             && now
                 .duration_since(*mtime)
                 .map(|d| d > Duration::from_secs(300))
                 .unwrap_or(false);
-        if stale_tmp || *is_legacy {
+        if stale_tmp || *kind == Kind::Legacy {
             if std::fs::remove_file(p).is_ok() {
                 total_size = total_size.saturating_sub(*sz);
             }
@@ -396,8 +422,10 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
     if total_size <= max_size && count <= max_files && avail >= min_free {
         return;
     }
-    let size_target = max_size / 10 * 9;
-    let count_target = max_files / 10 * 9;
+    // Evict to ~90% of the cap, but never below 1 — for a tiny `max-files` (e.g.
+    // 5) `max_files / 10 * 9` rounds to 0, which would wipe the whole cache.
+    let size_target = (max_size / 10 * 9).max(1);
+    let count_target = (max_files - max_files / 10).max(1);
     let mut to_free_for_space = min_free.saturating_sub(avail);
     // If freeing the ENTIRE cache still wouldn't reach min_free, the floor is
     // unachievable (other data on the volume holds the space) — don't pointlessly
@@ -405,11 +433,11 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
     if to_free_for_space > total_size {
         to_free_for_space = 0;
     }
-    for (p, sz, _, is_tmp, _) in entries {
+    for (p, sz, _, kind) in entries {
         if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
             break;
         }
-        if is_tmp {
+        if kind == Kind::Tmp {
             continue; // never delete an in-progress write
         }
         if std::fs::remove_file(&p).is_ok() {
@@ -417,6 +445,30 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
             count = count.saturating_sub(1);
             to_free_for_space = to_free_for_space.saturating_sub(sz);
         }
+    }
+}
+
+/// Is `stem` a 32-char lowercase-hex cache hash (`CacheHashKey::combined()`)?
+fn is_hash_stem(stem: &str) -> bool {
+    stem.len() == 32
+        && stem
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+/// Classify a filename as one the cache OWNS, or `None` for an unrelated file
+/// the reaper must leave completely alone. The cache only ever creates:
+/// `<32-hex>.ent` (entries), `.tmp.<pid>.<seq>.<nanos>` (its own temps), and —
+/// from the retired layout — `<32-hex>.meta` / `<32-hex>.body`.
+fn classify(name: &str) -> Option<Kind> {
+    if name.starts_with(".tmp.") {
+        return Some(Kind::Tmp);
+    }
+    let (stem, ext) = name.rsplit_once('.')?;
+    match ext {
+        "ent" if is_hash_stem(stem) => Some(Kind::Entry),
+        "meta" | "body" if is_hash_stem(stem) => Some(Kind::Legacy),
+        _ => None,
     }
 }
 
@@ -429,23 +481,23 @@ fn collect(dir: &Path, out: &mut Vec<Entry>, total: &mut u64) {
         let Ok(ft) = e.file_type() else { continue };
         if ft.is_dir() {
             collect(&p, out, total);
-        } else if let Ok(md) = e.metadata() {
-            // Count temp files too (so slow/leaked writes can't hide from the cap).
-            // Check the file NAME, not the full path — the cache root could itself
-            // contain ".tmp." and must not make every file look temporary.
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            let is_tmp = name.contains(".tmp.");
-            let is_legacy = !is_tmp && (name.ends_with(".meta") || name.ends_with(".body"));
-            *total += md.len();
-            out.push((
-                p,
-                md.len(),
-                md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
-                is_tmp,
-                is_legacy,
-            ));
+            continue;
         }
+        // Only files the cache itself created are eligible — a user's stray
+        // file (`notes.txt`, `important.meta` with a non-hash name) is ignored,
+        // never counted toward the caps and never deleted.
+        let name = e.file_name();
+        let Some(kind) = classify(&name.to_string_lossy()) else {
+            continue;
+        };
+        let Ok(md) = e.metadata() else { continue };
+        *total += md.len();
+        out.push((
+            p,
+            md.len(),
+            md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+            kind,
+        ));
     }
 }
 
@@ -503,6 +555,60 @@ mod tests {
             body.extend_from_slice(&b);
         }
         Some((m, body))
+    }
+
+    #[test]
+    fn classify_only_recognizes_cache_owned_files() {
+        let h = "0123456789abcdef0123456789abcdef"; // 32 hex
+        assert!(matches!(classify(&format!("{h}.ent")), Some(Kind::Entry)));
+        assert!(matches!(classify(&format!("{h}.meta")), Some(Kind::Legacy)));
+        assert!(matches!(classify(&format!("{h}.body")), Some(Kind::Legacy)));
+        assert!(matches!(classify(".tmp.123.4.5"), Some(Kind::Tmp)));
+        // A user's own files are NOT owned — reaper must ignore them.
+        assert!(classify("keep-1.txt").is_none());
+        assert!(classify("important.meta").is_none()); // non-hash stem
+        assert!(classify("notes.body").is_none());
+        assert!(classify(&format!("{h}.txt")).is_none());
+        assert!(classify("0123.ent").is_none()); // wrong hash length
+        assert!(classify(&format!("{}.ent", h.to_uppercase())).is_none()); // uppercase
+    }
+
+    #[test]
+    fn reaper_never_touches_foreign_files() {
+        let dir = std::env::temp_dir().join(format!("sluice-reap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Foreign files a user might have left in (or pointed) the cache dir.
+        std::fs::write(dir.join("keep-1.txt"), b"important").unwrap();
+        std::fs::write(dir.join("important.meta"), b"user data").unwrap();
+        let h = "0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.join(format!("{h}.ent")), vec![0u8; 100]).unwrap();
+        // Aggressive bounds (max-files 1) would evict everything it OWNS…
+        reap(&dir, 0, 1, 0);
+        // …but foreign files survive untouched.
+        assert_eq!(std::fs::read(dir.join("keep-1.txt")).unwrap(), b"important");
+        assert_eq!(
+            std::fs::read(dir.join("important.meta")).unwrap(),
+            b"user data"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reaper_tiny_max_files_keeps_at_least_one() {
+        let dir = std::env::temp_dir().join(format!("sluice-reap2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 6 entries, max-files 5 → count_target = 5 - 0 = 5 (NOT 0). The old
+        // `max_files/10*9` rounded to 0 and wiped the whole cache.
+        for i in 0..6 {
+            let name = format!("{:032x}.ent", i);
+            std::fs::write(dir.join(name), vec![0u8; 10]).unwrap();
+        }
+        reap(&dir, u64::MAX, 5, 0);
+        let remaining = std::fs::read_dir(&dir).unwrap().count();
+        assert!(remaining >= 4, "must not wipe the cache (kept {remaining})");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

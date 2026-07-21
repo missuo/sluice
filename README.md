@@ -67,8 +67,8 @@ against live Let's Encrypt (staging + production).
   the origin is asked for an uncompressed response so the body can be rewritten.
 - Trusted **client IP** from a configurable header (e.g. `CF-Connecting-IP`),
   dropping the spoofable client XFF chain.
-- Migration **host aliasing** (`staging-<sub>` behaves like `<sub>`).
-- **Per-site rate limiting** (token bucket per client IP) and **`cloudflare-only`**
+- **Per-site rate limiting** (token bucket per client IP, IPv6 bucketed by /64)
+  and **`cloudflare-only`**
   access (403 unless the peer is a Cloudflare edge IP).
 - **GeoIP**: country from the `CF-IPCountry` header (free) + optional **MaxMind
   ASN/city** (`maxminddb`); enriches the access log per `log-fields`; country as a

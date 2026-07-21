@@ -228,6 +228,88 @@ async fn send_status(session: &mut Session, status: u16, hsts: Option<&str>) -> 
 /// a large file (or slow FS) never blocks the worker or buffers the whole body
 /// in memory. Path traversal is rejected two ways: `..` components up front, and
 /// a canonicalized-under-root check.
+/// Open `root/comps...` as a regular file WITHOUT following any symlink below
+/// the root, resolving each component relative to the previously-opened
+/// directory fd so nothing can be swapped mid-walk (TOCTOU-free). Returns a
+/// tokio `File`; any symlink/missing/not-a-file component is an `Err`.
+#[cfg(unix)]
+fn open_regular_under(
+    root: &std::path::Path,
+    comps: &[String],
+) -> std::io::Result<tokio::fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+
+    let cstr = |b: &[u8]| {
+        CString::new(b).map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL"))
+    };
+    // The docroot itself is admin-controlled — open it following symlinks.
+    let root_c = cstr(root.as_os_str().as_bytes())?;
+    let base = unsafe { libc::open(root_c.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+    if base < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut dir = unsafe { OwnedFd::from_raw_fd(base) };
+    let (parents, last) = comps.split_at(comps.len() - 1);
+    for comp in parents {
+        let c = cstr(comp.as_bytes())?;
+        // O_NOFOLLOW: a symlinked intermediate dir yields ELOOP → error.
+        let fd = unsafe {
+            libc::openat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        dir = unsafe { OwnedFd::from_raw_fd(fd) };
+    }
+    let c = cstr(last[0].as_bytes())?;
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    if !f.metadata()?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok(tokio::fs::File::from_std(f))
+}
+
+#[cfg(not(unix))]
+fn open_regular_under(
+    root: &std::path::Path,
+    comps: &[String],
+) -> std::io::Result<tokio::fs::File> {
+    // Non-unix fallback: canonicalize + containment check (not TOCTOU-free, but
+    // unix is the only deploy target).
+    let mut p = std::path::PathBuf::from(root);
+    for c in comps {
+        p.push(c);
+    }
+    let real = std::fs::canonicalize(&p)?;
+    let base = std::fs::canonicalize(root)?;
+    if !real.starts_with(&base) || !std::fs::metadata(&real)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "outside root or not a file",
+        ));
+    }
+    Ok(tokio::fs::File::from_std(std::fs::File::open(&real)?))
+}
+
 async fn serve_file(
     session: &mut Session,
     root: &str,
@@ -251,41 +333,50 @@ async fn serve_file(
     }
     let is_head = method == "HEAD";
     let rel = req_path.trim_start_matches('/');
-    if rel.split('/').any(|c| c == "..") {
-        return send_status(session, 403, hsts).await;
-    }
-    let mut fpath = std::path::PathBuf::from(root);
-    if !rel.is_empty() {
-        fpath.push(rel);
-    }
-    if req_path.ends_with('/') || rel.is_empty() {
-        fpath.push(index);
-    }
 
-    // Resolve symlinks and confirm the target stays under root (async, non-blocking).
-    let (real, base) = match (
-        tokio::fs::canonicalize(&fpath).await,
-        tokio::fs::canonicalize(root).await,
-    ) {
-        (Ok(real), Ok(base)) => (real, base),
+    // Build the path segments to walk under the root. Reject `.`/`..`/empty so
+    // traversal can't escape even before the race-free open below.
+    let mut comps: Vec<String> = Vec::new();
+    for seg in rel.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            return send_status(session, 403, hsts).await;
+        }
+        comps.push(seg.to_string());
+    }
+    if req_path.ends_with('/') || comps.is_empty() {
+        comps.push(index.to_string());
+    }
+    let ctype = content_type(std::path::Path::new(
+        comps.last().map(String::as_str).unwrap_or(""),
+    ));
+
+    // Open the file RACE-FREE: descend from the root one component at a time with
+    // `O_NOFOLLOW`, so no directory or the final file can be swapped for a
+    // symlink between a check and the open (the classic TOCTOU that let a
+    // writable docroot leak files outside root). Symlinks UNDER the root are not
+    // followed (nginx `disable_symlinks` semantics) — the docroot itself may be
+    // one (admin-controlled). The Content-Length then comes from `fstat` on the
+    // SAME fd we stream, so length and bytes can't disagree.
+    let root_owned = root.to_string();
+    let open_res =
+        tokio::task::spawn_blocking(move || open_regular_under(root_owned.as_ref(), &comps)).await;
+    let file = match open_res {
+        Ok(Ok(f)) => f,
+        // ELOOP (a symlink under root), ENOENT, ENOTDIR, or "not a regular file".
         _ => return send_status(session, 404, hsts).await,
     };
-    if !real.starts_with(&base) {
-        return send_status(session, 403, hsts).await; // resolved outside root
-    }
-    let meta = match tokio::fs::metadata(&real).await {
-        Ok(m) if m.is_file() => m,
-        _ => return send_status(session, 404, hsts).await, // missing or a directory
-    };
-
-    let mut file = match tokio::fs::File::open(&real).await {
-        Ok(f) => f,
+    let len = match file.metadata().await {
+        Ok(m) => m.len(),
         Err(_) => return send_status(session, 404, hsts).await,
     };
+    let mut file = file;
 
     let mut resp = ResponseHeader::build(200, Some(4))?;
-    resp.insert_header("Content-Type", content_type(&real))?;
-    resp.insert_header("Content-Length", meta.len().to_string())?;
+    resp.insert_header("Content-Type", ctype)?;
+    resp.insert_header("Content-Length", len.to_string())?;
     if let Some(h) = hsts {
         resp.insert_header("Strict-Transport-Security", h)?;
     }
@@ -383,6 +474,19 @@ fn geo_lookup(cfg: &Config, ctx: &mut Ctx, session: &Session) {
 }
 
 // ---- rate limiter (state lives in the proxy, survives config reload) ----
+
+/// Collapse an IPv6 address to its /64 for rate-limit bucketing (a /64 is the
+/// standard end-user allocation; finer granularity lets one subscriber mint
+/// unbounded buckets by rotating the low bits). IPv4 is used as-is.
+fn limiter_key_ip(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v) => IpAddr::V4(v),
+        IpAddr::V6(v) => {
+            let s = v.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+    }
+}
 
 struct Bucket {
     tokens: f64,
@@ -716,18 +820,20 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
             }
         }
     })
-    .await; // on timeout, parse whatever arrived (usually nothing → DOWN)
-            // Parse the status code from the first line: "HTTP/1.x NNN ...".
-    let line_end = buf
-        .windows(2)
-        .position(|w| w == b"\r\n")
-        .unwrap_or(buf.len());
+    .await;
+    // A COMPLETE, CRLF-terminated status line is required — a backend that sends
+    // "HTTP/1.1 200" then hangs (or EOFs) has NOT answered the probe and must
+    // count as DOWN; and the first token must actually be an HTTP version, not
+    // arbitrary bytes whose second token happens to be a number.
+    let Some(line_end) = buf.windows(2).position(|w| w == b"\r\n") else {
+        return false;
+    };
     let head = String::from_utf8_lossy(&buf[..line_end]);
-    match head
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse::<u16>().ok())
-    {
+    let mut toks = head.split_whitespace();
+    if !toks.next().is_some_and(|v| v.starts_with("HTTP/")) {
+        return false;
+    }
+    match toks.next().and_then(|s| s.parse::<u16>().ok()) {
         Some(s) => s >= hc.expect_status.0 && s <= hc.expect_status.1,
         None => false,
     }
@@ -736,6 +842,8 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
 pub struct SluiceProxy {
     cfg: Arc<ArcSwap<Config>>,
     limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
+    /// One-shot flag so a full limiter table warns once, not per request.
+    limiter_full_warned: std::sync::atomic::AtomicBool,
     /// Smooth-weighted-round-robin state (current weights) per (host, location).
     rr: Arc<DashMap<(String, usize), Vec<i64>>>,
     /// Passive health: "host:port" → instant until which it's considered down.
@@ -788,6 +896,7 @@ impl SluiceProxy {
         SluiceProxy {
             cfg,
             limiter,
+            limiter_full_warned: std::sync::atomic::AtomicBool::new(false),
             rr: Arc::new(DashMap::new()),
             health: Arc::new(DashMap::new()),
             health_active,
@@ -915,16 +1024,32 @@ impl SluiceProxy {
         best
     }
 
-    /// Token bucket per (host, client-ip). Returns true if allowed.
+    /// Token bucket per (host, client-key). Returns true if allowed.
+    ///
+    /// IPv6 clients are bucketed by their /64. The table is hard-capped: when
+    /// full, NEW keys pass un-limited (fail open) and a one-shot warning is
+    /// logged — bounding memory beats letting an address-rotation flood OOM the
+    /// proxy, and such a flood already evades a per-IP limit by construction.
     fn allow(&self, host: &str, ip: IpAddr, rl: RateLimit) -> bool {
+        const LIMITER_MAX_ENTRIES: usize = 262_144;
+        let key = (host.to_string(), limiter_key_ip(ip));
+        if self.limiter.len() >= LIMITER_MAX_ENTRIES && !self.limiter.contains_key(&key) {
+            if !self
+                .limiter_full_warned
+                .swap(true, std::sync::atomic::Ordering::Relaxed)
+            {
+                log::warn!(
+                    "rate-limit table full ({LIMITER_MAX_ENTRIES} buckets); new clients \
+                     pass unlimited until the 10-min sweep frees space"
+                );
+            }
+            return true;
+        }
         let now = Instant::now();
-        let mut b = self
-            .limiter
-            .entry((host.to_string(), ip))
-            .or_insert(Bucket {
-                tokens: rl.burst,
-                last: now,
-            });
+        let mut b = self.limiter.entry(key).or_insert(Bucket {
+            tokens: rl.burst,
+            last: now,
+        });
         let elapsed = now.duration_since(b.last).as_secs_f64();
         b.tokens = (b.tokens + elapsed * rl.rps).min(rl.burst);
         b.last = now;
@@ -1051,8 +1176,17 @@ impl ProxyHttp for SluiceProxy {
                 .iter()
                 .map(|v| v.as_bytes()),
         );
+        // Namespace = host + the site's config epoch: a reload/restart/upgrade
+        // that changes the site's upstreams/roots/sub-filters yields a fresh
+        // namespace, so the persistent disk cache can never serve the OLD
+        // config's responses. Identical config keeps the namespace (cache
+        // survives restarts).
+        let epoch = ctx
+            .site
+            .map(|i| ctx.cfg.sites[i].cache_epoch)
+            .unwrap_or_default();
         Ok(CacheKey::new(
-            ctx.host.clone(),
+            format!("{}:{epoch:016x}", ctx.host),
             format!("{}:ae={}:{}", req.method.as_str(), ae_hex, uri),
             "",
         ))
@@ -1167,7 +1301,7 @@ impl ProxyHttp for SluiceProxy {
             send_status(session, 400, None).await?;
             return Ok(true);
         };
-        let host = cfg.canonical(&raw_host);
+        let host = raw_host;
         ctx.host = host.clone();
         geo_lookup(&cfg, ctx, session);
 
@@ -1661,13 +1795,12 @@ impl ProxyHttp for RedirectProxy {
                 }
             }
         }
-        // Redirect to https, but only for a Host we actually serve (or a known
-        // alias). An unrecognized Host gets 400 rather than a 301 to an arbitrary
+        // Redirect to https, but only for a Host we actually serve. An
+        // unrecognized Host gets 400 rather than a 301 to an arbitrary
         // location, so :80 can't be used as an open redirector.
         let host = host_of(session).unwrap_or_default();
         let cfg = self.cfg.load();
-        let known = !host.is_empty()
-            && (cfg.index.contains_key(&host) || cfg.index.contains_key(&cfg.canonical(&host)));
+        let known = !host.is_empty() && cfg.index.contains_key(&host);
         if !known {
             send_status(session, 400, None).await?;
             return Ok(true);
@@ -1740,6 +1873,58 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn open_regular_under_refuses_symlink_escape() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let base = std::env::temp_dir().join(format!("sluice-static-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&base);
+            let root = base.join("www");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("ok.txt"), b"public").unwrap();
+            std::fs::write(base.join("secret"), b"TOPSECRET").unwrap();
+            // A real file under root opens and reports the correct length.
+            let f =
+                open_regular_under(&root, &["ok.txt".to_string()]).expect("real file must open");
+            assert_eq!(f.metadata().await.unwrap().len(), 6);
+            // A symlink under root pointing OUTSIDE must not be followed.
+            std::os::unix::fs::symlink(base.join("secret"), root.join("leak")).unwrap();
+            assert!(
+                open_regular_under(&root, &["leak".to_string()]).is_err(),
+                "symlink escape must be refused (O_NOFOLLOW)"
+            );
+            // A symlinked intermediate directory must not be followed either.
+            std::os::unix::fs::symlink(&base, root.join("up")).unwrap();
+            assert!(
+                open_regular_under(&root, &["up".to_string(), "secret".to_string()]).is_err(),
+                "symlinked parent dir must be refused"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        });
+    }
+
+    #[test]
+    fn limiter_key_ip_aggregates_ipv6_by_64() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+        // Two addresses in the same /64 collapse to one key.
+        let a: IpAddr = "2001:db8:1:2:3:4:5:6".parse().unwrap();
+        let b: IpAddr = "2001:db8:1:2:ffff:ffff:ffff:ffff".parse().unwrap();
+        assert_eq!(limiter_key_ip(a), limiter_key_ip(b));
+        assert_eq!(
+            limiter_key_ip(a),
+            IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, 0, 0))
+        );
+        // A different /64 is a different key; IPv4 is unchanged.
+        let c: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(limiter_key_ip(a), limiter_key_ip(c));
+        let v4 = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
+        assert_eq!(limiter_key_ip(v4), v4);
+    }
+
+    #[test]
     fn probe_handles_fragmented_status_line() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -1783,6 +1968,43 @@ mod tests {
             assert!(
                 !probe(&addr, &miss, false, "vhost.test").await,
                 "status outside the expected range must count as DOWN"
+            );
+        });
+    }
+
+    #[test]
+    fn probe_incomplete_status_line_is_down() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            // Backend sends a plausible status WITHOUT a terminating CRLF and
+            // then hangs — the exact "half response marked UP" round-6 finding.
+            tokio::spawn(async move {
+                loop {
+                    let (mut s, _) = listener.accept().await.unwrap();
+                    let mut sink = [0u8; 512];
+                    let _ = s.read(&mut sink).await;
+                    s.write_all(b"HTTP/1.1 200").await.unwrap();
+                    s.flush().await.unwrap();
+                    tokio::time::sleep(Duration::from_secs(30)).await; // hold open
+                }
+            });
+            let hc = crate::config::HealthCheck {
+                path: Some("/health".into()),
+                interval: Duration::from_secs(1),
+                timeout: Duration::from_millis(300),
+                healthy: 1,
+                unhealthy: 1,
+                expect_status: (200, 200),
+            };
+            assert!(
+                !probe(&addr, &hc, false, "vhost.test").await,
+                "a status line with no CRLF (hung backend) must be DOWN"
             );
         });
     }

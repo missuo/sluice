@@ -74,7 +74,7 @@ jobs:
             || { echo "::error::expected the missing-cert filesystem error"; exit 1; }
           echo "$out" | grep -q 'file-server root not a directory' \
             || { echo "::error::expected the missing-static-root filesystem error"; exit 1; }
-          if echo "$out" | grep -Ei 'unknown (property|directive)|takes no (properties|block)|given more than once|duplicate property|must be (an integer|a number|true|false|a quoted)|expected .* argument|not both'; then
+          if echo "$out" | grep -Ei 'unknown (property|directive)|takes no (properties|block)|given more than once|duplicate property|must be (an integer|a number|true|false|a quoted)|expected .* argument|not both|out of range|control character|not a valid hostname'; then
             echo "::error::example config produced a schema/type error"
             exit 1
           fi
