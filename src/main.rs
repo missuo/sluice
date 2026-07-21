@@ -29,6 +29,7 @@ fn main() {
     // Parse our own args (kept separate from Pingora's Opt).
     let mut config_path = DEFAULT_CONFIG.to_string();
     let mut check = false;
+    let mut upgrade = false;
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -36,8 +37,12 @@ fn main() {
                 config_path = it.next().unwrap_or_else(|| fatal("-c needs a path"));
             }
             "--check" => check = true,
+            // Zero-downtime binary upgrade: start the new process with -u; it
+            // acquires the listening sockets from the running one over the
+            // upgrade socket, then SIGQUIT the old process to drain and exit.
+            "-u" | "--upgrade" => upgrade = true,
             "-h" | "--help" => {
-                println!("sluice [-c <config.kdl>] [--check]");
+                println!("sluice [-c <config.kdl>] [--check] [-u|--upgrade]");
                 return;
             }
             other => fatal(&format!("unknown argument: {other}")),
@@ -76,7 +81,10 @@ fn main() {
         conf.upgrade_sock = sock.clone();
     }
 
-    let mut server = Server::new_with_opt_and_conf(None::<Opt>, conf);
+    // `upgrade` makes bootstrap acquire the listening FDs from the old process
+    // (via `upgrade-sock`) instead of binding fresh — zero-downtime upgrade.
+    let opt = Opt { upgrade, ..Default::default() };
+    let mut server = Server::new_with_opt_and_conf(opt, conf);
     server.bootstrap();
     let threads = server.configuration.threads;
 
