@@ -405,7 +405,7 @@ benefit. Tracked as M5.
   serve a retired upstream's entries), race-free static serving (`openat`/
   `O_NOFOLLOW` per component; `Content-Length` from the streamed fd), response-
   body rewrite (`sub-filter`), a rate limiter bounded by a 256k cap + per-host
-  overflow bucket (IPv6 /64), **seven** rounds of adversarial security review,
+  overflow bucket (IPv6 /64), **eight** rounds of adversarial security review,
   and a **declarative recursive config schema** validating every node's args
   (count + type + integer range), properties (names/types/dups), and children
   (names/multiplicity/block-allowed) at every level — a full *structural +

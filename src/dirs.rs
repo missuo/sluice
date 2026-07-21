@@ -57,6 +57,63 @@ mod unix {
         CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "NUL"))
     }
 
+    /// Open a single directory component relative to `dir` with `O_NOFOLLOW`,
+    /// creating it 0700 if missing. If the component is a symlink, accept it ONLY
+    /// when the link is owned by root or by us (a trusted system symlink); an
+    /// attacker-owned link is refused. Returns the opened directory fd.
+    fn open_or_make_dir(dir: &OwnedFd, comp: &str, euid: libc::uid_t) -> io::Result<OwnedFd> {
+        let c = component(comp)?;
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC;
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd >= 0 {
+            return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+        }
+        let e = errno();
+        if e.raw_os_error() == Some(libc::ENOENT) {
+            // Create it (0700) and reopen no-follow. A racing symlink swap makes
+            // the reopen fail (ELOOP) → error, never a followed link.
+            if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o700) } != 0 {
+                let me = errno();
+                if me.raw_os_error() != Some(libc::EEXIST) {
+                    return Err(me);
+                }
+            }
+            let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+            if fd >= 0 {
+                return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+            }
+            // fall through to the symlink/other-error handling below
+        }
+        // Not ENOENT (or the reopen failed): if it's a symlink, allow only a
+        // trusted-owner one (root/us); otherwise refuse.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe {
+            libc::fstatat(
+                dir.as_raw_fd(),
+                c.as_ptr(),
+                &mut st,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == 0
+            && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
+        {
+            if st.st_uid == 0 || st.st_uid == euid {
+                // Trusted system symlink (e.g. macOS /var) — follow it.
+                let follow = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+                let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), follow) };
+                if fd >= 0 {
+                    return Ok(unsafe { OwnedFd::from_raw_fd(fd) });
+                }
+                return Err(errno());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("untrusted symlink (owned by uid {})", st.st_uid),
+            ));
+        }
+        Err(e)
+    }
+
     /// A directory pinned by its fd. All IO is relative to it via `*at` syscalls.
     pub struct SecureDir {
         fd: OwnedFd,
@@ -75,53 +132,68 @@ mod unix {
             self.fd.as_raw_fd()
         }
 
-        /// Startup: create `path` (0700) if missing, open it `O_NOFOLLOW`
-        /// (refusing a symlinked final component), verify it's a directory owned
-        /// by the running uid, and `fchmod` it to 0700 on the opened fd. Fails
-        /// closed. Parent-path components are followed here (an admin may
-        /// legitimately symlink `/var/lib` → …); the returned fd then pins the
-        /// resolved inode so nothing below can be re-routed later.
+        /// Startup: create + open `path` component-by-component from a trusted
+        /// root fd (`/` for an absolute path, the CWD for a relative one), with
+        /// `O_NOFOLLOW` at EVERY level — not just the last. This closes the
+        /// startup parent-symlink TOCTOU: the old code let `mkdir -p` + a single
+        /// `open(path, O_NOFOLLOW)` follow a symlinked PARENT that a low-priv user
+        /// swapped in between `--check` and provisioning, so provisioning could
+        /// pin (and chmod 0700) an attacker-chosen root-owned victim dir.
+        ///
+        /// A symlink component is accepted ONLY if the link itself is owned by
+        /// root or by us — so legitimate system symlinks (macOS `/var` →
+        /// `private/var`) still work, while an attacker's link (owned by their
+        /// uid) is refused. Real directory components are opened by fd and never
+        /// re-resolved. The final dir must be owned by us; it's `fchmod`'d 0700.
         pub fn provision(path: &str) -> Result<SecureDir, String> {
-            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-            let _ = std::fs::DirBuilder::new()
-                .recursive(true)
-                .mode(0o700)
-                .create(path); // ok if it already exists — verified below
-            let cpath = CString::new(path.as_bytes()).map_err(|_| "path has NUL".to_string())?;
-            // O_NOFOLLOW: a symlink AT `path` is refused outright.
-            let fd = unsafe {
+            let comps: Vec<&str> = path
+                .split('/')
+                .filter(|c| !c.is_empty() && *c != ".")
+                .collect();
+            if comps.contains(&"..") {
+                return Err(format!("{path}: must not contain `..`"));
+            }
+            let euid = unsafe { libc::geteuid() };
+            // Trusted anchor: "/" (root, not a symlink) or "." (our CWD).
+            let anchor = if path.starts_with('/') { "/" } else { "." };
+            let ac = CString::new(anchor).map_err(|_| "bad anchor".to_string())?;
+            let afd = unsafe {
                 libc::open(
-                    cpath.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                    ac.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
                 )
             };
-            if fd < 0 {
-                return Err(format!("{path}: {}", errno()));
+            if afd < 0 {
+                return Err(format!("{anchor}: {}", errno()));
             }
-            let dir = unsafe { OwnedFd::from_raw_fd(fd) };
-            // fstat the OPEN fd (not the path) → no TOCTOU.
-            let md = File::from(dir.try_clone().map_err(|e| e.to_string())?)
+            let mut cur = unsafe { OwnedFd::from_raw_fd(afd) };
+            for comp in comps {
+                cur = open_or_make_dir(&cur, comp, euid)
+                    .map_err(|e| format!("{path}: component {comp:?}: {e}"))?;
+            }
+            // fstat the final OPEN fd → owner check with no TOCTOU.
+            let md = File::from(cur.try_clone().map_err(|e| e.to_string())?)
                 .metadata()
                 .map_err(|e| e.to_string())?;
             if !md.is_dir() {
                 return Err(format!("{path}: not a directory"));
             }
-            let euid = unsafe { libc::geteuid() };
+            use std::os::unix::fs::MetadataExt;
             if md.uid() != euid {
                 return Err(format!(
                     "{path}: owned by uid {} but sluice runs as uid {euid}",
                     md.uid()
                 ));
             }
-            if unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0 {
+            if unsafe { libc::fchmod(cur.as_raw_fd(), 0o700) } != 0 {
                 return Err(format!("{path}: cannot chmod 0700: {}", errno()));
             }
-            Ok(SecureDir { fd: dir })
+            Ok(SecureDir { fd: cur })
         }
 
         /// Open (creating if needed, 0700) a SUB-directory by a single component,
         /// relative to this dir's fd, `O_NOFOLLOW` — a symlinked component is
-        /// refused. Used for the disk cache's two-level sharding.
+        /// refused. Used only on the cache WRITE path (a miss).
         pub fn sub(&self, name: &str) -> io::Result<SecureDir> {
             let c = component(name)?;
             // mkdirat: ignore EEXIST, surface anything else.
@@ -131,6 +203,14 @@ mod unix {
                     return Err(e);
                 }
             }
+            self.sub_open(name)
+        }
+
+        /// Open an EXISTING sub-directory (never creates it), `O_NOFOLLOW`. Used
+        /// on read/lookup/reaper paths so a cache MISS can't make an attacker
+        /// mint unbounded empty shard directories by varying the URL.
+        pub fn sub_open(&self, name: &str) -> io::Result<SecureDir> {
+            let c = component(name)?;
             let fd = unsafe {
                 libc::openat(
                     self.raw(),
@@ -144,6 +224,16 @@ mod unix {
             Ok(SecureDir {
                 fd: unsafe { OwnedFd::from_raw_fd(fd) },
             })
+        }
+
+        /// `unlinkat(AT_REMOVEDIR)` an (empty) sub-directory. Used by the reaper
+        /// to reclaim shard dirs left empty after their entries were evicted.
+        pub fn remove_dir(&self, name: &str) -> io::Result<()> {
+            let c = component(name)?;
+            if unsafe { libc::unlinkat(self.raw(), c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+                return Err(errno());
+            }
+            Ok(())
         }
 
         /// Create a fresh file (O_CREAT|O_EXCL|O_NOFOLLOW, mode 0600) by a single
@@ -286,9 +376,13 @@ mod unix {
                 }
                 Ok(())
             }
-            // Missing is OK — startup will create it 0700. (A missing parent is
-            // surfaced then, not here, so --check stays purely read-only.)
-            Err(_) => Ok(()),
+            // ONLY a genuine "not found" is OK (startup will create it 0700).
+            // Any other error — ENOTDIR (a path component is a file), EACCES
+            // (unreadable ancestor), ELOOP (symlink loop) — is a real problem
+            // that would fail at startup, so it must fail `--check` too, not be
+            // treated as "doesn't exist yet" (a previous fail-open bug).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("{path}: {e}")),
         }
     }
 
@@ -306,20 +400,52 @@ mod unix {
         }
 
         #[test]
-        fn provision_locks_mode_and_rejects_symlink() {
+        fn provision_creates_nested_locks_mode_and_rejects_dotdot() {
             let base = tmpbase("prov");
-            let real = base.join("cache");
-            std::fs::create_dir(&real).unwrap();
-            std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o777)).unwrap();
-            let sd = SecureDir::provision(real.to_str().unwrap()).unwrap();
+            // Provision creates a DEEP nested path component-by-component.
+            let deep = base.join("a/b/c/cache");
+            let sd = SecureDir::provision(deep.to_str().unwrap()).unwrap();
+            assert!(deep.is_dir(), "nested path must be created");
             assert_eq!(
-                std::fs::metadata(&real).unwrap().permissions().mode() & 0o7777,
-                0o700
+                std::fs::metadata(&deep).unwrap().permissions().mode() & 0o7777,
+                0o700,
+                "final dir locked to 0700"
             );
             drop(sd);
-            let link = base.join("link");
-            std::os::unix::fs::symlink(&real, &link).unwrap();
-            assert!(SecureDir::provision(link.to_str().unwrap()).is_err());
+            // Re-provisioning an existing 0777 dir tightens it to 0700.
+            let loose = base.join("loose");
+            std::fs::create_dir(&loose).unwrap();
+            std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o777)).unwrap();
+            SecureDir::provision(loose.to_str().unwrap()).unwrap();
+            assert_eq!(
+                std::fs::metadata(&loose).unwrap().permissions().mode() & 0o7777,
+                0o700
+            );
+            // `..` in the path is refused (can't walk upward out of the tree).
+            assert!(SecureDir::provision(base.join("x/../y").to_str().unwrap()).is_err());
+            let _ = std::fs::remove_dir_all(&base);
+        }
+
+        #[test]
+        fn provision_follows_self_owned_symlink_component_but_would_reject_foreign() {
+            // The parent-symlink TOCTOU fix walks each component with O_NOFOLLOW
+            // and accepts a symlink component ONLY if the link is owned by root
+            // or us. We can't create a foreign-owned symlink without root, so we
+            // assert the TRUSTED path (a self-owned symlink IS followed — needed
+            // for real system symlinks like macOS /var → private/var, which every
+            // other provision test here already traverses). The foreign-owned
+            // rejection is exercised by the reviewer's cross-UID test + the
+            // `st_uid == 0 || st_uid == euid` gate in `open_or_make_dir`.
+            let base = tmpbase("symparent");
+            let realparent = base.join("realparent");
+            std::fs::create_dir(&realparent).unwrap();
+            let linkparent = base.join("linkparent");
+            std::os::unix::fs::symlink(&realparent, &linkparent).unwrap(); // owned by us
+            let sd = SecureDir::provision(linkparent.join("cache").to_str().unwrap())
+                .expect("a self-owned symlink component is trusted and followed");
+            drop(sd);
+            // The real dir behind the trusted link now holds the pinned cache dir.
+            assert!(realparent.join("cache").is_dir());
             let _ = std::fs::remove_dir_all(&base);
         }
 
@@ -378,6 +504,16 @@ mod unix {
             let link = base.join("link");
             std::os::unix::fs::symlink(&loose, &link).unwrap();
             assert!(validate(link.to_str().unwrap()).is_err());
+            // FAIL-OPEN regression: a path whose ancestor is a regular FILE
+            // returns ENOTDIR, which must be an ERROR (it would fail at startup),
+            // NOT silently treated as "doesn't exist yet, ok".
+            let afile = base.join("afile");
+            std::fs::write(&afile, b"x").unwrap();
+            let under_file = afile.join("cache");
+            assert!(
+                validate(under_file.to_str().unwrap()).is_err(),
+                "ENOTDIR must fail --check, not fail-open"
+            );
             let _ = std::fs::remove_dir_all(&base);
         }
     }

@@ -73,7 +73,11 @@ impl CertStore {
         if self.fallback.is_none() {
             self.fallback = Some(cert.clone());
         }
-        self.map.insert(sni, cert);
+        // DNS hostnames are case-insensitive, and the SNI a client sends can use
+        // any case — so key on the lowercased name (and lowercase the lookup in
+        // `pick`). Without this, `B.TEST` missed its `b.test` cert and fell back
+        // to the wrong one (a review finding in a multi-cert deployment).
+        self.map.insert(sni.to_ascii_lowercase(), cert);
     }
 
     /// Load every `<host>.crt` + `<host>.key` pair from a directory; the file
@@ -109,7 +113,9 @@ impl CertStore {
     }
 
     fn pick(&self, sni: &str) -> Option<&Arc<Cert>> {
-        self.map.get(sni).or(self.fallback.as_ref())
+        self.map
+            .get(&sni.to_ascii_lowercase())
+            .or(self.fallback.as_ref())
     }
 }
 
@@ -176,5 +182,26 @@ mod tests {
         // A cert with no matching key in the buffer must fail (guards against the
         // old two-file scheme's new-key+old-cert hazard).
         assert!(Cert::from_combined_pem(CERT_PEM.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn sni_match_is_case_insensitive() {
+        // Two distinct certs (same fixture bytes, but each `insert` makes its own
+        // Arc). The first inserted becomes the fallback. A mixed-case SNI must
+        // resolve to its OWN cert, not fall back — the review found `B.TEST`
+        // returning `a.test`'s cert.
+        let mk = || Cert::from_pem(CERT_PEM.as_bytes(), KEY_PEM.as_bytes()).unwrap();
+        let mut store = CertStore::default();
+        store.insert("a.test".into(), mk()); // fallback
+        store.insert("b.test".into(), mk());
+        let picked = store.pick("B.TEST").cloned().expect("some cert");
+        let fallback = store.pick("a.test").cloned().expect("some cert");
+        assert!(
+            !Arc::ptr_eq(&picked, &fallback),
+            "B.TEST must resolve to b.test's cert, not the fallback"
+        );
+        // Sanity: it IS the same Arc as the lowercase lookup.
+        let lower = store.pick("b.test").cloned().unwrap();
+        assert!(Arc::ptr_eq(&picked, &lower));
     }
 }

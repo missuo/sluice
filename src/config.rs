@@ -1169,6 +1169,16 @@ impl Config {
                             child_arg(node, "country-header").map(|s| s.to_ascii_lowercase());
                         let log_fields =
                             child(node, "log-fields").map(all_args).unwrap_or_default();
+                        // Reject an unknown log-field NOW (a typo like `counrty`
+                        // was silently dropped at request time and produced an
+                        // empty column forever).
+                        for f in &log_fields {
+                            if !matches!(f.as_str(), "country" | "asn" | "asn-org" | "city") {
+                                errs.push(format!(
+                                    "geoip log-fields: unknown field `{f}` (country|asn|asn-org|city)"
+                                ));
+                            }
+                        }
                         let metric_labels = child(node, "metric-labels")
                             .map(all_args)
                             .unwrap_or_default();
@@ -1632,8 +1642,19 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
             let mut group = parse_upstream_group(u, host)?;
             if let Some(h) = child_arg(node, "upstream-host") {
                 reject_ctl("upstream-host", h, host)?;
-                if h.is_empty() {
-                    return Err(format!("site `{host}`: upstream-host must not be empty"));
+                // It goes straight into the upstream Host header, so it must be a
+                // syntactically valid host[:port] — no spaces or other bytes that
+                // an origin/CDN would reject or that could split the header.
+                let host_ok = !h.is_empty()
+                    && h.len() <= 253
+                    && h.bytes().all(|b| {
+                        b.is_ascii_alphanumeric()
+                            || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+                    });
+                if !host_ok {
+                    return Err(format!(
+                        "site `{host}`: upstream-host {h:?} is not a valid host[:port]"
+                    ));
                 }
                 for s in &mut group.servers {
                     s.host_header = Some(h.to_string());
@@ -1751,6 +1772,13 @@ fn parse_waf(node: &KdlNode, host: &str) -> Result<Vec<WafRule>, String> {
         let field_s = prop_str(b, "field")
             .ok_or_else(|| format!("site `{host}`: waf block needs field=\"...\""))?;
         let field = if let Some(h) = field_s.strip_prefix("header:") {
+            // `field="header:"` (empty name) makes a rule that can never match —
+            // reject it instead of silently installing a dead rule.
+            if h.is_empty() {
+                return Err(format!(
+                    "site `{host}`: waf field=\"header:\" needs a header name (e.g. header:x-api-key)"
+                ));
+            }
             WafField::Header(h.to_ascii_lowercase())
         } else {
             match field_s {
@@ -1931,6 +1959,15 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
                 }
             }
             let _ = write!(fp, "ws={}:rt={:?}\u{1f}", loc.websocket, loc.read_timeout);
+            // Cache policy (TTL + max-object) is part of the namespace too, so a
+            // reload that changes the TTL doesn't leave entries bound by the OLD
+            // policy (a review finding: `ttl-secs 600`→`1` still served the old
+            // entry). Absence vs. a value both fingerprint distinctly.
+            if let Some(cc) = &loc.cache {
+                let _ = write!(fp, "C{:?}:{}\u{1f}", cc.ttl, cc.max_object);
+            } else {
+                let _ = write!(fp, "C-\u{1f}");
+            }
             for sf in &loc.sub_filters {
                 let _ = write!(fp, "S{:?}>{:?}\u{1f}", sf.from, sf.to);
             }
@@ -2205,6 +2242,36 @@ mod tests {
             mk(true).sites[0].cache_epoch,
             "upstream-verify must be part of the cache namespace"
         );
+        // TTL / max-object are policy that must also namespace the cache: a
+        // reload changing the TTL must not keep serving entries under the old
+        // policy (review finding).
+        let ttl = |secs: u32| {
+            Config::parse(&format!(
+                "listener \"0.0.0.0:80\" {{\n redirect-to-https true\n}}\nsite \"x\" {{\n upstream \"127.0.0.1:9\"\n cache {{\n ttl-secs {secs}\n }}\n}}\n",
+            ))
+            .unwrap()
+        };
+        assert_ne!(
+            ttl(600).sites[0].cache_epoch,
+            ttl(1).sites[0].cache_epoch,
+            "cache TTL must be part of the namespace"
+        );
+    }
+
+    #[test]
+    fn strict_schema_rejects_round8_silent_values() {
+        // geoip log-fields typo (was silently dropped at request time).
+        assert!(parse_err("geoip {\n log-fields \"counrty\"\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("unknown field"));
+        // waf field="header:" (empty header name → dead rule).
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n waf {\n block field=\"header:\" match=\"x\"\n }"
+        ))
+        .contains("needs a header name"));
+        // upstream-host with a space (would corrupt the Host header).
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n upstream-host \"bad host\""
+        ))
+        .contains("not a valid host"));
     }
 
     #[test]

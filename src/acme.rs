@@ -36,12 +36,28 @@ pub type ChallengeStore = Arc<ArcSwap<HashMap<String, String>>>;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Provision the ACME cache dir and load any cached certs into the store
+/// SYNCHRONOUSLY (before the caller starts the `:443` listener), then spawn the
+/// background renewal thread. Returns `Err` if the cache dir can't be pinned —
+/// the caller (main) treats that as fatal, so a misconfigured ACME dir fails
+/// startup loudly instead of silently leaving `:443` with an empty cert store.
 pub fn spawn(
     cfg: AcmeCfg,
     domains: Vec<String>,
     cert_store: Arc<ArcSwap<CertStore>>,
     challenges: ChallengeStore,
-) {
+) -> Result<(), String> {
+    // Pin the cache dir by fd (create 0700 if missing, verify owner, chmod).
+    // Every key read/write is then done relative to THIS fd via openat/renameat,
+    // so a local user can't reroute a write by swapping a parent component.
+    // Config load already did a read-only `validate`; provisioning (which
+    // mutates) happens here at startup, never during `--check`.
+    let dir = crate::dirs::SecureDir::provision(&cfg.cache_dir)
+        .map_err(|e| format!("acme cache-dir {}: {e}", cfg.cache_dir))?;
+    // Load cached/migrated certs before we return, so the listener binds with
+    // certs already in the store rather than a window of empty `:443`.
+    load_cached(&cfg, &dir, &domains, &cert_store);
+
     std::thread::spawn(move || {
         let rt = match tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -53,20 +69,6 @@ pub fn spawn(
                 return;
             }
         };
-        // Pin the cache dir by fd (create 0700 if missing, verify owner, chmod).
-        // Every key read/write below is done relative to THIS fd via openat/
-        // renameat, so a local user can't reroute a write by swapping a parent
-        // path component after validation. Config load already did a read-only
-        // `validate`; the real provisioning (which mutates) happens here at
-        // startup, never during `--check`.
-        let dir = match crate::dirs::SecureDir::provision(&cfg.cache_dir) {
-            Ok(d) => d,
-            Err(e) => {
-                log::error!("acme: cache-dir {}: {e}; ACME disabled", cfg.cache_dir);
-                return;
-            }
-        };
-        load_cached(&cfg, &dir, &domains, &cert_store);
         rt.block_on(async move {
             // One ACME account, created once and reused for every domain and every
             // renewal cycle (a fresh account per provision would hit Let's
@@ -115,6 +117,7 @@ pub fn spawn(
             }
         });
     });
+    Ok(())
 }
 
 /// Per-environment combined cert+key file NAME (a single basename under the

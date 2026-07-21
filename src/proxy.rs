@@ -875,7 +875,11 @@ pub struct SluiceProxy {
 }
 
 impl SluiceProxy {
-    pub fn new(cfg: Arc<ArcSwap<Config>>) -> Self {
+    /// `disk_root` is the already-provisioned, fd-pinned cache directory (or
+    /// `None` for the in-memory LRU). It is provisioned by `main` BEFORE the
+    /// proxy is built, so a bad `cache-store` dir is a fatal startup error there
+    /// — never a silent downgrade to in-memory here.
+    pub fn new(cfg: Arc<ArcSwap<Config>>, disk_root: Option<Arc<crate::dirs::SecureDir>>) -> Self {
         let limiter: Arc<DashMap<(String, IpAddr), Bucket>> = Arc::new(DashMap::new());
         // Sweep idle buckets so the map can't grow without bound (one entry per
         // distinct client IP otherwise lives forever).
@@ -888,37 +892,17 @@ impl SluiceProxy {
         let health_active: Arc<DashMap<String, ActiveHealth>> = Arc::new(DashMap::new());
         spawn_health_prober(cfg.clone(), health_active.clone());
 
-        // Choose the cache storage backend once, from config. Disk cache persists
-        // to files (bounded by its own reaper); otherwise the in-memory LRU.
+        // Disk cache (fd-pinned root provisioned by main) or the in-memory LRU.
         let (storage, eviction): (
             &'static (dyn Storage + Sync),
             Option<&'static (dyn EvictionManager + Sync)>,
-        ) = match cfg.load().disk_cache.clone() {
-            // Provision + pin the cache dir by fd ONCE at startup (create 0700,
-            // verify owner). All cache IO and the reaper operate relative to this
-            // fd, so a swapped parent/shard symlink can't reroute a write/delete.
-            Some(dc) => match crate::dirs::SecureDir::provision(&dc.dir) {
-                Ok(sd) => {
-                    let root = std::sync::Arc::new(sd);
-                    crate::diskcache::spawn_reaper(
-                        root.clone(),
-                        dc.max_size,
-                        dc.max_files,
-                        dc.min_free,
-                    );
-                    let disk: &'static crate::diskcache::DiskCache =
-                        Box::leak(Box::new(crate::diskcache::DiskCache::new(root)));
-                    log::info!("sluice: response cache = disk ({})", dc.dir);
-                    (disk, None)
-                }
-                Err(e) => {
-                    log::error!(
-                        "sluice: cache-store dir {}: {e}; falling back to in-memory cache",
-                        dc.dir
-                    );
-                    (&*CACHE_STORAGE as _, Some(&*CACHE_EVICTION as _))
-                }
-            },
+        ) = match disk_root {
+            Some(root) => {
+                let disk: &'static crate::diskcache::DiskCache =
+                    Box::leak(Box::new(crate::diskcache::DiskCache::new(root)));
+                log::info!("sluice: response cache = disk");
+                (disk, None)
+            }
             None => (&*CACHE_STORAGE as _, Some(&*CACHE_EVICTION as _)),
         };
 

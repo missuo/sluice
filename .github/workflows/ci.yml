@@ -53,11 +53,11 @@ jobs:
 
       - name: Validate full example config (EXACT expected errors)
         # The example references paths absent in CI (certs, static roots), so a
-        # non-zero exit is expected. We assert the output is EXACTLY the set of
-        # filesystem errors we expect — every non-header line must be a
-        # cert-not-found or root-not-a-directory error. Any OTHER line (a new bad
-        # regex, a semantic error, a panic, or a schema regression) fails the job,
-        # so this can't silently pass on a newly-introduced error.
+        # non-zero exit is expected. We assert the output is EXACTLY: 1 header +
+        # 1 cert-not-found + 2 root-not-a-directory = 4 lines, with those exact
+        # counts. Any extra line, a different count, a panic, or a new error type
+        # fails the job — so a newly-introduced error (bad regex, semantic check,
+        # schema regression) can't hide behind a substring match.
         run: |
           set +e
           out=$(./target/debug/sluice --check -c examples/sluice.kdl 2>&1)
@@ -65,18 +65,15 @@ jobs:
           set -e
           echo "$out"
           [ "$rc" -ne 0 ] || { echo "::error::expected non-zero exit"; exit 1; }
-          [ -n "$out" ] || { echo "::error::no output"; exit 1; }
-          bad=0
-          while IFS= read -r line; do
-            case "$line" in
-              "config error in "*) ;;                              # header
-              *"cert file not found:"*) ;;                         # expected
-              *"file-server root not a directory:"*) ;;            # expected
-              "") ;;
-              *) echo "::error::unexpected --check line: $line"; bad=1 ;;
-            esac
-          done <<< "$out"
-          [ "$bad" -eq 0 ] || exit 1
+          total=$(printf '%s\n' "$out" | grep -c .)
+          headers=$(printf '%s\n' "$out" | grep -c '^config error in ')
+          certs=$(printf '%s\n' "$out" | grep -c ': cert file not found: ')
+          roots=$(printf '%s\n' "$out" | grep -c ': file-server root not a directory: ')
+          echo "lines=$total header=$headers cert=$certs root=$roots"
+          if [ "$headers" -ne 1 ] || [ "$certs" -ne 1 ] || [ "$roots" -ne 2 ] || [ "$total" -ne 4 ]; then
+            echo "::error::--check output is not the exact expected error set (1 header + 1 cert + 2 root = 4 lines)"
+            exit 1
+          fi
 
   boringssl:
     name: build / test (BoringSSL)

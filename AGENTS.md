@@ -135,12 +135,16 @@ These were fixed after review; a change that reverts any of them is a bug:
 - Disk-cache `lookup` treats any IO/parse error as a miss — never fail a request.
 - **Cache entries and ACME certs are single-file + one atomic rename** — never
   split state across two files whose renames can be separated by a crash.
-- **Private dirs (ACME, disk cache) are fd-pinned** via `dirs::SecureDir`: the
-  validated directory is held by fd and ALL IO is `*at`-relative + `O_NOFOLLOW`,
-  so a swapped parent/shard symlink can't reroute a write or a delete. Never go
-  back to path-based `open`/`rename`/`create_dir_all` for these — that reopens
-  the cross-UID symlink exploit. Provisioning mutates (startup only); `--check`
-  uses read-only `dirs::validate`.
+- **Private dirs (ACME, disk cache) are fd-pinned from the root down** via
+  `dirs::SecureDir::provision`: it walks from a trusted anchor (`/` or CWD) with
+  `O_NOFOLLOW` at EVERY component (a symlink component is followed only if
+  root/self-owned), then holds the dir by fd; ALL later IO is `*at`-relative.
+  Never go back to path-based `open`/`rename`/`create_dir_all` or a single
+  `open(path, O_NOFOLLOW)` — that reopens the parent-symlink cross-UID exploit.
+  Provisioning mutates and is done ONCE at startup and is FATAL on error (no
+  silent downgrade to in-memory); a cache LOOKUP must never create dirs (use
+  `sub_open`, not `sub`); `--check` uses read-only `dirs::validate` (fails on any
+  non-`NotFound` error).
 - **Static files are served race-free**: descend from the docroot with
   `openat`/`O_NOFOLLOW` per component (rejecting `.`/`..`/separators); never
   `canonicalize`→`open` (TOCTOU), and take `Content-Length` from `fstat` on the

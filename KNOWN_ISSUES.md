@@ -153,17 +153,33 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   changes ANY of these (e.g. flipping `upstream-verify` false→true — a review
   gap that previously kept serving unverified content) gets a fresh namespace
   and can never serve the OLD config's cached bodies; identical config keeps the
-  namespace, so the persistent disk cache still survives a plain restart. Bump
+  namespace, so the persistent disk cache still survives a plain restart. The
+  fingerprint also covers the cache **policy** (TTL, max-object), so a reload
+  that changes the TTL doesn't keep serving entries bound by the old policy. Bump
   the `v2` tag whenever the fingerprint format changes.
-- **Private dirs (ACME store, disk cache) are pinned by fd, not path.** After
-  `dirs::SecureDir::provision` validates a directory (created 0700 if missing,
-  owner checked via `fstat`, locked with `fchmod` on the fd), EVERY later
-  operation is done relative to that fd via `openat`/`mkdirat`/`renameat`/
-  `unlinkat`, one component at a time with `O_NOFOLLOW`. So a local user who can
-  write a parent directory can neither reroute a key/cache write by swapping a
-  component for a symlink (the open fails) nor make the reaper delete outside the
-  tree. Provisioning (which mutates) happens only at startup; `--check` runs a
-  read-only `validate` and never creates or chmods anything.
+- **Dynamic-SNI cert lookup is case-insensitive.** Certs are keyed (and looked
+  up) by the lowercased SNI, since DNS hostnames are case-insensitive and a
+  client may send any case — so `B.TEST` resolves to `b.test`'s cert rather than
+  falling back to the wrong one.
+- **Private dirs (ACME store, disk cache) are pinned by fd, from the root down.**
+  `dirs::SecureDir::provision` walks the path from a trusted anchor (`/` or the
+  CWD) creating/opening ONE component at a time with `O_NOFOLLOW` at EVERY level
+  (not just the last), then holds the final directory by fd; all later IO is
+  `openat`/`mkdirat`/`renameat`/`unlinkat`-relative. So a low-priv user who
+  controls a PARENT directory can't reroute provisioning (or any later write) by
+  swapping a component for a symlink between `--check` and startup — the open
+  fails. A symlink component is followed ONLY if the link is owned by root or by
+  us (so system symlinks like macOS `/var` still work; an attacker's link is
+  refused). The final dir must be owned by us and is locked to 0700 on its fd.
+  Provisioning (which mutates) happens only at startup and is FATAL on failure —
+  a bad `cache-store`/ACME dir fails the process, never a silent downgrade to
+  in-memory. `--check` runs a read-only `validate` that never creates or chmods
+  and fails on any real error (a non-`NotFound` stat error is no longer treated
+  as "doesn't exist yet").
+- **A cache LOOKUP never creates directories.** Only a miss that actually caches
+  (the write path) creates the two shard dirs; a lookup/purge uses a no-create
+  open, so an attacker varying the URL can't mint unbounded empty directories.
+  The reaper reclaims empty shard dirs every cycle regardless.
 - **Rate-limit table is hard-capped with a per-host overflow bucket.** Buckets
   are keyed by (host, client) with IPv6 collapsed to its /64; the per-client
   table is capped at 256k. When full, a NEW client is throttled against a single

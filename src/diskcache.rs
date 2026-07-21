@@ -88,10 +88,17 @@ impl DiskCache {
         DiskCache { root }
     }
 
-    /// Open (creating) the 2-level shard directory for a key hash, relative to
-    /// the pinned root fd. `combined()` is 32 hex chars so [0..4] is always hex.
-    fn shard(&self, hash: &str) -> std::io::Result<SecureDir> {
+    /// Open the 2-level shard dir for a key hash, CREATING it — write path only
+    /// (a miss). `combined()` is 32 hex chars so [0..4] is always hex.
+    fn shard_create(&self, hash: &str) -> std::io::Result<SecureDir> {
         self.root.sub(&hash[0..2])?.sub(&hash[2..4])
+    }
+
+    /// Open the shard dir WITHOUT creating it — read/lookup/purge paths. A
+    /// missing shard is a miss, so a lookup for an absent key never mints empty
+    /// directories (which the reaper would then have to scan forever).
+    fn shard_open(&self, hash: &str) -> std::io::Result<SecureDir> {
+        self.root.sub_open(&hash[0..2])?.sub_open(&hash[2..4])
     }
 }
 
@@ -228,7 +235,7 @@ impl Storage for DiskCache {
         _trace: &SpanHandle,
     ) -> Result<Option<(CacheMeta, HitHandler)>> {
         let hash = key.combined();
-        let Ok(shard) = self.shard(&hash) else {
+        let Ok(shard) = self.shard_open(&hash) else {
             return Ok(None);
         };
         // Any IO/parse problem is a miss (robust, never fails a request).
@@ -250,7 +257,7 @@ impl Storage for DiskCache {
         _trace: &SpanHandle,
     ) -> Result<MissHandler> {
         let hash = key.combined();
-        let shard = self.shard(&hash).map_err(err("disk cache mkdir"))?;
+        let shard = self.shard_create(&hash).map_err(err("disk cache mkdir"))?;
         let (internal, header) = meta.serialize()?;
         let tmp = tmp_name();
         let mut file =
@@ -282,7 +289,7 @@ impl Storage for DiskCache {
         _trace: &SpanHandle,
     ) -> Result<bool> {
         let hash = key.combined();
-        let Ok(shard) = self.shard(&hash) else {
+        let Ok(shard) = self.shard_open(&hash) else {
             return Ok(false);
         };
         Ok(shard.remove(&entry_file(&hash)).is_ok())
@@ -298,7 +305,7 @@ impl Storage for DiskCache {
         // single-renameat swap as a fresh write.
         let hash = key.combined();
         let name = entry_file(&hash);
-        let Ok(shard) = self.shard(&hash) else {
+        let Ok(shard) = self.shard_open(&hash) else {
             return Ok(false);
         };
         let Some((_, mut old, _)) = open_entry(&shard, &name).await else {
@@ -400,20 +407,21 @@ pub fn spawn_reaper(root: Arc<SecureDir>, max_size: u64, max_files: u64, min_fre
 }
 
 /// Collect cache-owned files by walking `root` two shard levels deep, all via
-/// the pinned fd (`entries`/`sub`/`stat` are `*at`-relative + `O_NOFOLLOW`).
+/// the pinned fd (`entries`/`sub_open`/`stat` are `*at`-relative + `O_NOFOLLOW`,
+/// and NEVER create — the reaper must not mint directories).
 fn collect(root: &SecureDir, out: &mut Vec<Entry>, total: &mut u64) {
     let Ok(l1s) = root.entries() else { return };
     for l1 in l1s {
         if !is_shard(&l1) || !root.stat(&l1).map(|s| s.0 && !s.1).unwrap_or(false) {
             continue;
         }
-        let Ok(d1) = root.sub(&l1) else { continue };
+        let Ok(d1) = root.sub_open(&l1) else { continue };
         let Ok(l2s) = d1.entries() else { continue };
         for l2 in l2s {
             if !is_shard(&l2) || !d1.stat(&l2).map(|s| s.0 && !s.1).unwrap_or(false) {
                 continue;
             }
-            let Ok(d2) = d1.sub(&l2) else { continue };
+            let Ok(d2) = d1.sub_open(&l2) else { continue };
             let Ok(names) = d2.entries() else { continue };
             for name in names {
                 let Some(kind) = classify(&name) else {
@@ -433,9 +441,37 @@ fn collect(root: &SecureDir, out: &mut Vec<Entry>, total: &mut u64) {
     }
 }
 
+/// Reclaim empty shard directories (a MISS used to mint two per varied URL —
+/// they aren't counted toward max-files and would otherwise accumulate and
+/// slow every scan). rmdir only removes a dir that is actually empty, so an
+/// entry racing in during the scan is safe (ENOTEMPTY → left in place).
+fn reap_empty_shards(root: &SecureDir) {
+    let Ok(l1s) = root.entries() else { return };
+    for l1 in l1s {
+        if !is_shard(&l1) || !root.stat(&l1).map(|s| s.0 && !s.1).unwrap_or(false) {
+            continue;
+        }
+        let Ok(d1) = root.sub_open(&l1) else { continue };
+        if let Ok(l2s) = d1.entries() {
+            for l2 in l2s {
+                if is_shard(&l2) && d1.stat(&l2).map(|s| s.0 && !s.1).unwrap_or(false) {
+                    let _ = d1.remove_dir(&l2); // ENOTEMPTY if it has entries — fine
+                }
+            }
+        }
+        if d1.entries().map(|e| e.is_empty()).unwrap_or(false) {
+            let _ = root.remove_dir(&l1);
+        }
+    }
+}
+
 fn remove_entry(root: &SecureDir, e: &Entry) -> bool {
-    let Ok(d1) = root.sub(&e.0) else { return false };
-    let Ok(d2) = d1.sub(&e.1) else { return false };
+    let Ok(d1) = root.sub_open(&e.0) else {
+        return false;
+    };
+    let Ok(d2) = d1.sub_open(&e.1) else {
+        return false;
+    };
     let ok = d2.remove(&e.2).is_ok();
     if ok {
         let _ = d2.sync();
@@ -468,33 +504,36 @@ fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
         }
     });
 
-    // 2) Evict oldest until under every bound.
+    // 2) Evict oldest until under every bound (skip the loop when already under).
     let mut count = entries.len() as u64;
     let avail = avail_bytes(root).unwrap_or(u64::MAX);
-    if total_size <= max_size && count <= max_files && avail >= min_free {
-        return;
-    }
-    // Evict to ~90% of the cap but never below 1 (a tiny `max-files` would
-    // otherwise round its target to 0 and wipe the whole cache).
-    let size_target = (max_size / 10 * 9).max(1);
-    let count_target = (max_files - max_files / 10).max(1);
-    let mut to_free_for_space = min_free.saturating_sub(avail);
-    if to_free_for_space > total_size {
-        to_free_for_space = 0; // floor unachievable — don't wipe the cache
-    }
-    for e in entries {
-        if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
-            break;
+    if total_size > max_size || count > max_files || avail < min_free {
+        // Evict to ~90% of the cap but never below 1 (a tiny `max-files` would
+        // otherwise round its target to 0 and wipe the whole cache).
+        let size_target = (max_size / 10 * 9).max(1);
+        let count_target = (max_files - max_files / 10).max(1);
+        let mut to_free_for_space = min_free.saturating_sub(avail);
+        if to_free_for_space > total_size {
+            to_free_for_space = 0; // floor unachievable — don't wipe the cache
         }
-        if e.5 == Kind::Tmp {
-            continue; // never delete an in-progress write
-        }
-        if remove_entry(root, &e) {
-            total_size = total_size.saturating_sub(e.3);
-            count = count.saturating_sub(1);
-            to_free_for_space = to_free_for_space.saturating_sub(e.3);
+        for e in entries {
+            if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
+                break;
+            }
+            if e.5 == Kind::Tmp {
+                continue; // never delete an in-progress write
+            }
+            if remove_entry(root, &e) {
+                total_size = total_size.saturating_sub(e.3);
+                count = count.saturating_sub(1);
+                to_free_for_space = to_free_for_space.saturating_sub(e.3);
+            }
         }
     }
+
+    // 3) Always reclaim empty shard dirs (misses mint them; eviction empties
+    //    more). Runs every cycle so they can't accumulate unboundedly.
+    reap_empty_shards(root);
 }
 
 /// Free bytes on the filesystem holding the cache (via fstatvfs on the root fd).
@@ -552,6 +591,47 @@ mod tests {
             body.extend_from_slice(&b);
         }
         Some((m, body))
+    }
+
+    #[test]
+    fn lookup_miss_creates_no_directories() {
+        // Regression: a cache MISS used to mkdir the two shard levels, letting an
+        // attacker mint unbounded empty dirs by varying the URL. A miss must
+        // leave the cache root empty.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (cache, dir) = test_cache("miss");
+            let before = std::fs::read_dir(&dir).unwrap().count();
+            let span = Span::inactive().handle();
+            for i in 0..50 {
+                let key = CacheKey::new("host", format!("GET:/absent/{i}"), "");
+                assert!(cache.lookup(&key, &span).await.unwrap().is_none());
+            }
+            let after = std::fs::read_dir(&dir).unwrap().count();
+            assert_eq!(before, 0);
+            assert_eq!(after, 0, "a lookup miss must not create shard directories");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn reaper_reclaims_empty_shard_dirs() {
+        let dir = std::env::temp_dir().join(format!("sluice-empty-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // Empty shard dirs (as a miss would have left) must be rmdir'd.
+        std::fs::create_dir_all(dir.join("ab").join("cd")).unwrap();
+        std::fs::create_dir_all(dir.join("ef").join("01")).unwrap();
+        let root = SecureDir::provision(dir.to_str().unwrap()).unwrap();
+        reap(&root, u64::MAX, u64::MAX, 0);
+        assert!(
+            !dir.join("ab").exists(),
+            "empty shard tree must be reclaimed"
+        );
+        assert!(!dir.join("ef").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

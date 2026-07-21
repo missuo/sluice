@@ -107,6 +107,7 @@ fn main() {
     let listeners = config.listeners.clone();
     let metrics_addr = config.server.metrics_addr.clone();
     let acme_cfg = config.acme.clone();
+    let disk_cfg = config.disk_cache.clone();
     // Only provision hosts that opted in with `acme true` — a CF-fronted host
     // can't pass HTTP-01, so enrolling every site would fail forever.
     let acme_domains: Vec<String> = config
@@ -125,15 +126,30 @@ fn main() {
     }
     let cfg = Arc::new(ArcSwap::from_pointee(config));
 
+    // Provision the disk cache dir NOW (fatal on error — a misconfigured
+    // `cache-store` dir must fail startup, not silently fall back to memory and
+    // hide the misconfiguration). The fd-pinned root is shared with the reaper.
+    let disk_root: Option<Arc<sluice::dirs::SecureDir>> = disk_cfg.map(|dc| {
+        let root = Arc::new(
+            sluice::dirs::SecureDir::provision(&dc.dir)
+                .unwrap_or_else(|e| fatal(&format!("cache-store dir: {e}"))),
+        );
+        sluice::diskcache::spawn_reaper(root.clone(), dc.max_size, dc.max_files, dc.min_free);
+        log::info!("sluice: response cache = disk ({})", dc.dir);
+        root
+    });
+
     // ACME auto-TLS: a shared cert store (served by SNI) + a challenge map
-    // (served on :80). The ACME thread fills both.
+    // (served on :80). Provisioning + cached-cert load happen synchronously
+    // (fatal on error) BEFORE the listeners bind, so `:443` never comes up with
+    // an empty cert store.
     let mut acme_certs: Option<Arc<ArcSwap<certs::CertStore>>> = None;
     let mut acme_challenges: Option<acme::ChallengeStore> = None;
     if let Some(acfg) = acme_cfg {
         let cs = Arc::new(ArcSwap::from_pointee(certs::CertStore::default()));
         let chs: acme::ChallengeStore =
             Arc::new(ArcSwap::from_pointee(std::collections::HashMap::new()));
-        acme::spawn(acfg, acme_domains, cs.clone(), chs.clone());
+        acme::spawn(acfg, acme_domains, cs.clone(), chs.clone()).unwrap_or_else(|e| fatal(&e));
         acme_certs = Some(cs);
         acme_challenges = Some(chs);
     }
@@ -141,7 +157,10 @@ fn main() {
     // SIGHUP → hot reload (fail-safe: a bad edit keeps the old config).
     spawn_reload(cfg.clone(), config_path.clone());
 
-    let mut proxy = http_proxy_service(&server.configuration, SluiceProxy::new(cfg.clone()));
+    let mut proxy = http_proxy_service(
+        &server.configuration,
+        SluiceProxy::new(cfg.clone(), disk_root),
+    );
     let mut redirector = http_proxy_service(
         &server.configuration,
         RedirectProxy {
