@@ -46,7 +46,8 @@ against live Let's Encrypt (staging + production).
 
 > Regexes go in KDL **raw strings** when they contain a backslash:
 > `match=r"\.php$"` (a plain `"\.php$"` is an invalid KDL escape).
-- **TLS** listeners (BoringSSL) + **:80 → https** redirect, all from config.
+- **TLS** listeners (OpenSSL by default, BoringSSL optional) + **:80 → https**
+  redirect, all from config.
   A single `cert`/`key`, **dynamic SNI certs** (`tls cert-dir="…"`), or
   **auto-TLS via ACME/Let's Encrypt** (`tls acme=true` + an `acme {}` block,
   HTTP-01, like Caddy — for domains that resolve directly to the server with :80

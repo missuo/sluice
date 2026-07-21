@@ -364,7 +364,9 @@ benefit. Tracked as M5.
   overrides. Verified against a real public HTTPS API. SSE + WebSocket pass through
   unbuffered (tested).
 - **M5 — auto-TLS — DONE + LIVE-VERIFIED:** dynamic SNI cert store + Pingora TLS
-  callback (certs from a `cert-dir`, hot-swappable, multi-domain) AND the ACME
+  callback (certs from a `cert-dir`, multi-domain; the store hot-swaps at runtime
+  for ACME renewals, but a `cert-dir` is read once at startup — rotating a file
+  there needs a restart) AND the ACME
   client (`instant-acme` 0.8 + HTTP-01, `tls acme=true` + `acme {}`): a background
   thread provisions/renews a cert per site host, the `:80` listener answers the
   HTTP-01 challenge, certs land in the hot-swappable store. **Verified end-to-end
@@ -389,10 +391,17 @@ benefit. Tracked as M5.
   path/query/method/header). Static files now stream off the async runtime. All
   verified live on the test box (routing, RR distribution, failover, cache HIT vs
   no-store, WAF blocks).
-- **M4 (later):** true zero-downtime binary upgrade (SIGQUIT fd-handoff), config
-  file-watch, **upstream health checks** (passive down-marking / active probes),
-  **per-location header add/remove**, disk-backed cache, Grafana board. Full
-  Lua/Rhai **scripting** remains out of scope (a compiled-in plugin seam instead).
+- **M7 — production hardening — DONE:** zero-downtime binary upgrade (`-u` /
+  SIGQUIT fd-handoff), weighted + Ketama + least-conn balancing, passive **and
+  active** upstream health checks, disk-backed cache (a custom `pingora-cache`
+  `Storage` with a size/count/free-space reaper), response-body rewrite
+  (`sub-filter`), and two rounds of adversarial security review + a config
+  validator that rejects unknown/mistyped/duplicate directives. All verified live.
+- **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
+  header add/remove, JSON access log, least-conn EWMA, notAfter-based ACME renewal
+  (blocked on pingora's TLS facade not re-exporting asn1), Grafana board, HTTP/3
+  (blocked on upstream Pingora QUIC). Full Lua/Rhai **scripting** stays out of
+  scope (a compiled-in plugin seam, or a constrained routing expression, instead).
 
 "nginx-like general tool" is explicitly out of scope (months, not weeks). Known MVP
 gaps to revisit: rate-limiter map has no eviction (grows with distinct client IPs);

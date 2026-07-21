@@ -17,9 +17,11 @@ cargo clippy --all-targets       # lint before committing
 ./target/release/sluice -c cfg.kdl -u                    # zero-downtime upgrade (see below)
 ```
 
-- **There is no unit-test suite yet.** Validate changes with `--check` plus manual
-  end-to-end testing against a local backend + a self-signed cert. Never test
-  against a production/live host unless that is explicitly the task.
+- **`cargo test`** runs a small unit suite (config parsing/validation, `parse_size`,
+  path normalization, query decode, sub-filter carry-over, Ketama distribution).
+  It is NOT end-to-end — also validate with `--check` and manual testing against a
+  local backend + a self-signed cert. Never test against a production/live host
+  unless that is explicitly the task. There is no CI workflow yet.
 - The **BoringSSL** feature (`boring-sys`) needs extra tools beyond a C toolchain
   on a fresh Debian: `git golang-go nasm ninja-build`.
 

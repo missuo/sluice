@@ -104,10 +104,22 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Percent-decode a query and turn `+` into space, for WAF query matching. Lossy
-/// on invalid UTF-8 so an ASCII payload still matches. Used alongside the raw
-/// query, so both `union select` and `union%20select`/`union+select` are caught.
+/// Percent-decode a query and turn `+` into space, repeatedly until stable (a
+/// few rounds), so double-encoding like `union%2520select` is also caught by a
+/// rule written against the literal payload. Lossy on invalid UTF-8.
 fn decode_query(q: &str) -> String {
+    let mut cur = q.to_owned();
+    for _ in 0..3 {
+        let next = decode_query_once(&cur);
+        if next == cur {
+            break;
+        }
+        cur = next;
+    }
+    cur
+}
+
+fn decode_query_once(q: &str) -> String {
     let b = q.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -527,15 +539,27 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                 health.retain(|k, _| targets.contains_key(k));
 
                 let now = Instant::now();
-                for (addr, (hc, tls, host)) in &targets {
+                // Probe all due backends CONCURRENTLY (a slow/hung backend must
+                // not delay the others — one cycle is bounded by one timeout, not
+                // by the sum over the pool).
+                let mut tasks = Vec::new();
+                for (addr, (hc, tls, host)) in targets {
                     let due = health
-                        .get(addr)
+                        .get(&addr)
                         .map(|h| now.duration_since(h.last_probe) >= hc.interval)
                         .unwrap_or(true);
                     if !due {
                         continue;
                     }
-                    let ok = probe(addr, hc, *tls, host).await;
+                    tasks.push(tokio::spawn(async move {
+                        let ok = probe(&addr, &hc, tls, &host).await;
+                        (addr, hc.healthy, hc.unhealthy, ok)
+                    }));
+                }
+                for t in tasks {
+                    let Ok((addr, healthy_thr, unhealthy_thr, ok)) = t.await else {
+                        continue;
+                    };
                     let mut e = health.entry(addr.clone()).or_insert(ActiveHealth {
                         healthy: true,
                         ok_streak: 0,
@@ -546,14 +570,14 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                     if ok {
                         e.fail_streak = 0;
                         e.ok_streak = e.ok_streak.saturating_add(1);
-                        if !e.healthy && e.ok_streak >= hc.healthy {
+                        if !e.healthy && e.ok_streak >= healthy_thr {
                             e.healthy = true;
                             log::info!("health: {addr} is UP");
                         }
                     } else {
                         e.ok_streak = 0;
                         e.fail_streak = e.fail_streak.saturating_add(1);
-                        if e.healthy && e.fail_streak >= hc.unhealthy {
+                        if e.healthy && e.fail_streak >= unhealthy_thr {
                             e.healthy = false;
                             log::warn!("health: {addr} is DOWN");
                         }
@@ -901,14 +925,25 @@ impl ProxyHttp for SluiceProxy {
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<CacheKey> {
         let req = session.req_header();
         let uri = req.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
+        // Coarse Accept-Encoding bucket. Parse tokens case-insensitively and skip
+        // any with `q=0` — otherwise `GZIP` (or `gzip;q=0`) would fall to the
+        // identity bucket and a gzip body could be served to an identity client.
         let ae = req
             .headers
             .get("accept-encoding")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        let enc = if ae.contains("br") {
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let accepts = |enc: &str| {
+            ae.split(',').map(str::trim).any(|tok| {
+                let mut parts = tok.split(';').map(str::trim);
+                parts.next() == Some(enc)
+                    && !parts.any(|p| p.replace(' ', "") == "q=0" || p.replace(' ', "") == "q=0.0")
+            })
+        };
+        let enc = if accepts("br") {
             "br"
-        } else if ae.contains("gzip") {
+        } else if accepts("gzip") {
             "gzip"
         } else {
             "id"
@@ -941,9 +976,11 @@ impl ProxyHttp for SluiceProxy {
         }
         // We don't implement full Vary. Only cache when the response varies on
         // nothing beyond Accept-Encoding (which is already in the key); reject
-        // `Vary: *`, `Vary: Cookie`, `Vary: Authorization`, etc. — otherwise one
-        // client's variant would be served to everyone.
-        if let Some(vary) = resp.headers.get("vary") {
+        // `Vary: *`, `Vary: Cookie`, etc. Must check EVERY `Vary` line
+        // (get_all) — a `Vary: Cookie` on a second line would otherwise be missed
+        // and leak one user's response to another (RFC 9110 §5.2: multiple field
+        // lines combine).
+        for vary in resp.headers.get_all("vary") {
             let ok = vary
                 .to_str()
                 .map(|v| {
@@ -955,17 +992,22 @@ impl ProxyHttp for SluiceProxy {
                 return Ok(uncacheable());
             }
         }
-        // Object-size cap (bytes) from the location.
+        // Object-size cap (bytes) from the location. Enforced via Content-Length;
+        // when a cap is set and the origin declares NO length, we can't verify the
+        // size, so we refuse to cache (a chunked over-limit body would otherwise
+        // slip in — pingora's mid-stream cap surfaces as a 500, so we don't use it).
         if ctx.cache_max_object > 0 {
-            if let Some(len) = resp
+            match resp
                 .headers
                 .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse::<usize>().ok())
             {
-                if len > ctx.cache_max_object {
+                Some(len) if len > ctx.cache_max_object => {
                     return Ok(RespCacheable::Uncacheable(NoCacheReason::ResponseTooLarge));
                 }
+                Some(_) => {}
+                None => return Ok(RespCacheable::Uncacheable(NoCacheReason::ResponseTooLarge)),
             }
         }
 
@@ -1061,29 +1103,34 @@ impl ProxyHttp for SluiceProxy {
             return Ok(true);
         };
 
-        // WAF (site-wide) → block matching requests.
-        let raw_query = session.req_header().uri.query().unwrap_or("").to_owned();
-        let decoded_query = decode_query(&raw_query);
-        for rule in &site.waf {
-            let blocked = match &rule.field {
-                WafField::Path => rule.re.is_match(&path),
-                // Match both the raw query AND a percent/`+`-decoded form, so an
-                // attacker can't slip `union%20select` / `union+select` past a
-                // rule written against the literal payload.
-                WafField::Query => rule.re.is_match(&raw_query) || rule.re.is_match(&decoded_query),
-                WafField::Method => rule.re.is_match(session.req_header().method.as_str()),
-                // Every value (duplicate-header smuggling), lossily decoded so a
-                // non-UTF-8 byte can't hide the payload from the regex.
-                WafField::Header(name) => session
-                    .req_header()
-                    .headers
-                    .get_all(name.as_str())
-                    .iter()
-                    .any(|v| rule.re.is_match(&String::from_utf8_lossy(v.as_bytes()))),
-            };
-            if blocked {
-                send_status(session, rule.status, hsts).await?;
-                return Ok(true);
+        // WAF (site-wide) → block matching requests. Skip all of it — including
+        // the query decode — when the site has no rules (most requests).
+        if !site.waf.is_empty() {
+            let raw_query = session.req_header().uri.query().unwrap_or("").to_owned();
+            let decoded_query = decode_query(&raw_query);
+            for rule in &site.waf {
+                let blocked = match &rule.field {
+                    WafField::Path => rule.re.is_match(&path),
+                    // Match both the raw query AND a percent/`+`-decoded form, so an
+                    // attacker can't slip `union%20select` / `union+select` past a
+                    // rule written against the literal payload.
+                    WafField::Query => {
+                        rule.re.is_match(&raw_query) || rule.re.is_match(&decoded_query)
+                    }
+                    WafField::Method => rule.re.is_match(session.req_header().method.as_str()),
+                    // Every value (duplicate-header smuggling), lossily decoded so a
+                    // non-UTF-8 byte can't hide the payload from the regex.
+                    WafField::Header(name) => session
+                        .req_header()
+                        .headers
+                        .get_all(name.as_str())
+                        .iter()
+                        .any(|v| rule.re.is_match(&String::from_utf8_lossy(v.as_bytes()))),
+                };
+                if blocked {
+                    send_status(session, rule.status, hsts).await?;
+                    return Ok(true);
+                }
             }
         }
 
@@ -1319,11 +1366,17 @@ impl ProxyHttp for SluiceProxy {
                 if uncompressed && text {
                     ctx.rewrite = true;
                     // The body is about to change: drop Content-Length (streams
-                    // chunked) and the now-stale integrity/validator headers.
-                    upstream_response.remove_header("Content-Length");
-                    upstream_response.remove_header("Content-MD5");
-                    upstream_response.remove_header("Digest");
-                    upstream_response.remove_header("ETag");
+                    // chunked) and every now-stale integrity/validator header.
+                    for h in [
+                        "Content-Length",
+                        "Content-MD5",
+                        "Digest",
+                        "Content-Digest",
+                        "Repr-Digest",
+                        "ETag",
+                    ] {
+                        upstream_response.remove_header(h);
+                    }
                 }
             }
         }
@@ -1566,5 +1619,51 @@ mod tests {
         let (out, carry) = rewrite_stream(b"hello world", &f, 3, true);
         assert!(carry.is_empty());
         assert_eq!(&out, b"hello world");
+    }
+
+    fn upstream(host: &str, weight: u32) -> Upstream {
+        Upstream {
+            host: host.into(),
+            port: 80,
+            tls: false,
+            sni: host.into(),
+            host_header: None,
+            verify: false,
+            weight,
+        }
+    }
+
+    #[test]
+    fn ketama_distributes_roughly_evenly() {
+        let ring = crate::config::build_ketama_ring(&[
+            upstream("10.0.0.1", 1),
+            upstream("10.0.0.2", 1),
+            upstream("10.0.0.3", 1),
+        ]);
+        let mut counts = [0usize; 3];
+        for i in 0..3000 {
+            counts[ketama_pick(&ring, &format!("client-{i}"))] += 1;
+        }
+        // plain FNV gave e.g. 90/210/0; each should now be within ~±40% of 1000.
+        for c in counts {
+            assert!(
+                c > 600 && c < 1400,
+                "uneven ketama distribution: {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ketama_respects_weight() {
+        let ring = crate::config::build_ketama_ring(&[upstream("a", 3), upstream("b", 1)]);
+        let mut counts = [0usize; 2];
+        for i in 0..4000 {
+            counts[ketama_pick(&ring, &format!("client-{i}"))] += 1;
+        }
+        let ratio = counts[0] as f64 / counts[1] as f64;
+        assert!(
+            ratio > 2.2 && ratio < 4.0,
+            "weight ~3:1 not honored: {counts:?}"
+        );
     }
 }

@@ -74,7 +74,14 @@ pub fn spawn(
                                 log::warn!("acme: {d}: could not write key: {e}; skipping");
                                 continue;
                             }
-                            let _ = std::fs::write(&crt_p, &cert_pem);
+                            if let Err(e) = std::fs::write(&crt_p, &cert_pem) {
+                                // Disk copy is now missing/partial; remove the key so
+                                // the pair is consistent and needs_cert re-issues next
+                                // cycle rather than leaving a mismatched pair.
+                                log::warn!("acme: {d}: could not write cert: {e}; skipping");
+                                let _ = std::fs::remove_file(&key_p);
+                                continue;
+                            }
                             match Cert::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()) {
                                 Ok(c) => {
                                     let mut store = (**cert_store.load()).clone();
@@ -154,13 +161,17 @@ fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertS
     }
 }
 
-/// Re-issue if either file is missing or the cert is older than 60 days (LE
-/// certs last 90). A future mtime (clock skew) is treated as "fresh" — NOT as
-/// "needs cert" — so a skewed clock can't trigger an every-12h re-issue storm
-/// that would hit Let's Encrypt's rate limit.
+/// Re-issue if the cached pair won't load as a valid, matching cert, or if it's
+/// older than 60 days (LE certs last 90). Loading the pair (not just checking the
+/// files exist) means a broken/mismatched/partial cached cert is re-issued
+/// promptly instead of sitting unusable for 60 days. A future mtime (clock skew)
+/// is treated as "fresh" so a skewed clock can't trigger an every-12h re-issue
+/// storm. (mtime, not X.509 notAfter, because pingora's TLS facade doesn't
+/// re-export the asn1 module needed to read notAfter portably across OpenSSL/
+/// BoringSSL — tracked for later.)
 fn needs_cert(cfg: &AcmeCfg, domain: &str) -> bool {
     let (crt, key) = cert_paths(cfg, domain);
-    if !std::path::Path::new(&key).exists() {
+    if Cert::from_files(&crt, &key).is_err() {
         return true;
     }
     match std::fs::metadata(&crt).and_then(|m| m.modified()) {

@@ -436,6 +436,80 @@ fn reject_unknown_props(node: &KdlNode, ctx: &str, allowed: &[&str], errs: &mut 
     }
 }
 
+#[derive(Clone, Copy)]
+enum Ty {
+    Int,
+    Bool,
+    Str,
+}
+impl Ty {
+    fn describe(self) -> &'static str {
+        match self {
+            Ty::Int => "an integer",
+            Ty::Bool => "true or false",
+            Ty::Str => "a quoted string",
+        }
+    }
+}
+
+/// Error when a known child directive is present but its value is the wrong type
+/// (e.g. `threads "four"`, `max-body 1024`) — which otherwise silently defaults.
+fn check_child_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut Vec<String>) {
+    for (name, ty) in specs {
+        let Some(c) = child(node, name) else { continue };
+        let val = c
+            .entries()
+            .iter()
+            .find(|e| e.name().is_none())
+            .map(|e| e.value());
+        let ok = match (val, ty) {
+            (Some(v), Ty::Int) => v.as_integer().is_some(),
+            (Some(v), Ty::Bool) => v.as_bool().is_some(),
+            (Some(v), Ty::Str) => v.as_string().is_some(),
+            (None, _) => false,
+        };
+        if !ok {
+            errs.push(format!("{ctx}: `{name}` must be {}", ty.describe()));
+        }
+    }
+}
+
+/// Error when a known property is present but its value is the wrong type
+/// (e.g. `cloudflare-only="true"`, a string where a bool is meant).
+fn check_prop_types(node: &KdlNode, ctx: &str, specs: &[(&str, Ty)], errs: &mut Vec<String>) {
+    for (name, ty) in specs {
+        let Some(v) = node.get(*name) else { continue };
+        let ok = match ty {
+            Ty::Int => v.as_integer().is_some() || v.as_float().is_some(),
+            Ty::Bool => v.as_bool().is_some(),
+            Ty::Str => v.as_string().is_some(),
+        };
+        if !ok {
+            errs.push(format!(
+                "{ctx}: property `{name}` must be {}",
+                ty.describe()
+            ));
+        }
+    }
+}
+
+/// Error when a directive that may appear at most once is repeated.
+fn reject_dup_children(node: &KdlNode, ctx: &str, singletons: &[&str], errs: &mut Vec<String>) {
+    if let Some(ch) = node.children() {
+        for name in singletons {
+            if ch
+                .nodes()
+                .iter()
+                .filter(|n| n.name().value() == *name)
+                .count()
+                > 1
+            {
+                errs.push(format!("{ctx}: `{name}` given more than once"));
+            }
+        }
+    }
+}
+
 /// `32MiB` / `1024` / `512KB` -> bytes.
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -542,23 +616,27 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     })
 }
 
-/// Stable hash for Ketama ring points and key lookup. FNV-1a is deterministic
-/// across Rust versions (unlike `DefaultHasher`), so the ring — and thus every
-/// client's sticky backend — stays stable across recompiles and toolchain
-/// upgrades. Must match `proxy::str_hash`.
+/// Stable, well-distributed hash for Ketama ring points and key lookup. FNV-1a
+/// per-byte fold (deterministic across Rust versions, unlike `DefaultHasher`)
+/// followed by a splitmix64 finalizer for avalanche — plain FNV clusters badly
+/// on the shared-prefix `host:port-<n>` ring-point strings, which skewed the
+/// distribution. Must match `proxy::str_hash`.
 pub fn stable_hash(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.as_bytes() {
         h ^= *b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    h
+    // splitmix64 finalizer
+    h = (h ^ (h >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    h = (h ^ (h >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    h ^ (h >> 31)
 }
 
 /// Build a Ketama consistent-hash ring: each backend gets `160 * weight` points,
 /// so its share of the key space is proportional to its weight and removing one
 /// backend only reshuffles that backend's arcs.
-fn build_ketama_ring(servers: &[Upstream]) -> Vec<(u64, usize)> {
+pub fn build_ketama_ring(servers: &[Upstream]) -> Vec<(u64, usize)> {
     let mut ring = Vec::new();
     for (idx, s) in servers.iter().enumerate() {
         let points = 160usize.saturating_mul(s.weight.max(1) as usize);
@@ -595,19 +673,34 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
             }
         }
         match name {
-            "server" => reject_unknown_children(
-                node,
-                "server",
-                &[
-                    "threads",
-                    "metrics-addr",
-                    "grace-period-secs",
-                    "graceful-shutdown-secs",
-                    "upstream-keepalive-pool",
-                    "upgrade-sock",
-                ],
-                errs,
-            ),
+            "server" => {
+                reject_unknown_children(
+                    node,
+                    "server",
+                    &[
+                        "threads",
+                        "metrics-addr",
+                        "grace-period-secs",
+                        "graceful-shutdown-secs",
+                        "upstream-keepalive-pool",
+                        "upgrade-sock",
+                    ],
+                    errs,
+                );
+                check_child_types(
+                    node,
+                    "server",
+                    &[
+                        ("threads", Ty::Int),
+                        ("metrics-addr", Ty::Str),
+                        ("grace-period-secs", Ty::Int),
+                        ("graceful-shutdown-secs", Ty::Int),
+                        ("upstream-keepalive-pool", Ty::Int),
+                        ("upgrade-sock", Ty::Str),
+                    ],
+                    errs,
+                );
+            }
             "client-ip" => reject_unknown_children(
                 node,
                 "client-ip",
@@ -697,17 +790,44 @@ const LOCATION_CHILDREN: &[&str] = &[
     "upstream-verify",
 ];
 
+/// Directives shared by a site and a location that must appear at most once.
+const SINGLE_HANDLER_CHILDREN: &[&str] = &[
+    "upstream",
+    "file-server",
+    "cache",
+    "rate-limit",
+    "access",
+    "waf",
+];
+/// Typed leaf fields shared by a site and a location.
+const HANDLER_FIELD_TYPES: &[(&str, Ty)] = &[
+    ("websocket", Ty::Bool),
+    ("max-body", Ty::Str),
+    ("read-timeout-secs", Ty::Int),
+    ("upstream-host", Ty::Str),
+    ("upstream-verify", Ty::Bool),
+    ("hsts", Ty::Str),
+    ("acme", Ty::Bool),
+];
+
 fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
     let host = first_arg(node).unwrap_or("?");
     let ctx = format!("site `{host}`");
     reject_unknown_children(node, &ctx, SITE_CHILDREN, errs);
+    // A site takes only a host argument — reject stray props like `typo=true`.
+    reject_unknown_props(node, &ctx, &[], errs);
+    reject_dup_children(node, &ctx, SINGLE_HANDLER_CHILDREN, errs);
+    check_child_types(node, &ctx, HANDLER_FIELD_TYPES, errs);
     let Some(children) = node.children() else {
         return;
     };
     for n in children.nodes() {
         match n.name().value() {
             "location" => {
-                reject_unknown_children(n, &format!("{ctx} location"), LOCATION_CHILDREN, errs);
+                let lctx = format!("{ctx} location");
+                reject_unknown_children(n, &lctx, LOCATION_CHILDREN, errs);
+                reject_dup_children(n, &lctx, SINGLE_HANDLER_CHILDREN, errs);
+                check_child_types(n, &lctx, HANDLER_FIELD_TYPES, errs);
                 validate_backend_unknowns(n, &ctx, errs);
             }
             "upstream" | "file-server" | "cache" | "rate-limit" | "access" | "waf" | "redirect"
@@ -744,12 +864,19 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
             if let Some(ch) = n.children() {
                 for s in ch.nodes().iter().filter(|x| x.name().value() == "server") {
                     reject_unknown_props(s, &format!("{ctx} upstream server"), &["weight"], errs);
+                    check_prop_types(
+                        s,
+                        &format!("{ctx} upstream server"),
+                        &[("weight", Ty::Int)],
+                        errs,
+                    );
                 }
             }
             if let Some(hc) = child(n, "health-check") {
+                let hctx = format!("{ctx} health-check");
                 reject_unknown_children(
                     hc,
-                    &format!("{ctx} health-check"),
+                    &hctx,
                     &[
                         "path",
                         "interval-secs",
@@ -760,21 +887,56 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
                     ],
                     errs,
                 );
+                check_child_types(
+                    hc,
+                    &hctx,
+                    &[
+                        ("path", Ty::Str),
+                        ("interval-secs", Ty::Int),
+                        ("timeout-secs", Ty::Int),
+                        ("healthy", Ty::Int),
+                        ("unhealthy", Ty::Int),
+                        ("expect-status", Ty::Int),
+                    ],
+                    errs,
+                );
             }
         }
         "file-server" => {
             reject_unknown_children(n, &format!("{ctx} file-server"), &["root", "index"], errs)
         }
-        "cache" => reject_unknown_children(
-            n,
-            &format!("{ctx} cache"),
-            &["ttl-secs", "max-object"],
-            errs,
-        ),
-        "rate-limit" => {
-            reject_unknown_props(n, &format!("{ctx} rate-limit"), &["rps", "burst"], errs)
+        "cache" => {
+            reject_unknown_children(
+                n,
+                &format!("{ctx} cache"),
+                &["ttl-secs", "max-object"],
+                errs,
+            );
+            check_child_types(
+                n,
+                &format!("{ctx} cache"),
+                &[("ttl-secs", Ty::Int), ("max-object", Ty::Str)],
+                errs,
+            );
         }
-        "access" => reject_unknown_props(n, &format!("{ctx} access"), &["cloudflare-only"], errs),
+        "rate-limit" => {
+            reject_unknown_props(n, &format!("{ctx} rate-limit"), &["rps", "burst"], errs);
+            check_prop_types(
+                n,
+                &format!("{ctx} rate-limit"),
+                &[("rps", Ty::Int), ("burst", Ty::Int)],
+                errs,
+            );
+        }
+        "access" => {
+            reject_unknown_props(n, &format!("{ctx} access"), &["cloudflare-only"], errs);
+            check_prop_types(
+                n,
+                &format!("{ctx} access"),
+                &[("cloudflare-only", Ty::Bool)],
+                errs,
+            );
+        }
         "redirect" => reject_unknown_props(
             n,
             &format!("{ctx} redirect"),
@@ -785,6 +947,9 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
             reject_unknown_props(n, &format!("{ctx} sub-filter"), &["from", "to"], errs)
         }
         "waf" => {
+            // A `waf` block contains only `block` directives — catch e.g. `blok`,
+            // which would otherwise leave the WAF with no rules.
+            reject_unknown_children(n, &format!("{ctx} waf"), &["block"], errs);
             if let Some(ch) = n.children() {
                 for b in ch.nodes().iter().filter(|x| x.name().value() == "block") {
                     reject_unknown_props(
@@ -1019,18 +1184,30 @@ impl Config {
             errs.push("no `listener` defined".to_string());
         }
         // Two acceptors on one address both try to bind → the second fails at
-        // startup, after --check said ok. Catch it here.
+        // startup, after --check said ok. Compare PARSED addresses so `:19550`
+        // and `:019550` (same socket, different string) are caught too.
+        use std::net::SocketAddr;
+        let paddr = |s: &str| s.parse::<SocketAddr>().ok();
         for (i, l) in listeners.iter().enumerate() {
-            if listeners[..i].iter().any(|p| p.addr == l.addr) {
+            let a = paddr(&l.addr);
+            if a.is_some() && listeners[..i].iter().any(|p| paddr(&p.addr) == a) {
                 errs.push(format!("duplicate listener address `{}`", l.addr));
             }
         }
-        // metrics-addr is bound at startup; validate it like a listener address.
+        // metrics-addr is bound at startup; validate it, and reject a collision
+        // with a listener (Pingora would then randomly share the port between the
+        // metrics service and the proxy — breaking both).
         if let Some(m) = &server.metrics_addr {
-            if m.parse::<std::net::SocketAddr>().is_err() {
-                errs.push(format!(
+            match paddr(m) {
+                None => errs.push(format!(
                     "server metrics-addr {m:?}: not a valid socket address"
-                ));
+                )),
+                Some(ma) if listeners.iter().any(|l| paddr(&l.addr) == Some(ma)) => {
+                    errs.push(format!(
+                        "server metrics-addr {m:?} collides with a listener address"
+                    ));
+                }
+                Some(_) => {}
             }
         }
         let has_acme_listener = listeners
@@ -1041,16 +1218,17 @@ impl Config {
                 "a listener uses `tls acme=true` but there is no `acme {}` block".to_string(),
             );
         }
-        // HTTP-01 challenges are answered on the :80 redirect listener; without one
-        // ACME can never validate.
+        // HTTP-01 challenges are answered on the :80 redirect listener; without a
+        // redirect listener *on port 80* ACME can never validate.
         if has_acme_listener
-            && !listeners
-                .iter()
-                .any(|l| matches!(l.kind, ListenerKind::RedirectHttps))
+            && !listeners.iter().any(|l| {
+                matches!(l.kind, ListenerKind::RedirectHttps)
+                    && paddr(&l.addr).map(|a| a.port() == 80).unwrap_or(false)
+            })
         {
             errs.push(
                 "`tls acme=true` needs a `listener \"0.0.0.0:80\" { redirect-to-https true }` \
-                 to answer HTTP-01 challenges"
+                 (on port 80) to answer HTTP-01 challenges"
                     .to_string(),
             );
         }
@@ -1137,6 +1315,11 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
 
     // ACME-managed certs (needs a top-level `acme {}` block).
     if prop_bool(tls, "acme").unwrap_or(false) {
+        if prop_str(tls, "cert").is_some() || prop_str(tls, "cert-dir").is_some() {
+            return Err(format!(
+                "listener {addr:?}: `tls acme=true` can't be combined with cert/cert-dir"
+            ));
+        }
         return Ok(Listener {
             addr,
             kind: ListenerKind::TlsAcme { http2 },
@@ -1168,6 +1351,11 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
     }
     if !Path::new(&key).exists() {
         return Err(format!("listener {addr:?}: key file not found: {key}"));
+    }
+    // Actually load the pair at --check time so a malformed PEM or a key that
+    // doesn't match the cert is caught now, not at the first TLS handshake.
+    if let Err(e) = crate::certs::Cert::from_files(&cert, &key) {
+        return Err(format!("listener {addr:?}: tls cert/key: {e}"));
     }
     Ok(Listener {
         addr,
@@ -1571,11 +1759,32 @@ mod tests {
     }
 
     #[test]
-    fn stable_hash_matches_fnv1a_vector() {
-        // Published FNV-1a-64 test vectors — pins the algorithm so a change
-        // (which would reshuffle every ketama client) is caught.
-        assert_eq!(stable_hash(""), 0xcbf2_9ce4_8422_2325);
-        assert_eq!(stable_hash("a"), 0xaf63_dc4c_8601_ec8c);
+    fn stable_hash_deterministic_and_avalanches() {
+        assert_eq!(stable_hash("abc"), stable_hash("abc"));
+        // Adjacent ring-point strings must land far apart (good avalanche) —
+        // plain FNV failed this and skewed the ketama distribution.
+        let a = stable_hash("127.0.0.1:8080-0");
+        let b = stable_hash("127.0.0.1:8080-1");
+        assert_ne!(a, b);
+        assert!((a ^ b).count_ones() > 20, "weak avalanche: {a:x} vs {b:x}");
+    }
+
+    #[test]
+    fn ketama_ring_points_scale_with_weight() {
+        let mk = |host: &str, w: u32| Upstream {
+            host: host.into(),
+            port: 80,
+            tls: false,
+            sni: host.into(),
+            host_header: None,
+            verify: false,
+            weight: w,
+        };
+        let ring = build_ketama_ring(&[mk("a", 3), mk("b", 1)]);
+        let a = ring.iter().filter(|(_, i)| *i == 0).count();
+        let b = ring.iter().filter(|(_, i)| *i == 1).count();
+        assert_eq!(a, 480);
+        assert_eq!(b, 160);
     }
 
     #[test]
