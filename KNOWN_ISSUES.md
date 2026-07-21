@@ -68,26 +68,33 @@ Two categories:
 - **Guidance:** if you need weighted hashing, use `balance ketama`. This is
   documented in `config.rs` (the `Balance` enum) and README.
 
-### 2.2 Disk-cache reaper does a full directory scan
+### 2.2 Disk-cache reaper does a full directory scan **and sort**
 - **What:** the disk cache's background reaper (every 30 s) walks the whole cache
-  directory to enforce the size / file-count / free-space bounds.
-- **Why not fixed:** O(files) every 30 s is fine for the expected cache size and is
-  how simple on-disk caches (and nginx's cache manager) work. An incremental index
-  (in-memory LRU of on-disk entries with usage tracking) would avoid the scan but
+  directory and, when it needs to evict, **sorts** the entries by mtime — so a
+  cycle is O(files) to stat plus O(n log n) to sort, not just O(files).
+- **Why not fixed:** for the expected cache size this is negligible and is how
+  simple on-disk caches (and nginx's cache manager) work. An incremental index
+  (in-memory LRU of on-disk entries) would avoid both the scan and the sort but
   adds a crash-consistency problem (index vs. disk divergence after an unclean
-  exit) that the stateless full-scan sidesteps. Not worth the complexity until a
-  large cache makes the scan a measured problem.
-- **Mitigation:** keep `cache-store { max-files }` reasonable; the scan cost scales
+  exit) that the stateless scan sidesteps. Not worth the complexity until a large
+  cache makes it a *measured* problem.
+- **Honest caveat:** "acceptable" here is a design judgement, **not backed by a
+  benchmark** at the default million-file ceiling. If you run a very large disk
+  cache, measure the reaper cycle time before relying on it.
+- **Mitigation:** keep `cache-store { max-files }` reasonable; the cost scales
   with it.
 
 ### 2.3 Config file-watch / `cert-dir` hot-reload
-- **What:** config reload is **SIGHUP-triggered**, not automatic on file change;
-  a `cert-dir` is read **once at startup** (only ACME renewals hot-swap the store).
+- **What:** config reload is **SIGHUP-triggered**, not automatic on file change.
+  A `cert-dir` store is built **once at process startup** and is **not re-read on
+  SIGHUP** — only the ACME renewal loop hot-swaps certs into the in-memory store.
+  So rotating a file in a `cert-dir` requires a **process restart** (a SIGHUP will
+  reload routing/other config but will **not** pick up new/rotated cert files).
 - **Why not fixed:** SIGHUP is explicit and predictable; a file-watcher adds a
-  dependency and races (partial writes). Rotating a `cert-dir` file today needs a
-  SIGHUP/restart.
-- **What it would take:** a debounced `notify`-based watcher feeding the same
-  `ArcSwap` reload path. Small, just not yet prioritised.
+  dependency and races (partial writes).
+- **What it would take:** rebuild the `CertStore` inside the SIGHUP reload path
+  (and/or a debounced `notify` watcher) feeding the same `ArcSwap`. Small, just
+  not yet prioritised.
 
 ### 2.4 Full Lua/Rhai scripting / WAF programmability
 - **What:** the WAF is **declarative** (`waf { block field=… match=… }` over
@@ -100,6 +107,41 @@ Two categories:
 - **What it would take:** a sandboxed, resource-limited engine (Rhai) or a
   compiled-in Rust plugin seam. If pursued, prefer the compiled plugin seam or a
   constrained routing-expression grammar over a general scripting language.
+
+---
+
+## 3. Behavioural notes & smaller known gaps
+
+These are correct-and-intentional behaviours worth writing down (a reviewer or
+operator could reasonably expect otherwise), plus small gaps not yet closed.
+
+- **Over-limit chunked body → abort, not a clean 413.** A request whose declared
+  `Content-Length` exceeds `max-body` gets a proper `413`. A **chunked / no-
+  Content-Length** body that crosses the limit mid-stream is terminated with a
+  proxy error (connection reset / 5xx-class) once the cap is passed — the bytes
+  are capped either way (no evasion), but a streaming over-limit upload does not
+  receive a tidy `413` response.
+- **HTTPS upstreams get connect-level health only.** An active `health-check`
+  with a `path` performs an HTTP `GET` for **plaintext** backends; for a **TLS**
+  (`https://…`) upstream it falls back to a **TCP-connect** check (no TLS
+  handshake, no HTTP status assertion). A TLS backend that accepts connections
+  but returns errors won't be marked down by the path check.
+- **Static-file root is canonicalized per request.** `file-server` calls
+  `canonicalize()` on the resolved path and the root on **every** request to
+  enforce the under-root containment check (the traversal defense). That's a
+  `stat`-per-request cost; it is deliberate (correctness over caching the root),
+  not yet optimised with a cached canonical root.
+- **Disk cache pairs body+meta by a stamped size, not a transactional write.**
+  The disk `Storage` stamps the body length into the meta header and verifies it
+  on lookup (a torn/half-written entry is treated as a miss), but body and meta
+  are separate files without a two-phase commit — the size stamp is the integrity
+  check, not a transaction. A crash mid-write yields a miss, never a wrong body.
+- **Access log is a fixed line format (no JSON).** The access log emits a fixed
+  field layout; there is no `json` access-log mode yet. Tracked as a "still
+  later" item in DESIGN.
+- **`protobuf` is pulled in transitively** (via a dependency) and has carried
+  advisories in the past; it is not used on the request path. Watch `cargo audit`
+  on dependency bumps.
 
 ---
 

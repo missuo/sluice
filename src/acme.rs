@@ -95,50 +95,53 @@ pub fn spawn(
     });
 }
 
-/// Per-environment cert/key file paths, so switching `staging` on/off doesn't
-/// serve the other environment's (e.g. untrusted staging) cert.
-fn cert_paths(cfg: &AcmeCfg, domain: &str) -> (String, String) {
+/// Per-environment combined cert+key file path, so switching `staging` on/off
+/// doesn't serve the other environment's (e.g. untrusted staging) cert. Key and
+/// full chain live in ONE file so publishing is a single atomic rename.
+fn cert_path(cfg: &AcmeCfg, domain: &str) -> String {
     let env = if cfg.staging { "staging" } else { "production" };
-    (
-        format!("{}/{env}-{domain}.crt", cfg.cache_dir),
-        format!("{}/{env}-{domain}.key", cfg.cache_dir),
-    )
+    format!("{}/{env}-{domain}.pem", cfg.cache_dir)
 }
 
-/// Publish a new cert/key atomically: write both to temp files, verify they load
-/// as a matching pair, then rename into place (key first). On any failure the
-/// temps are cleaned up and the previous live cert is left untouched.
+/// Publish a new cert atomically. Key + full chain are concatenated into a single
+/// buffer, verified to load as a matching pair, written to a pid-tagged temp
+/// (fsync'd), then `rename`d over the live file in ONE step. A single file means
+/// there is never a window where a new key is paired with an old certificate —
+/// the previous two-file scheme could crash between its two renames and leave a
+/// mismatched key+cert that broke TLS load on the next boot. The parent directory
+/// is fsync'd after the rename so a power loss can't lose the new name, and the
+/// pid tag keeps two processes (a rolling upgrade) from racing on one temp path.
 fn publish_cert(cfg: &AcmeCfg, domain: &str, cert_pem: &str, key_pem: &str) -> Result<(), String> {
-    let (crt, key) = cert_paths(cfg, domain);
-    let (crt_tmp, key_tmp) = (format!("{crt}.tmp"), format!("{key}.tmp"));
-    let cleanup = || {
-        let _ = std::fs::remove_file(&crt_tmp);
-        let _ = std::fs::remove_file(&key_tmp);
-    };
-    if let Err(e) = write_private(&key_tmp, key_pem.as_bytes()) {
-        cleanup();
-        return Err(format!("write key: {e}"));
+    let path = cert_path(cfg, domain);
+    let mut combined = String::with_capacity(key_pem.len() + cert_pem.len() + 1);
+    combined.push_str(key_pem.trim_end());
+    combined.push('\n');
+    combined.push_str(cert_pem);
+    // Prove the bytes load as a matching pair before anything durable is written.
+    Cert::from_combined_pem(combined.as_bytes()).map_err(|e| format!("verify new pair: {e}"))?;
+
+    let tmp = format!("{path}.tmp.{}", std::process::id());
+    if let Err(e) = write_private(&tmp, combined.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("write temp: {e}"));
     }
-    if let Err(e) = std::fs::write(&crt_tmp, cert_pem.as_bytes()) {
-        cleanup();
-        return Err(format!("write cert: {e}"));
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("install: {e}"));
     }
-    if let Err(e) = Cert::from_files(&crt_tmp, &key_tmp) {
-        cleanup();
-        return Err(format!("verify new pair: {e}"));
-    }
-    // Both temps are valid — swap them in (key before cert).
-    if let Err(e) = std::fs::rename(&key_tmp, &key) {
-        cleanup();
-        return Err(format!("install key: {e}"));
-    }
-    if let Err(e) = std::fs::rename(&crt_tmp, &crt) {
-        // Key already replaced; cert rename failed. Next cycle's needs_cert loads
-        // the (now-mismatched) pair, fails, and re-issues — no permanent bad state.
-        let _ = std::fs::remove_file(&crt_tmp);
-        return Err(format!("install cert: {e}"));
-    }
+    sync_parent_dir(&path);
     Ok(())
+}
+
+/// fsync the directory holding `path` so a freshly `rename`d entry survives a
+/// crash/power loss (a rename is only durable once its directory is synced).
+fn sync_parent_dir(path: &str) {
+    #[cfg(unix)]
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if let Ok(dir) = std::fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
 }
 
 /// Create the cache dir with owner-only permissions (it holds private keys).
@@ -170,18 +173,25 @@ fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
         f.write_all(data)?;
         // mode() only applies on create — force 0600 on an existing (possibly
         // world-readable) file too.
-        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // Durably flush secret material before a rename relies on it.
+        f.sync_all()
     }
     #[cfg(not(unix))]
-    std::fs::write(path, data)
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        f.write_all(data)?;
+        f.sync_all()
+    }
 }
 
 fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertStore>>) {
     let mut store = (**cert_store.load()).clone();
     let mut any = false;
     for d in domains {
-        let (crt, key) = cert_paths(cfg, d);
-        if let Ok(c) = Cert::from_files(&crt, &key) {
+        let path = cert_path(cfg, d);
+        if let Ok(c) = Cert::from_combined_file(&path) {
             store.insert(d.clone(), c);
             any = true;
         }
@@ -200,11 +210,11 @@ fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertS
 /// re-export the asn1 module needed to read notAfter portably across OpenSSL/
 /// BoringSSL — tracked for later.)
 fn needs_cert(cfg: &AcmeCfg, domain: &str) -> bool {
-    let (crt, key) = cert_paths(cfg, domain);
-    if Cert::from_files(&crt, &key).is_err() {
+    let path = cert_path(cfg, domain);
+    if Cert::from_combined_file(&path).is_err() {
         return true;
     }
-    match std::fs::metadata(&crt).and_then(|m| m.modified()) {
+    match std::fs::metadata(&path).and_then(|m| m.modified()) {
         Ok(mtime) => mtime
             .elapsed()
             .map(|e| e > Duration::from_secs(60 * 24 * 3600))

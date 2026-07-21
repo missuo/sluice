@@ -14,7 +14,8 @@ jobs:
     name: build / test / lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      # checkout@v5 runs on Node 24 (v4 targeted the now-deprecated Node 20).
+      - uses: actions/checkout@v5
 
       - name: Install stable toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -42,15 +43,22 @@ jobs:
       - name: Test
         run: cargo test --verbose
 
-      - name: Validate example config
+      - name: Smoke config must validate (strict exit 0)
+        # examples/smoke.kdl is self-contained (ACME TLS, no cert/static files),
+        # so `--check` MUST exit 0. This catches KDL syntax errors, panics, and
+        # schema regressions with an unambiguous pass/fail — unlike the full
+        # example below, whose absent cert/static paths force a non-zero exit.
+        run: ./target/debug/sluice --check -c examples/smoke.kdl
+
+      - name: Validate full example config
         # The example references paths that don't exist in CI (certs, static
-        # roots), so a non-zero exit is expected; we only assert the binary
-        # parses far enough to report those *filesystem* errors and not a
-        # schema/type error. Any "unknown"/"must be" line is a real failure.
+        # roots), so a non-zero exit is expected. We assert only that the binary
+        # gets far enough to report those *filesystem* errors and emits no
+        # schema/type error line — those would be real regressions.
         run: |
           out=$(./target/debug/sluice --check -c examples/sluice.kdl 2>&1 || true)
           echo "$out"
-          if echo "$out" | grep -Ei 'unknown (property|directive|child)|must be (an integer|true|false|a quoted)'; then
+          if echo "$out" | grep -Ei 'unknown (property|directive|child)|takes no properties|given more than once|must be (an integer|a number|true|false|a quoted)|expected .* argument'; then
             echo "::error::example config produced a schema/type error"
             exit 1
           fi

@@ -507,6 +507,33 @@ struct ActiveHealth {
     last_probe: Instant,
 }
 
+/// Hex-encode the EXACT bytes of every `Accept-Encoding` request line (in order,
+/// NUL-separated) as a cache-key component. Byte-exact on purpose: any difference
+/// — q-values, client preference order, casing, duplicate lines — yields a
+/// distinct key, because the origin negotiates the encoding over the whole header
+/// and we don't parse it (see `cache_key_callback`).
+fn accept_encoding_key<'a>(lines: impl Iterator<Item = &'a [u8]>) -> String {
+    let mut ae: Vec<u8> = Vec::new();
+    for l in lines {
+        ae.extend_from_slice(l);
+        ae.push(0); // NUL boundary — cannot appear inside a header value
+    }
+    let mut hex = String::with_capacity(ae.len() * 2);
+    for b in &ae {
+        use std::fmt::Write;
+        let _ = write!(hex, "{b:02x}");
+    }
+    hex
+}
+
+/// Key for the active-health map: a probe is identified by (site host, location
+/// index, backend addr), so two pools that share a backend addr but differ in
+/// Host / path / thresholds keep independent health verdicts. NUL separates the
+/// fields (it can't appear in a host or addr), so the key is unambiguous.
+fn active_health_key(host: &str, loc_idx: usize, addr: &str) -> String {
+    format!("{host}\u{0}{loc_idx}\u{0}{addr}")
+}
+
 /// Background active health checker: every second it re-reads the live config
 /// (so reloads are picked up), probes each backend whose pool set a
 /// `health-check` when its interval is due, and flips its health state.
@@ -525,30 +552,44 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
         };
         rt.block_on(async move {
             loop {
-                // Collect probe targets from the current config: addr → (check, tls, host).
+                // Collect probe targets from the current config. The map key is the
+                // *probe identity* — (site host, location index, backend addr) — not
+                // just the backend addr: two sites/pools that share a backend but set
+                // a different Host / path / thresholds must get independent state and
+                // their own probe config, instead of colliding on one entry.
                 let snap = cfg.load();
-                let mut targets: std::collections::HashMap<String, (HealthCheck, bool, String)> =
-                    std::collections::HashMap::new();
+                let mut targets: std::collections::HashMap<
+                    String,
+                    (String, HealthCheck, bool, String),
+                > = std::collections::HashMap::new();
                 for site in &snap.sites {
-                    for loc in &site.locations {
+                    for (li, loc) in site.locations.iter().enumerate() {
                         if let Handler::Proxy(g) = &loc.handler {
                             if let Some(hc) = &g.health_check {
                                 for s in &g.servers {
-                                    // Probe with the Host the real requests use
-                                    // (upstream-host / the rewritten https host),
-                                    // not the raw backend IP — else a vhost that
-                                    // only answers for its own Host looks DOWN.
-                                    let probe_host =
-                                        s.host_header.clone().unwrap_or_else(|| s.host.clone());
+                                    let addr = format!("{}:{}", s.host, s.port);
+                                    // Probe with the Host the real requests carry:
+                                    // upstream-host / the rewritten https host if set,
+                                    // otherwise the *site* vhost (what the client
+                                    // sends and what we forward) — NOT the raw backend
+                                    // IP, or a name-vhost that only answers for its own
+                                    // Host looks DOWN while real traffic succeeds.
+                                    let probe_host = s
+                                        .host_header
+                                        .clone()
+                                        .or_else(|| {
+                                            (!site.host.contains('*')).then(|| site.host.clone())
+                                        })
+                                        .unwrap_or_else(|| s.host.clone());
                                     targets
-                                        .entry(format!("{}:{}", s.host, s.port))
-                                        .or_insert_with(|| (hc.clone(), s.tls, probe_host));
+                                        .entry(active_health_key(&site.host, li, &addr))
+                                        .or_insert_with(|| (addr, hc.clone(), s.tls, probe_host));
                                 }
                             }
                         }
                     }
                 }
-                // Forget backends no longer under a health check.
+                // Forget probe identities no longer under a health check.
                 health.retain(|k, _| targets.contains_key(k));
 
                 let now = Instant::now();
@@ -556,9 +597,9 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                 // not delay the others — one cycle is bounded by one timeout, not
                 // by the sum over the pool).
                 let mut tasks = Vec::new();
-                for (addr, (hc, tls, host)) in targets {
+                for (key, (addr, hc, tls, host)) in targets {
                     let due = health
-                        .get(&addr)
+                        .get(&key)
                         .map(|h| now.duration_since(h.last_probe) >= hc.interval)
                         .unwrap_or(true);
                     if !due {
@@ -566,14 +607,14 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                     }
                     tasks.push(tokio::spawn(async move {
                         let ok = probe(&addr, &hc, tls, &host).await;
-                        (addr, hc.healthy, hc.unhealthy, ok)
+                        (key, hc.healthy, hc.unhealthy, ok)
                     }));
                 }
                 for t in tasks {
-                    let Ok((addr, healthy_thr, unhealthy_thr, ok)) = t.await else {
+                    let Ok((key, healthy_thr, unhealthy_thr, ok)) = t.await else {
                         continue;
                     };
-                    let mut e = health.entry(addr.clone()).or_insert(ActiveHealth {
+                    let mut e = health.entry(key.clone()).or_insert(ActiveHealth {
                         healthy: true,
                         ok_streak: 0,
                         fail_streak: 0,
@@ -585,14 +626,14 @@ fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, Ac
                         e.ok_streak = e.ok_streak.saturating_add(1);
                         if !e.healthy && e.ok_streak >= healthy_thr {
                             e.healthy = true;
-                            log::info!("health: {addr} is UP");
+                            log::info!("health: {key} is UP");
                         }
                     } else {
                         e.ok_streak = 0;
                         e.fail_streak = e.fail_streak.saturating_add(1);
                         if e.healthy && e.fail_streak >= unhealthy_thr {
                             e.healthy = false;
-                            log::warn!("health: {addr} is DOWN");
+                            log::warn!("health: {key} is DOWN");
                         }
                     }
                 }
@@ -726,9 +767,12 @@ impl SluiceProxy {
         }
     }
 
-    /// Is this backend out of rotation — either passively (recent connect failure,
-    /// within cooldown) or actively (a configured health check marked it down)?
-    fn is_down(&self, addr: &str) -> bool {
+    /// Is this backend out of rotation for this specific pool — either passively
+    /// (a recent connect failure to the addr, within cooldown; a property of the
+    /// addr, so keyed by addr) or actively (this pool's configured health check
+    /// marked it down; keyed by the pool's probe identity so two vhosts sharing a
+    /// backend don't share a DOWN verdict).
+    fn is_down(&self, host: &str, loc_idx: usize, addr: &str) -> bool {
         if self
             .health
             .get(addr)
@@ -736,7 +780,9 @@ impl SluiceProxy {
         {
             return true;
         }
-        self.health_active.get(addr).is_some_and(|h| !h.healthy)
+        self.health_active
+            .get(&active_health_key(host, loc_idx, addr))
+            .is_some_and(|h| !h.healthy)
     }
 
     /// Mark a backend down for the cooldown after a connect failure.
@@ -757,19 +803,19 @@ impl SluiceProxy {
             Balance::Random => weighted_random(&group.servers),
             Balance::IpHash => (str_hash(client_ip) % n as u64) as usize,
             Balance::Ketama => ketama_pick(&group.ring, client_ip),
-            Balance::LeastConn => self.least_conn(&group.servers),
+            Balance::LeastConn => self.least_conn(host, loc_idx, &group.servers),
         }
     }
 
     /// Weighted least-connections: the up backend with the smallest
     /// active-requests / weight ratio. Ties break toward the earlier server.
-    fn least_conn(&self, servers: &[Upstream]) -> usize {
+    fn least_conn(&self, host: &str, loc_idx: usize, servers: &[Upstream]) -> usize {
         let mut best = 0usize;
         let mut best_score = f64::MAX;
         let mut any_up = false;
         for (i, s) in servers.iter().enumerate() {
             let addr = format!("{}:{}", s.host, s.port);
-            if self.is_down(&addr) {
+            if self.is_down(host, loc_idx, &addr) {
                 continue;
             }
             any_up = true;
@@ -932,40 +978,31 @@ impl ProxyHttp for SluiceProxy {
         Ok(())
     }
 
-    /// Cache key: host + method + the client's full (normalized) Accept-Encoding
-    /// + URI. We key on the WHOLE Accept-Encoding rather than a coarse br/gzip/id
-    /// bucket, because the origin chooses the encoding from the full header — two
-    /// clients that map to the same bucket but send different `q`-values can get
-    /// different origin representations, and sharing an entry would serve one an
-    /// encoding it can't decode. (We don't implement full `Vary`, so this is the
-    /// safe conservative key.)
+    /// Cache key: host + method + Accept-Encoding + URI.
+    ///
+    /// The Accept-Encoding component is the **exact raw bytes** of every
+    /// `Accept-Encoding` request line, in order, with an unambiguous field
+    /// boundary between lines, hex-encoded. We deliberately do NOT parse
+    /// q-values, reorder, lowercase, or merge tokens: the origin performs full
+    /// RFC 7231 content negotiation over the whole header (weights *and* client
+    /// preference order), so `br;q=.1, gzip;q=1` and `br;q=1, gzip;q=.1` can
+    /// legitimately yield different representations. Without a complete
+    /// negotiation parser, the only safe assumption is that any byte difference
+    /// may select a different encoding — so any byte difference gets its own
+    /// cache entry. This trades a little hit rate for never handing a client an
+    /// encoding it didn't ask for (we don't implement full `Vary`).
     fn cache_key_callback(&self, session: &Session, ctx: &mut Ctx) -> Result<CacheKey> {
         let req = session.req_header();
         let uri = req.uri.path_and_query().map(|p| p.as_str()).unwrap_or("/");
-        // Merge every Accept-Encoding line, lowercase, drop q=0 tokens, sort+dedup
-        // so the key is order-insensitive but distinguishes any real difference.
-        let mut toks: Vec<String> = Vec::new();
-        for v in req.headers.get_all("accept-encoding") {
-            let Ok(s) = v.to_str() else { continue };
-            for tok in s.split(',') {
-                let tok = tok.trim().to_ascii_lowercase();
-                let mut parts = tok.split(';').map(str::trim);
-                let name = parts.next().unwrap_or("");
-                let q0 = parts.any(|p| {
-                    let p = p.replace(' ', "");
-                    p == "q=0" || p == "q=0.0" || p == "q=0.00"
-                });
-                if !name.is_empty() && !q0 {
-                    toks.push(name.to_string());
-                }
-            }
-        }
-        toks.sort();
-        toks.dedup();
-        let ae = toks.join(",");
+        let ae_hex = accept_encoding_key(
+            req.headers
+                .get_all("accept-encoding")
+                .iter()
+                .map(|v| v.as_bytes()),
+        );
         Ok(CacheKey::new(
             ctx.host.clone(),
-            format!("{}:ae={}:{}", req.method.as_str(), ae, uri),
+            format!("{}:ae={}:{}", req.method.as_str(), ae_hex, uri),
             "",
         ))
     }
@@ -1121,15 +1158,22 @@ impl ProxyHttp for SluiceProxy {
         // WAF (site-wide) → block matching requests. Skip all of it — including
         // the query decode — when the site has no rules (most requests).
         if !site.waf.is_empty() {
-            let raw_query = session.req_header().uri.query().unwrap_or("").to_owned();
-            let (decoded_query, stable) = decode_query(&raw_query);
             let has_query_rule = site.waf.iter().any(|r| matches!(r.field, WafField::Query));
-            // A query that won't stop decoding (over-encoded) is treated as an
-            // attack — fail closed rather than let a deeper layer slip through.
-            if has_query_rule && !stable {
-                send_status(session, 403, hsts).await?;
-                return Ok(true);
-            }
+            // Only pay for the raw-query copy + multi-round decode when a query
+            // rule actually exists (path/method/header rules don't need it).
+            let (raw_query, decoded_query) = if has_query_rule {
+                let raw = session.req_header().uri.query().unwrap_or("").to_owned();
+                let (decoded, stable) = decode_query(&raw);
+                // A query that won't stop decoding (over-encoded) is treated as an
+                // attack — fail closed rather than let a deeper layer slip through.
+                if !stable {
+                    send_status(session, 403, hsts).await?;
+                    return Ok(true);
+                }
+                (raw, decoded)
+            } else {
+                (String::new(), String::new())
+            };
             for rule in &site.waf {
                 let blocked = match &rule.field {
                     WafField::Path => rule.re.is_match(&path),
@@ -1252,11 +1296,12 @@ impl ProxyHttp for SluiceProxy {
         // member is down, fall back to the start so we still attempt one.
         let n = group.servers.len();
         let start = (ctx.lb_base + ctx.tries) % n;
+        let host = &cfg.sites[si].host;
         let mut chosen = start;
         for k in 0..n {
             let cand = (start + k) % n;
             let s = &group.servers[cand];
-            if !self.is_down(&format!("{}:{}", s.host, s.port)) {
+            if !self.is_down(host, li, &format!("{}:{}", s.host, s.port)) {
                 chosen = cand;
                 break;
             }
@@ -1606,6 +1651,41 @@ mod tests {
             Some("/etc/passwd")
         );
         assert!(normalize_path("/a\u{0}b").is_none()); // NUL rejected
+    }
+
+    #[test]
+    fn accept_encoding_key_distinguishes_qvalue_and_order() {
+        let k = |s: &str| accept_encoding_key(std::iter::once(s.as_bytes()));
+        // The reviewer's collisions: same token set, different q-weights / order,
+        // which the origin can legitimately negotiate differently. Must NOT share
+        // a key.
+        assert_ne!(k("br;q=.1, gzip;q=1"), k("br;q=1, gzip;q=.1"));
+        // q=0.000 (a valid zero weight the old parser missed) differs from no q.
+        assert_ne!(k("gzip"), k("gzip;q=0.000"));
+        // Identical bytes still collapse to one key (real cache hit).
+        assert_eq!(k("gzip, br"), k("gzip, br"));
+        // Multiple header lines are boundary-separated (not concatenated blindly).
+        let two = accept_encoding_key(["gzip".as_bytes(), "br".as_bytes()].into_iter());
+        assert_ne!(two, k("gzipbr"));
+    }
+
+    #[test]
+    fn active_health_key_separates_pools_sharing_a_backend() {
+        let addr = "10.0.0.1:8080";
+        // Same backend, different sites → independent health verdicts.
+        assert_ne!(
+            active_health_key("a.example", 0, addr),
+            active_health_key("b.example", 0, addr)
+        );
+        // Same site, different locations → independent too.
+        assert_ne!(
+            active_health_key("a.example", 0, addr),
+            active_health_key("a.example", 1, addr)
+        );
+        assert_eq!(
+            active_health_key("a.example", 0, addr),
+            active_health_key("a.example", 0, addr)
+        );
     }
 
     #[test]

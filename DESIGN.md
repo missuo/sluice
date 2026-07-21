@@ -397,18 +397,22 @@ benefit. Tracked as M5.
   SIGQUIT fd-handoff), weighted + Ketama + least-conn balancing, passive **and
   active** upstream health checks, disk-backed cache (a custom `pingora-cache`
   `Storage` with a size/count/free-space reaper), response-body rewrite
-  (`sub-filter`), and three rounds of adversarial security review + a config
-  validator that rejects unknown/mistyped/duplicate directives and type-checks
-  leaf values (integer/bool/string) at `--check` time. All verified live.
+  (`sub-filter`), four rounds of adversarial security review, and a config
+  validator that, per node, rejects unknown/duplicate directives and unknown or
+  stray properties, type-checks leaf values (integer/bool/string, rejecting
+  non-finite numbers), and checks positional-argument counts at `--check` time.
+  It is a per-node schema (not yet a single declarative table), but the covered
+  node set is now the full config surface. All verified live.
 - **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
   header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`. See
   **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items that are deliberately not
   built or blocked upstream (notAfter-based ACME renewal, HTTP/3, Rustls,
   full Lua/Rhai scripting) and why.
 
-"nginx-like general tool" is explicitly out of scope (months, not weeks). Known MVP
-gaps to revisit: rate-limiter map has no eviction (grows with distinct client IPs);
-reload does not re-read `server{}`/listeners (by design — those need a restart).
+"nginx-like general tool" is explicitly out of scope (months, not weeks). By
+design, reload does not re-read `server{}`/listeners (those need a restart). The
+rate-limiter map is swept every 10 minutes (buckets idle >10 min are dropped), so
+it does not grow unboundedly with distinct client IPs.
 
 ## 9. Risks
 

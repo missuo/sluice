@@ -17,11 +17,15 @@ cargo clippy --all-targets       # lint before committing
 ./target/release/sluice -c cfg.kdl -u                    # zero-downtime upgrade (see below)
 ```
 
-- **`cargo test`** runs a small unit suite (config parsing/validation, `parse_size`,
-  path normalization, query decode, sub-filter carry-over, Ketama distribution).
-  It is NOT end-to-end — also validate with `--check` and manual testing against a
-  local backend + a self-signed cert. Never test against a production/live host
-  unless that is explicitly the task. There is no CI workflow yet.
+- **`cargo test`** runs a unit suite (config parsing/validation + strict-schema
+  rejection, `parse_size`, path normalization, query decode, Accept-Encoding
+  cache-key isolation, active-health key scoping, sub-filter carry-over, Ketama
+  distribution). It is NOT end-to-end — also validate with `--check` and manual
+  testing against a local backend + a self-signed cert. Never test against a
+  production/live host unless that is explicitly the task.
+- **CI** (`.github/workflows/ci.yml`) runs fmt, `clippy -D warnings`, build,
+  test, a strict `--check` on the self-contained `examples/smoke.kdl` (must exit
+  0), and a schema-regression grep over the full `examples/sluice.kdl`.
 - The **BoringSSL** feature (`boring-sys`) needs extra tools beyond a C toolchain
   on a fresh Debian: `git golang-go nasm ninja-build`.
 

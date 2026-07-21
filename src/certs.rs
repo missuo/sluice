@@ -50,6 +50,19 @@ impl Cert {
         let k = std::fs::read(key_path).map_err(|e| format!("{key_path}: {e}"))?;
         Cert::from_pem(&c, &k)
     }
+
+    /// Load a cert+chain and its private key from a single combined PEM buffer
+    /// (concatenated PRIVATE KEY + CERTIFICATE blocks). The ACME store persists
+    /// each cert as one file so publishing is a single atomic rename — there is
+    /// no window where a fresh key is paired with a stale certificate.
+    pub fn from_combined_pem(pem: &[u8]) -> Result<Cert, String> {
+        Cert::from_pem(pem, pem)
+    }
+
+    pub fn from_combined_file(path: &str) -> Result<Cert, String> {
+        let b = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        Cert::from_combined_pem(&b)
+    }
 }
 
 /// SNI hostname → cert. The first-inserted cert is the fallback for an unknown SNI.
@@ -138,5 +151,35 @@ impl TlsAccept for DynamicCert {
                 "tls: no certificate for SNI {sni:?} (and no fallback); handshake will fail"
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A self-signed P-256 cert + its key (CN=combined.test). Only used to prove
+    // the PEM *parsing* works — `from_combined_pem` checks the key matches the
+    // cert, not that the cert is unexpired, so expiry is irrelevant here.
+    const KEY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgiA8cUWegRzXpawhI\neFydTRVo8XZtftk6JVs188iFnD+hRANCAAR1ETweKF6kwa1+xSYIYY4xqmzd5C/a\nzSuE7b+1Ttbj/aVo080GbqY3HAim/bruu0QmzMK3sVAghAJ5w3CdBMZF\n-----END PRIVATE KEY-----\n";
+    const CERT_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBhDCCASugAwIBAgIUY2qpVCvSrv2kWbErBo0p+mjSMXIwCgYIKoZIzj0EAwIw\nGDEWMBQGA1UEAwwNY29tYmluZWQudGVzdDAeFw0yNjA3MjEwNTQ3MjdaFw0yNjA3\nMjMwNTQ3MjdaMBgxFjAUBgNVBAMMDWNvbWJpbmVkLnRlc3QwWTATBgcqhkjOPQIB\nBggqhkjOPQMBBwNCAAR1ETweKF6kwa1+xSYIYY4xqmzd5C/azSuE7b+1Ttbj/aVo\n080GbqY3HAim/bruu0QmzMK3sVAghAJ5w3CdBMZFo1MwUTAdBgNVHQ4EFgQUJ9Xi\nYOgnJn8BV/yHfFoRm1GBRN0wHwYDVR0jBBgwFoAUJ9XiYOgnJn8BV/yHfFoRm1GB\nRN0wDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNHADBEAiAa6hsc1tumjZ47\nCI6cmgo0rMMBB4g43NcZPlpVUCr4FAIgXv8E0zt+D/AOpzdcFXNp/YdsL+H87Cmj\nRaa4N45/YA0=\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn combined_pem_loads_cert_and_key_from_one_buffer() {
+        // publish_cert writes key then cert into one file; from_combined_pem must
+        // read both back and confirm they're a matching pair.
+        let combined = format!("{KEY_PEM}\n{CERT_PEM}");
+        Cert::from_combined_pem(combined.as_bytes())
+            .expect("combined key+cert PEM should load as a matching pair");
+        // Order-independence: cert-then-key must work too.
+        let reversed = format!("{CERT_PEM}\n{KEY_PEM}");
+        Cert::from_combined_pem(reversed.as_bytes()).expect("cert-then-key order should also load");
+    }
+
+    #[test]
+    fn mismatched_pair_is_rejected() {
+        // A cert with no matching key in the buffer must fail (guards against the
+        // old two-file scheme's new-key+old-cert hazard).
+        assert!(Cert::from_combined_pem(CERT_PEM.as_bytes()).is_err());
     }
 }

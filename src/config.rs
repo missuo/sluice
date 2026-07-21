@@ -456,9 +456,54 @@ impl Ty {
     fn matches(self, v: &kdl::KdlValue) -> bool {
         match self {
             Ty::Int => v.as_integer().is_some(),
-            Ty::Num => v.as_integer().is_some() || v.as_float().is_some(),
+            // Reject non-finite floats (`1.0e999` parses to +inf): they'd silently
+            // become an unbounded rate limit / burst.
+            Ty::Num => {
+                v.as_integer().is_some() || v.as_float().map(f64::is_finite).unwrap_or(false)
+            }
             Ty::Bool => v.as_bool().is_some(),
             Ty::Str => v.as_string().is_some(),
+        }
+    }
+}
+
+/// Count a node's positional (unnamed) entries — its arguments, not its `k=v`
+/// properties.
+fn positional_count(node: &KdlNode) -> usize {
+    node.entries().iter().filter(|e| e.name().is_none()).count()
+}
+
+/// Error if a node's positional-argument count isn't in `min..=max`. Catches a
+/// stray extra arg like `listener "a" "b"` or `max-body "1mb" "2mb"`.
+fn check_arg_count(node: &KdlNode, ctx: &str, min: usize, max: usize, errs: &mut Vec<String>) {
+    let n = positional_count(node);
+    if n < min || n > max {
+        let want = if min == max {
+            format!("exactly {min}")
+        } else {
+            format!("{min} to {max}")
+        };
+        errs.push(format!("{ctx}: expected {want} argument(s), found {n}"));
+    }
+}
+
+/// Reject `key=value` properties on any value-only child of `node` (i.e. a child
+/// whose name is NOT in `prop_bearing`). Catches `threads 2 typo=true`.
+fn reject_child_leaf_props(
+    node: &KdlNode,
+    ctx: &str,
+    prop_bearing: &[&str],
+    errs: &mut Vec<String>,
+) {
+    if let Some(ch) = node.children() {
+        for c in ch.nodes() {
+            let cn = c.name().value();
+            if prop_bearing.contains(&cn) {
+                continue;
+            }
+            if c.entries().iter().any(|e| e.name().is_some()) {
+                errs.push(format!("{ctx}: `{cn}` takes no properties"));
+            }
         }
     }
 }
@@ -675,19 +720,18 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
         }
         match name {
             "server" => {
-                reject_unknown_children(
-                    node,
-                    "server",
-                    &[
-                        "threads",
-                        "metrics-addr",
-                        "grace-period-secs",
-                        "graceful-shutdown-secs",
-                        "upstream-keepalive-pool",
-                        "upgrade-sock",
-                    ],
-                    errs,
-                );
+                const SERVER_LEAVES: &[&str] = &[
+                    "threads",
+                    "metrics-addr",
+                    "grace-period-secs",
+                    "graceful-shutdown-secs",
+                    "upstream-keepalive-pool",
+                    "upgrade-sock",
+                ];
+                reject_unknown_props(node, "server", &[], errs);
+                reject_unknown_children(node, "server", SERVER_LEAVES, errs);
+                reject_dup_children(node, "server", SERVER_LEAVES, errs);
+                reject_child_leaf_props(node, "server", &[], errs);
                 check_child_types(
                     node,
                     "server",
@@ -703,28 +747,26 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
                 );
             }
             "client-ip" => {
-                reject_unknown_children(
-                    node,
-                    "client-ip",
-                    &["trusted-header", "trusted-proxies"],
-                    errs,
-                );
+                const CIP_LEAVES: &[&str] = &["trusted-header", "trusted-proxies"];
+                reject_unknown_props(node, "client-ip", &[], errs);
+                reject_unknown_children(node, "client-ip", CIP_LEAVES, errs);
+                reject_dup_children(node, "client-ip", CIP_LEAVES, errs);
+                reject_child_leaf_props(node, "client-ip", &[], errs);
                 check_child_types(node, "client-ip", &[("trusted-header", Ty::Str)], errs);
             }
             "geoip" => {
-                reject_unknown_children(
-                    node,
-                    "geoip",
-                    &[
-                        "enabled",
-                        "country-header",
-                        "mmdb-asn",
-                        "mmdb-city",
-                        "log-fields",
-                        "metric-labels",
-                    ],
-                    errs,
-                );
+                const GEOIP_LEAVES: &[&str] = &[
+                    "enabled",
+                    "country-header",
+                    "mmdb-asn",
+                    "mmdb-city",
+                    "log-fields",
+                    "metric-labels",
+                ];
+                reject_unknown_props(node, "geoip", &[], errs);
+                reject_unknown_children(node, "geoip", GEOIP_LEAVES, errs);
+                reject_dup_children(node, "geoip", GEOIP_LEAVES, errs);
+                reject_child_leaf_props(node, "geoip", &[], errs);
                 check_child_types(
                     node,
                     "geoip",
@@ -738,31 +780,47 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
                 );
             }
             "acme" => {
-                reject_unknown_children(
-                    node,
-                    "acme",
-                    &["enabled", "contact", "staging", "cache-dir"],
-                    errs,
-                );
+                const ACME_LEAVES: &[&str] = &["enabled", "contact", "staging", "cache-dir"];
+                reject_unknown_props(node, "acme", &[], errs);
+                reject_unknown_children(node, "acme", ACME_LEAVES, errs);
+                reject_dup_children(node, "acme", ACME_LEAVES, errs);
+                reject_child_leaf_props(node, "acme", &[], errs);
                 check_child_types(
                     node,
                     "acme",
                     &[
                         ("enabled", Ty::Bool),
                         ("staging", Ty::Bool),
+                        ("contact", Ty::Str),
                         ("cache-dir", Ty::Str),
                     ],
                     errs,
                 );
             }
-            "cache-store" => reject_unknown_children(
-                node,
-                "cache-store",
-                &["dir", "max-size", "max-files", "min-free"],
-                errs,
-            ),
+            "cache-store" => {
+                const CS_LEAVES: &[&str] = &["dir", "max-size", "max-files", "min-free"];
+                reject_unknown_props(node, "cache-store", &[], errs);
+                reject_unknown_children(node, "cache-store", CS_LEAVES, errs);
+                reject_dup_children(node, "cache-store", CS_LEAVES, errs);
+                reject_child_leaf_props(node, "cache-store", &[], errs);
+                check_child_types(
+                    node,
+                    "cache-store",
+                    &[
+                        ("dir", Ty::Str),
+                        ("max-size", Ty::Str),
+                        ("max-files", Ty::Int),
+                        ("min-free", Ty::Str),
+                    ],
+                    errs,
+                );
+            }
             "defaults" => {
-                reject_unknown_children(node, "defaults", &["hsts", "unknown-host"], errs);
+                const DEF_LEAVES: &[&str] = &["hsts", "unknown-host"];
+                reject_unknown_props(node, "defaults", &[], errs);
+                reject_unknown_children(node, "defaults", DEF_LEAVES, errs);
+                reject_dup_children(node, "defaults", DEF_LEAVES, errs);
+                reject_child_leaf_props(node, "defaults", &[], errs);
                 check_child_types(
                     node,
                     "defaults",
@@ -770,16 +828,21 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
                     errs,
                 );
             }
-            "alias" => reject_unknown_props(node, "alias", &["prefix"], errs),
+            "alias" => {
+                check_arg_count(node, "alias", 0, 0, errs);
+                reject_unknown_props(node, "alias", &["prefix"], errs);
+                check_prop_types(node, "alias", &[("prefix", Ty::Str)], errs);
+            }
             "listener" => {
-                // A listener takes only its bind-address argument — reject `typo=true`.
+                const LIS_LEAVES: &[&str] = &["http2", "tls", "redirect-to-https"];
+                // A listener takes only its bind-address argument — reject
+                // `typo=true` and a stray second positional.
+                check_arg_count(node, "listener", 1, 1, errs);
                 reject_unknown_props(node, "listener", &[], errs);
-                reject_unknown_children(
-                    node,
-                    "listener",
-                    &["http2", "tls", "redirect-to-https"],
-                    errs,
-                );
+                reject_unknown_children(node, "listener", LIS_LEAVES, errs);
+                reject_dup_children(node, "listener", LIS_LEAVES, errs);
+                // `tls` bears properties; http2/redirect-to-https are value-only.
+                reject_child_leaf_props(node, "listener", &["tls"], errs);
                 check_child_types(
                     node,
                     "listener",
@@ -791,6 +854,17 @@ fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
                         tls,
                         "listener tls",
                         &["cert", "key", "cert-dir", "acme"],
+                        errs,
+                    );
+                    check_prop_types(
+                        tls,
+                        "listener tls",
+                        &[
+                            ("cert", Ty::Str),
+                            ("key", Ty::Str),
+                            ("cert-dir", Ty::Str),
+                            ("acme", Ty::Bool),
+                        ],
                         errs,
                     );
                 }
@@ -864,7 +938,9 @@ fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
     let host = first_arg(node).unwrap_or("?");
     let ctx = format!("site `{host}`");
     reject_unknown_children(node, &ctx, SITE_CHILDREN, errs);
-    // A site takes only a host argument — reject stray props like `typo=true`.
+    // A site takes exactly one host argument — reject stray props like
+    // `typo=true` and a stray second positional.
+    check_arg_count(node, &ctx, 1, 1, errs);
     reject_unknown_props(node, &ctx, &[], errs);
     reject_dup_children(node, &ctx, SINGLE_HANDLER_CHILDREN, errs);
     check_child_types(node, &ctx, HANDLER_FIELD_TYPES, errs);
@@ -876,7 +952,9 @@ fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
             "location" => {
                 let lctx = format!("{ctx} location");
                 reject_unknown_children(n, &lctx, LOCATION_CHILDREN, errs);
-                // A location takes only a matcher argument — reject `typo=true`.
+                // A location takes exactly one matcher argument — reject
+                // `typo=true` and a stray second positional.
+                check_arg_count(n, &lctx, 1, 1, errs);
                 reject_unknown_props(n, &lctx, &[], errs);
                 reject_dup_children(n, &lctx, SINGLE_HANDLER_CHILDREN, errs);
                 check_child_types(n, &lctx, HANDLER_FIELD_TYPES, errs);
@@ -885,6 +963,7 @@ fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
                         let cn = c.name().value();
                         if VALUE_ONLY_LEAVES.contains(&cn) {
                             reject_unknown_props(c, &format!("{lctx} {cn}"), &[], errs);
+                            check_arg_count(c, &format!("{lctx} {cn}"), 1, 1, errs);
                         }
                     }
                 }
@@ -895,6 +974,7 @@ fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
             name if VALUE_ONLY_LEAVES.contains(&name) => {
                 // e.g. `max-body "10mb" typo=true` — the leaf takes only its value.
                 reject_unknown_props(n, &format!("{ctx} {name}"), &[], errs);
+                check_arg_count(n, &format!("{ctx} {name}"), 1, 1, errs);
             }
             _ => {}
         }
@@ -930,12 +1010,14 @@ fn validate_backend_unknowns(node: &KdlNode, ctx: &str, errs: &mut Vec<String>) 
 fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
     match n.name().value() {
         "upstream" => {
-            reject_unknown_children(
-                n,
-                &format!("{ctx} upstream"),
-                &["server", "balance", "health-check"],
-                errs,
-            );
+            let uctx = format!("{ctx} upstream");
+            reject_unknown_props(n, &uctx, &[], errs);
+            reject_unknown_children(n, &uctx, &["server", "balance", "health-check"], errs);
+            // `server` repeats; `balance`/`health-check` are singletons.
+            reject_dup_children(n, &uctx, &["balance", "health-check"], errs);
+            // `balance` is a value-only leaf; `server` bears `weight`.
+            reject_child_leaf_props(n, &uctx, &["server", "health-check"], errs);
+            check_child_types(n, &uctx, &[("balance", Ty::Str)], errs);
             if let Some(ch) = n.children() {
                 for s in ch.nodes().iter().filter(|x| x.name().value() == "server") {
                     reject_unknown_props(s, &format!("{ctx} upstream server"), &["weight"], errs);
@@ -948,20 +1030,19 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
                 }
             }
             if let Some(hc) = child(n, "health-check") {
+                const HC_LEAVES: &[&str] = &[
+                    "path",
+                    "interval-secs",
+                    "timeout-secs",
+                    "healthy",
+                    "unhealthy",
+                    "expect-status",
+                ];
                 let hctx = format!("{ctx} health-check");
-                reject_unknown_children(
-                    hc,
-                    &hctx,
-                    &[
-                        "path",
-                        "interval-secs",
-                        "timeout-secs",
-                        "healthy",
-                        "unhealthy",
-                        "expect-status",
-                    ],
-                    errs,
-                );
+                reject_unknown_props(hc, &hctx, &[], errs);
+                reject_unknown_children(hc, &hctx, HC_LEAVES, errs);
+                reject_dup_children(hc, &hctx, HC_LEAVES, errs);
+                reject_child_leaf_props(hc, &hctx, &[], errs);
                 check_child_types(
                     hc,
                     &hctx,
@@ -980,6 +1061,7 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
         "file-server" => {
             let fctx = format!("{ctx} file-server");
             reject_unknown_children(n, &fctx, &["root", "index"], errs);
+            reject_dup_children(n, &fctx, &["root", "index"], errs);
             reject_unknown_props(n, &fctx, &[], errs);
             check_child_types(n, &fctx, &[("root", Ty::Str), ("index", Ty::Str)], errs);
             // `root "/tmp" typo=true` — root/index take only their value.
@@ -993,15 +1075,14 @@ fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
             }
         }
         "cache" => {
-            reject_unknown_children(
-                n,
-                &format!("{ctx} cache"),
-                &["ttl-secs", "max-object"],
-                errs,
-            );
+            let cctx = format!("{ctx} cache");
+            reject_unknown_props(n, &cctx, &[], errs);
+            reject_unknown_children(n, &cctx, &["ttl-secs", "max-object"], errs);
+            reject_dup_children(n, &cctx, &["ttl-secs", "max-object"], errs);
+            reject_child_leaf_props(n, &cctx, &[], errs);
             check_child_types(
                 n,
-                &format!("{ctx} cache"),
+                &cctx,
                 &[("ttl-secs", Ty::Int), ("max-object", Ty::Str)],
                 errs,
             );
@@ -1908,6 +1989,54 @@ mod tests {
             "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream {\n server \"127.0.0.1:9\" weight=5000\n balance \"ketama\"\n }\n}\n",
         );
         assert!(e.contains("weight must be 1..=1000"), "{e}");
+    }
+
+    // A minimal valid config the strict-schema tests can splice a bad line into.
+    fn cfg_with(site_body: &str) -> String {
+        format!(
+            "listener \"0.0.0.0:80\" {{\n redirect-to-https true\n}}\nsite \"x\" {{\n{site_body}\n}}\n"
+        )
+    }
+
+    #[test]
+    fn strict_schema_rejects_stray_props_and_dups() {
+        // Props on value-only leaves / blocks.
+        assert!(parse_err("server {\n threads 2 typo=true\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("takes no properties"));
+        assert!(parse_err(&cfg_with(
+            " max-body \"1MiB\" typo=true\n upstream \"127.0.0.1:9\""
+        ))
+        .contains("property"));
+        assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:9\" typo=true"))
+            .contains("unknown property"));
+        // Duplicate singleton leaves / blocks.
+        assert!(parse_err("server {\n threads 2\n threads 4\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("given more than once"));
+        assert!(parse_err(&cfg_with(
+            " websocket true\n websocket true\n upstream \"127.0.0.1:9\""
+        ))
+        .contains("given more than once"));
+        assert!(parse_err(&cfg_with(
+            " cache {\n ttl-secs 1\n ttl-secs 2\n}\n upstream \"127.0.0.1:9\""
+        ))
+        .contains("given more than once"));
+        assert!(parse_err(&cfg_with(
+            " upstream {\n server \"127.0.0.1:9\"\n balance \"random\"\n balance \"ketama\"\n }"
+        ))
+        .contains("given more than once"));
+    }
+
+    #[test]
+    fn strict_schema_rejects_bad_args_and_nonfinite() {
+        // Extra positional argument.
+        assert!(parse_err(&cfg_with(
+            " max-body \"1mb\" \"2mb\"\n upstream \"127.0.0.1:9\""
+        ))
+        .contains("argument"));
+        assert!(parse_err("listener \"0.0.0.0:80\" \"extra\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n").contains("argument"));
+        // Non-finite float in a numeric prop must not silently become +inf.
+        assert!(parse_err(&cfg_with(
+            " upstream \"127.0.0.1:9\"\n rate-limit rps=1.0e999 burst=1.0e999"
+        ))
+        .contains("must be a number"));
     }
 
     #[test]

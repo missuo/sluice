@@ -1,0 +1,61 @@
+// Self-contained smoke config for CI: references NO external files (TLS is via
+// ACME, which needs no cert files on disk at check time; no static roots), so
+// `sluice --check` on it must exit 0. This catches KDL syntax errors, panics,
+// and schema regressions that the full example (which legitimately points at
+// absent cert/static paths) can't assert on.
+
+server {
+    threads 2
+}
+
+client-ip {
+    trusted-header "cf-connecting-ip"
+    trusted-proxies "173.245.48.0/20"
+}
+
+acme {
+    contact "ops@smoke.example"
+    staging true
+}
+
+listener "0.0.0.0:80" {
+    redirect-to-https true
+}
+
+listener "0.0.0.0:443" {
+    http2 true
+    tls acme=true
+}
+
+site "smoke.example" {
+    acme true
+    max-body "8MiB"
+    rate-limit rps=50 burst=100
+
+    location "/api" {
+        upstream {
+            server "127.0.0.1:9001" weight=2
+            server "127.0.0.1:9002"
+            balance "least-conn"
+            health-check {
+                path "/healthz"
+                interval-secs 5
+                healthy 2
+                unhealthy 3
+                expect-status 200
+            }
+        }
+        cache {
+            ttl-secs 30
+            max-object "1MiB"
+        }
+    }
+
+    location "/" {
+        upstream "127.0.0.1:9000"
+    }
+
+    waf {
+        block field="query" match=r"(?i)union\s+select"
+    }
+}
