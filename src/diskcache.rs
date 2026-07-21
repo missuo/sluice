@@ -80,7 +80,10 @@ impl DiskCache {
     fn paths(&self, hash: &str) -> (PathBuf, PathBuf) {
         // `combined()` is a 32-char hex string, so [0..4] is always present.
         let dir = self.root.join(&hash[0..2]).join(&hash[2..4]);
-        (dir.join(format!("{hash}.meta")), dir.join(format!("{hash}.body")))
+        (
+            dir.join(format!("{hash}.meta")),
+            dir.join(format!("{hash}.body")),
+        )
     }
 }
 
@@ -95,7 +98,11 @@ struct DiskHit {
 #[async_trait]
 impl HandleHit for DiskHit {
     async fn read_body(&mut self) -> Result<Option<Bytes>> {
-        let n = self.file.read(&mut self.buf).await.map_err(err("disk cache read"))?;
+        let n = self
+            .file
+            .read(&mut self.buf)
+            .await
+            .map_err(err("disk cache read"))?;
         if n == 0 {
             Ok(None)
         } else {
@@ -141,14 +148,19 @@ struct DiskMiss {
 impl HandleMiss for DiskMiss {
     async fn write_body(&mut self, data: Bytes, _eof: bool) -> Result<()> {
         if let Some(f) = self.file.as_mut() {
-            f.write_all(&data).await.map_err(err("disk cache write body"))?;
+            f.write_all(&data)
+                .await
+                .map_err(err("disk cache write body"))?;
             self.written += data.len();
         }
         Ok(())
     }
 
     async fn finish(mut self: Box<Self>) -> Result<MissFinishType> {
-        let mut f = self.file.take().ok_or_else(|| Error::new_str("disk cache: miss handler already finished"))?;
+        let mut f = self
+            .file
+            .take()
+            .ok_or_else(|| Error::new_str("disk cache: miss handler already finished"))?;
         f.flush().await.map_err(err("disk cache flush"))?;
         let _ = f.sync_all().await; // best-effort durability
         drop(f);
@@ -160,8 +172,12 @@ impl HandleMiss for DiskMiss {
         // by a concurrent writer of a different size.
         let blob = encode_meta(self.written as u64, &self.meta_internal, &self.meta_header);
         let meta_tmp = tmp_sibling(&self.meta_path);
-        tokio::fs::write(&meta_tmp, &blob).await.map_err(err("disk cache write meta"))?;
-        tokio::fs::rename(&meta_tmp, &self.meta_path).await.map_err(err("disk cache publish meta"))?;
+        tokio::fs::write(&meta_tmp, &blob)
+            .await
+            .map_err(err("disk cache write meta"))?;
+        tokio::fs::rename(&meta_tmp, &self.meta_path)
+            .await
+            .map_err(err("disk cache publish meta"))?;
         self.done = true;
         Ok(MissFinishType::Created(self.written))
     }
@@ -202,7 +218,11 @@ impl Storage for DiskCache {
         if actual != body_size {
             return Ok(None);
         }
-        let hit = DiskHit { file, buf: vec![0u8; 64 * 1024], weight: actual as usize };
+        let hit = DiskHit {
+            file,
+            buf: vec![0u8; 64 * 1024],
+            weight: actual as usize,
+        };
         Ok(Some((meta, Box::new(hit))))
     }
 
@@ -214,11 +234,15 @@ impl Storage for DiskCache {
     ) -> Result<MissHandler> {
         let (meta_p, body_p) = self.paths(&key.combined());
         if let Some(dir) = body_p.parent() {
-            tokio::fs::create_dir_all(dir).await.map_err(err("disk cache mkdir"))?;
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(err("disk cache mkdir"))?;
         }
         let (meta_internal, meta_header) = meta.serialize()?;
         let tmp_body = tmp_sibling(&body_p);
-        let file = tokio::fs::File::create(&tmp_body).await.map_err(err("disk cache create body"))?;
+        let file = tokio::fs::File::create(&tmp_body)
+            .await
+            .map_err(err("disk cache create body"))?;
         Ok(Box::new(DiskMiss {
             file: Some(file),
             tmp_body,
@@ -252,11 +276,18 @@ impl Storage for DiskCache {
         let (meta_p, body_p) = self.paths(&key.combined());
         let (i, h) = meta.serialize()?;
         // Body is unchanged on a revalidation — preserve its size in the new meta.
-        let body_size = tokio::fs::metadata(&body_p).await.map(|m| m.len()).unwrap_or(0);
+        let body_size = tokio::fs::metadata(&body_p)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         let blob = encode_meta(body_size, &i, &h);
         let tmp = tmp_sibling(&meta_p);
-        tokio::fs::write(&tmp, &blob).await.map_err(err("disk cache update meta"))?;
-        tokio::fs::rename(&tmp, &meta_p).await.map_err(err("disk cache publish meta"))?;
+        tokio::fs::write(&tmp, &blob)
+            .await
+            .map_err(err("disk cache update meta"))?;
+        tokio::fs::rename(&tmp, &meta_p)
+            .await
+            .map_err(err("disk cache publish meta"))?;
         Ok(true)
     }
 
@@ -280,7 +311,9 @@ type Entry = (PathBuf, u64, SystemTime, bool); // (path, size, mtime, is_tmp)
 /// reclaims a previous run's files so the bound survives restarts.
 pub fn spawn_reaper(root: PathBuf, max_size: u64, max_files: u64, min_free: u64) {
     std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(10));
+        // 30s balances the enforcement window against the cost of the full
+        // directory walk+sort (which grows with the file count).
+        std::thread::sleep(Duration::from_secs(30));
         reap(&root, max_size, max_files, min_free);
     });
 }
@@ -296,7 +329,10 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
     //    temp is an in-progress write and is kept (but still counted).
     entries.retain(|(p, sz, mtime, is_tmp)| {
         let stale = *is_tmp
-            && now.duration_since(*mtime).map(|d| d > Duration::from_secs(300)).unwrap_or(false);
+            && now
+                .duration_since(*mtime)
+                .map(|d| d > Duration::from_secs(300))
+                .unwrap_or(false);
         if stale {
             if std::fs::remove_file(p).is_ok() {
                 total_size = total_size.saturating_sub(*sz);
@@ -316,6 +352,12 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
     let size_target = max_size / 10 * 9;
     let count_target = max_files / 10 * 9;
     let mut to_free_for_space = min_free.saturating_sub(avail);
+    // If freeing the ENTIRE cache still wouldn't reach min_free, the floor is
+    // unachievable (other data on the volume holds the space) — don't pointlessly
+    // wipe the whole cache; just enforce the size/count caps.
+    if to_free_for_space > total_size {
+        to_free_for_space = 0;
+    }
     for (p, sz, _, is_tmp) in entries {
         if total_size <= size_target && count <= count_target && to_free_for_space == 0 {
             break;
@@ -332,7 +374,9 @@ fn reap(root: &Path, max_size: u64, max_files: u64, min_free: u64) {
 }
 
 fn collect(dir: &Path, out: &mut Vec<Entry>, total: &mut u64) {
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for e in rd.flatten() {
         let p = e.path();
         let Ok(ft) = e.file_type() else { continue };
@@ -340,9 +384,16 @@ fn collect(dir: &Path, out: &mut Vec<Entry>, total: &mut u64) {
             collect(&p, out, total);
         } else if let Ok(md) = e.metadata() {
             // Count temp files too (so slow/leaked writes can't hide from the cap).
-            let is_tmp = p.to_string_lossy().contains(".tmp.");
+            // Check the file NAME, not the full path — the cache root could itself
+            // contain ".tmp." and must not make every file look temporary.
+            let is_tmp = e.file_name().to_string_lossy().contains(".tmp.");
             *total += md.len();
-            out.push((p, md.len(), md.modified().unwrap_or(SystemTime::UNIX_EPOCH), is_tmp));
+            out.push((
+                p,
+                md.len(),
+                md.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+                is_tmp,
+            ));
         }
     }
 }

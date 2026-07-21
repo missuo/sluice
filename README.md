@@ -15,7 +15,10 @@ against live Let's Encrypt (staging + production).
 - **`sluice --check`** — syntax (`line:col`) + semantic validation (unknown
   directives, missing/duplicate fields, bad regex, missing cert/mmdb files).
 - **Hot reload on SIGHUP** — re-parses the file and atomically swaps; a bad edit
-  is rejected and the running config is kept (never takes the proxy down).
+  is rejected and the running config is kept (never takes the proxy down). This
+  covers the request path (sites, routing, upstreams, WAF, rate limits, GeoIP);
+  **listeners/TLS, `cert-dir`, `cache-store`, ACME, and `server{}` are fixed at
+  startup** and need a restart to change (see DESIGN.md §3).
 - Host-routed **sites**, then **path-routed `location` blocks** (prefix or
   `~regex`, first match wins) — nginx-style routing to different backends per path.
 - **Load-balanced upstream pools**: `upstream { server …; server …; balance … }`
@@ -47,8 +50,10 @@ against live Let's Encrypt (staging + production).
   A single `cert`/`key`, **dynamic SNI certs** (`tls cert-dir="…"`), or
   **auto-TLS via ACME/Let's Encrypt** (`tls acme=true` + an `acme {}` block,
   HTTP-01, like Caddy — for domains that resolve directly to the server with :80
-  open; behind Cloudflare use an Origin CA cert instead). Certs hot-swap at
-  runtime via the TLS callback — no restart. Auto-TLS is **verified end-to-end
+  open; behind Cloudflare use an Origin CA cert instead). ACME-renewed certs
+  hot-swap at runtime via the TLS callback — no restart. (`cert-dir` and single
+  `cert`/`key` files are read once at startup; rotating them needs a restart.)
+  Auto-TLS is **verified end-to-end
   against live Let's Encrypt** (staging and production): a browser-trusted cert
   issues over HTTP-01 with zero manual steps and is served by SNI at runtime.
 - **HTTPS upstreams** (`upstream "https://api.openai.com"`): TLS + SNI + cert
@@ -65,7 +70,7 @@ against live Let's Encrypt (staging + production).
 - **GeoIP**: country from the `CF-IPCountry` header (free) + optional **MaxMind
   ASN/city** (`maxminddb`); enriches the access log per `log-fields`; country as a
   Prometheus label.
-- **Prometheus** metrics + structured **access log**.
+- **Prometheus** metrics + a per-request **access log** (text; JSON is on the roadmap).
 - Multi-core, graceful drain on SIGTERM, upstream keepalive pool.
 - **Zero-downtime binary upgrade** (Pingora fd handoff): with an `upgrade-sock`
   set, start the new binary with `-u` (it takes over the listening sockets from
@@ -83,7 +88,7 @@ Legend: ✅ built-in · 🔌 plugin/module · 💰 paid tier only · ❌ not ava
 | Feature | Sluice | nginx (OSS) | Caddy |
 | --- | :---: | :---: | :---: |
 | Written in | Rust (Pingora) | C | Go |
-| Single static binary | ✅ | ✅ | ✅ |
+| Single binary (dynamically links libc) | ✅ | ✅ | ✅ |
 | Config format | KDL | custom DSL | Caddyfile / JSON |
 | Config validation | ✅ semantic + `line:col` | ✅ syntax (`-t`) | ✅ |
 | Hot config reload | ✅ SIGHUP, fail-safe | ✅ SIGHUP | ✅ (API) |

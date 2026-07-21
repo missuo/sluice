@@ -1,9 +1,11 @@
 //! KDL config: parse `sluice.kdl` into a validated `Config`.
 //!
-//! Reads like nginx (brace blocks, directives), whitespace-insensitive, with
-//! `line:col`-precise diagnostics from the `kdl` crate. `Config::parse` does
-//! syntax + semantic validation; `sluice --check` and the (future) hot-reload
-//! path both go through it, so a bad edit never reaches a running proxy.
+//! Reads like nginx (brace blocks, directives), whitespace-insensitive. Syntax
+//! errors carry `line:col` (from the `kdl` crate); semantic errors are keyed by
+//! the offending block/host. `Config::parse` does syntax + semantic validation
+//! (including rejecting unknown/mistyped directives inside blocks), and both
+//! `sluice --check` and hot-reload go through it, so a bad edit never reaches a
+//! running proxy.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -19,12 +21,28 @@ use regex::Regex;
 /// `access cloudflare-only`.
 pub static CF_RANGES: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
     const CIDRS: &[&str] = &[
-        "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-        "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
-        "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-        "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22", "2400:cb00::/32",
-        "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32",
-        "2a06:98c0::/29", "2c0f:f248::/32",
+        "173.245.48.0/20",
+        "103.21.244.0/22",
+        "103.22.200.0/22",
+        "103.31.4.0/22",
+        "141.101.64.0/18",
+        "108.162.192.0/18",
+        "190.93.240.0/20",
+        "188.114.96.0/20",
+        "197.234.240.0/22",
+        "198.41.128.0/17",
+        "162.158.0.0/15",
+        "104.16.0.0/13",
+        "104.24.0.0/14",
+        "172.64.0.0/13",
+        "131.0.72.0/22",
+        "2400:cb00::/32",
+        "2606:4700::/32",
+        "2803:f800::/32",
+        "2405:b500::/32",
+        "2405:8100::/32",
+        "2a06:98c0::/29",
+        "2c0f:f248::/32",
     ];
     CIDRS.iter().filter_map(|s| s.parse().ok()).collect()
 });
@@ -120,12 +138,21 @@ pub struct Listener {
 
 #[derive(Debug, Clone)]
 pub enum ListenerKind {
-    Tls { cert: String, key: String, http2: bool },
+    Tls {
+        cert: String,
+        key: String,
+        http2: bool,
+    },
     /// SNI-based certs loaded from a directory (`<host>.crt`/`<host>.key`),
     /// served via Pingora's TLS callback and hot-swappable.
-    TlsDynamic { cert_dir: String, http2: bool },
+    TlsDynamic {
+        cert_dir: String,
+        http2: bool,
+    },
     /// Certs auto-provisioned via ACME (needs a top-level `acme {}` block).
-    TlsAcme { http2: bool },
+    TlsAcme {
+        http2: bool,
+    },
     RedirectHttps,
 }
 
@@ -364,7 +391,10 @@ fn prop_bool(node: &KdlNode, key: &str) -> Option<bool> {
     node.get(key).and_then(|v| v.as_bool())
 }
 fn child<'a>(node: &'a KdlNode, name: &str) -> Option<&'a KdlNode> {
-    node.children()?.nodes().iter().find(|n| n.name().value() == name)
+    node.children()?
+        .nodes()
+        .iter()
+        .find(|n| n.name().value() == name)
 }
 fn child_arg<'a>(node: &'a KdlNode, name: &str) -> Option<&'a str> {
     first_arg(child(node, name)?)
@@ -374,6 +404,36 @@ fn child_int(node: &KdlNode, name: &str) -> Option<i128> {
 }
 fn child_bool(node: &KdlNode, name: &str) -> Option<bool> {
     first_arg_bool(child(node, name)?)
+}
+/// A numeric property that accepts both integers and floats (e.g. `rps=0.5`).
+fn prop_f64(node: &KdlNode, key: &str) -> Option<f64> {
+    let v = node.get(key)?;
+    v.as_float().or_else(|| v.as_integer().map(|i| i as f64))
+}
+
+/// Push an error for any child directive whose name isn't in `allowed` — so a
+/// typo (`threds`, `cahce`, `interval-sec`) is a config error, not a silent
+/// no-op. This is the nested-block equivalent of the top-level unknown check.
+fn reject_unknown_children(node: &KdlNode, ctx: &str, allowed: &[&str], errs: &mut Vec<String>) {
+    if let Some(ch) = node.children() {
+        for n in ch.nodes() {
+            let name = n.name().value();
+            if !allowed.contains(&name) {
+                errs.push(format!("{ctx}: unknown directive `{name}`"));
+            }
+        }
+    }
+}
+/// Push an error for any `key=value` property whose key isn't in `allowed`.
+fn reject_unknown_props(node: &KdlNode, ctx: &str, allowed: &[&str], errs: &mut Vec<String>) {
+    for e in node.entries() {
+        if let Some(k) = e.name() {
+            let name = k.value();
+            if !allowed.contains(&name) {
+                errs.push(format!("{ctx}: unknown property `{name}`"));
+            }
+        }
+    }
 }
 
 /// `32MiB` / `1024` / `512KB` -> bytes.
@@ -396,11 +456,19 @@ fn parse_size(s: &str) -> Result<u64, String> {
     } else {
         (s, 1)
     };
-    let v: u64 = num.trim().parse().map_err(|_| format!("invalid size {s:?}"))?;
-    v.checked_mul(mult).ok_or_else(|| format!("size {s:?} overflows u64"))
+    let v: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid size {s:?}"))?;
+    v.checked_mul(mult)
+        .ok_or_else(|| format!("size {s:?} overflows u64"))
 }
 
-fn open_mmdb(path: &str, label: &str, errs: &mut Vec<String>) -> Option<maxminddb::Reader<Vec<u8>>> {
+fn open_mmdb(
+    path: &str,
+    label: &str,
+    errs: &mut Vec<String>,
+) -> Option<maxminddb::Reader<Vec<u8>>> {
     if !Path::new(path).exists() {
         errs.push(format!("geoip {label} not found: {path}"));
         return None;
@@ -431,22 +499,33 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
             .split_once(']')
             .ok_or_else(|| format!("upstream {s:?}: unclosed IPv6 bracket"))?;
         let port = match after.strip_prefix(':') {
-            Some(p) => p.parse::<u16>().map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
+            Some(p) => p
+                .parse::<u16>()
+                .map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
             None if after.is_empty() && default_port != 0 => default_port,
             None if after.is_empty() => {
                 return Err(format!("upstream {s:?}: IPv6 literal needs a :port"))
             }
-            None => return Err(format!("upstream {s:?}: junk after IPv6 address: {after:?}")),
+            None => {
+                return Err(format!(
+                    "upstream {s:?}: junk after IPv6 address: {after:?}"
+                ))
+            }
         };
         (addr.to_string(), port)
     } else {
         match hostport.rsplit_once(':') {
             Some((h, p)) => (
                 h.to_string(),
-                p.parse::<u16>().map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
+                p.parse::<u16>()
+                    .map_err(|_| format!("upstream {s:?}: bad port {p:?}"))?,
             ),
             None if default_port != 0 => (hostport.to_string(), default_port),
-            None => return Err(format!("upstream {s:?} must be host:port or a http(s):// URL")),
+            None => {
+                return Err(format!(
+                    "upstream {s:?} must be host:port or a http(s):// URL"
+                ))
+            }
         }
     };
     if host.is_empty() {
@@ -463,12 +542,17 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     })
 }
 
-/// Stable (run-independent) hash for Ketama ring points and key lookup.
-fn stable_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
+/// Stable hash for Ketama ring points and key lookup. FNV-1a is deterministic
+/// across Rust versions (unlike `DefaultHasher`), so the ring — and thus every
+/// client's sticky backend — stays stable across recompiles and toolchain
+/// upgrades. Must match `proxy::str_hash`.
+pub fn stable_hash(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
 }
 
 /// Build a Ketama consistent-hash ring: each backend gets `160 * weight` points,
@@ -486,6 +570,236 @@ fn build_ketama_ring(servers: &[Upstream]) -> Vec<(u64, usize)> {
     ring
 }
 
+// ---- unknown-directive validation (nested blocks; top level is checked inline) ----
+
+fn validate_unknowns(doc: &KdlDocument, errs: &mut Vec<String>) {
+    // Only one of each of these top-level blocks makes sense; a second silently
+    // won last-wins (or merged) before.
+    const SINGLETONS: &[&str] = &[
+        "server",
+        "client-ip",
+        "geoip",
+        "acme",
+        "cache-store",
+        "alias",
+        "defaults",
+    ];
+    let mut seen: Vec<&str> = Vec::new();
+    for node in doc.nodes() {
+        let name = node.name().value();
+        if SINGLETONS.contains(&name) {
+            if seen.contains(&name) {
+                errs.push(format!("duplicate `{name}` block (only one allowed)"));
+            } else {
+                seen.push(name);
+            }
+        }
+        match name {
+            "server" => reject_unknown_children(
+                node,
+                "server",
+                &[
+                    "threads",
+                    "metrics-addr",
+                    "grace-period-secs",
+                    "graceful-shutdown-secs",
+                    "upstream-keepalive-pool",
+                    "upgrade-sock",
+                ],
+                errs,
+            ),
+            "client-ip" => reject_unknown_children(
+                node,
+                "client-ip",
+                &["trusted-header", "trusted-proxies"],
+                errs,
+            ),
+            "geoip" => reject_unknown_children(
+                node,
+                "geoip",
+                &[
+                    "enabled",
+                    "country-header",
+                    "mmdb-asn",
+                    "mmdb-city",
+                    "log-fields",
+                    "metric-labels",
+                ],
+                errs,
+            ),
+            "acme" => reject_unknown_children(
+                node,
+                "acme",
+                &["enabled", "contact", "staging", "cache-dir"],
+                errs,
+            ),
+            "cache-store" => reject_unknown_children(
+                node,
+                "cache-store",
+                &["dir", "max-size", "max-files", "min-free"],
+                errs,
+            ),
+            "defaults" => {
+                reject_unknown_children(node, "defaults", &["hsts", "unknown-host"], errs)
+            }
+            "alias" => reject_unknown_props(node, "alias", &["prefix"], errs),
+            "listener" => {
+                reject_unknown_children(
+                    node,
+                    "listener",
+                    &["http2", "tls", "redirect-to-https"],
+                    errs,
+                );
+                if let Some(tls) = child(node, "tls") {
+                    reject_unknown_props(
+                        tls,
+                        "listener tls",
+                        &["cert", "key", "cert-dir", "acme"],
+                        errs,
+                    );
+                }
+            }
+            "site" => validate_site_unknowns(node, errs),
+            _ => {}
+        }
+    }
+}
+
+const SITE_CHILDREN: &[&str] = &[
+    "location",
+    "upstream",
+    "file-server",
+    "deny",
+    "redirect",
+    "rate-limit",
+    "access",
+    "waf",
+    "hsts",
+    "acme",
+    "websocket",
+    "max-body",
+    "read-timeout-secs",
+    "upstream-host",
+    "upstream-verify",
+    "sub-filter",
+    "cache",
+];
+const LOCATION_CHILDREN: &[&str] = &[
+    "upstream",
+    "file-server",
+    "websocket",
+    "max-body",
+    "read-timeout-secs",
+    "deny",
+    "cache",
+    "sub-filter",
+    "upstream-host",
+    "upstream-verify",
+];
+
+fn validate_site_unknowns(node: &KdlNode, errs: &mut Vec<String>) {
+    let host = first_arg(node).unwrap_or("?");
+    let ctx = format!("site `{host}`");
+    reject_unknown_children(node, &ctx, SITE_CHILDREN, errs);
+    let Some(children) = node.children() else {
+        return;
+    };
+    for n in children.nodes() {
+        match n.name().value() {
+            "location" => {
+                reject_unknown_children(n, &format!("{ctx} location"), LOCATION_CHILDREN, errs);
+                validate_backend_unknowns(n, &ctx, errs);
+            }
+            "upstream" | "file-server" | "cache" | "rate-limit" | "access" | "waf" | "redirect"
+            | "sub-filter" => validate_backend_child(n, &ctx, errs),
+            _ => {}
+        }
+    }
+    // The site-level backend sugar (upstream/file-server/cache/...) at the site node.
+    validate_backend_unknowns(node, &ctx, errs);
+}
+
+/// Validate the backend/handler-shaped children shared by a site and a location.
+fn validate_backend_unknowns(node: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
+    if let Some(u) = child(node, "upstream") {
+        validate_backend_child(u, ctx, errs);
+    }
+    if let Some(f) = child(node, "file-server") {
+        validate_backend_child(f, ctx, errs);
+    }
+    if let Some(c) = child(node, "cache") {
+        validate_backend_child(c, ctx, errs);
+    }
+}
+
+fn validate_backend_child(n: &KdlNode, ctx: &str, errs: &mut Vec<String>) {
+    match n.name().value() {
+        "upstream" => {
+            reject_unknown_children(
+                n,
+                &format!("{ctx} upstream"),
+                &["server", "balance", "health-check"],
+                errs,
+            );
+            if let Some(ch) = n.children() {
+                for s in ch.nodes().iter().filter(|x| x.name().value() == "server") {
+                    reject_unknown_props(s, &format!("{ctx} upstream server"), &["weight"], errs);
+                }
+            }
+            if let Some(hc) = child(n, "health-check") {
+                reject_unknown_children(
+                    hc,
+                    &format!("{ctx} health-check"),
+                    &[
+                        "path",
+                        "interval-secs",
+                        "timeout-secs",
+                        "healthy",
+                        "unhealthy",
+                        "expect-status",
+                    ],
+                    errs,
+                );
+            }
+        }
+        "file-server" => {
+            reject_unknown_children(n, &format!("{ctx} file-server"), &["root", "index"], errs)
+        }
+        "cache" => reject_unknown_children(
+            n,
+            &format!("{ctx} cache"),
+            &["ttl-secs", "max-object"],
+            errs,
+        ),
+        "rate-limit" => {
+            reject_unknown_props(n, &format!("{ctx} rate-limit"), &["rps", "burst"], errs)
+        }
+        "access" => reject_unknown_props(n, &format!("{ctx} access"), &["cloudflare-only"], errs),
+        "redirect" => reject_unknown_props(
+            n,
+            &format!("{ctx} redirect"),
+            &["match", "target", "status"],
+            errs,
+        ),
+        "sub-filter" => {
+            reject_unknown_props(n, &format!("{ctx} sub-filter"), &["from", "to"], errs)
+        }
+        "waf" => {
+            if let Some(ch) = n.children() {
+                for b in ch.nodes().iter().filter(|x| x.name().value() == "block") {
+                    reject_unknown_props(
+                        b,
+                        &format!("{ctx} waf block"),
+                        &["field", "match", "status"],
+                        errs,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 const TOP_LEVEL: &[&str] = &[
     "server",
     "client-ip",
@@ -500,8 +814,7 @@ const TOP_LEVEL: &[&str] = &[
 
 impl Config {
     pub fn load(path: &str) -> Result<Config, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("cannot read {path}: {e}"))?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("cannot read {path}: {e}"))?;
         Config::parse(&text)
     }
 
@@ -516,6 +829,7 @@ impl Config {
         let mut server = ServerCfg::default();
         let mut client_ip_header = "cf-connecting-ip".to_string();
         let mut trusted_proxies: Vec<IpNet> = Vec::new();
+        let mut trusted_proxies_set = false;
         let mut geoip = None;
         let mut listeners = Vec::new();
         let mut alias_prefix = None;
@@ -534,7 +848,10 @@ impl Config {
             match name {
                 "server" => {
                     if let Some(v) = child_int(node, "threads") {
-                        server.threads = v.max(0) as usize;
+                        if !(0..=4096).contains(&v) {
+                            errs.push(format!("server threads: {v} out of range (0..=4096)"));
+                        }
+                        server.threads = v.clamp(0, 4096) as usize;
                     }
                     if let Some(v) = child_arg(node, "metrics-addr") {
                         server.metrics_addr = Some(v.to_string());
@@ -557,10 +874,13 @@ impl Config {
                         client_ip_header = v.to_ascii_lowercase();
                     }
                     if let Some(tp) = child(node, "trusted-proxies") {
+                        trusted_proxies_set = true;
                         for a in all_args(tp) {
                             match a.parse::<IpNet>() {
                                 Ok(net) => trusted_proxies.push(net),
-                                Err(_) => errs.push(format!("client-ip trusted-proxies: bad CIDR {a:?}")),
+                                Err(_) => {
+                                    errs.push(format!("client-ip trusted-proxies: bad CIDR {a:?}"))
+                                }
                             }
                         }
                     }
@@ -568,11 +888,10 @@ impl Config {
                 "geoip" => {
                     let enabled = child_bool(node, "enabled").unwrap_or(true);
                     if enabled {
-                        let country_header = child_arg(node, "country-header")
-                            .map(|s| s.to_ascii_lowercase());
-                        let log_fields = child(node, "log-fields")
-                            .map(all_args)
-                            .unwrap_or_default();
+                        let country_header =
+                            child_arg(node, "country-header").map(|s| s.to_ascii_lowercase());
+                        let log_fields =
+                            child(node, "log-fields").map(all_args).unwrap_or_default();
                         let metric_labels = child(node, "metric-labels")
                             .map(all_args)
                             .unwrap_or_default();
@@ -583,10 +902,10 @@ impl Config {
                                 ));
                             }
                         }
-                        let asn_reader =
-                            child_arg(node, "mmdb-asn").and_then(|p| open_mmdb(p, "mmdb-asn", &mut errs));
-                        let city_reader =
-                            child_arg(node, "mmdb-city").and_then(|p| open_mmdb(p, "mmdb-city", &mut errs));
+                        let asn_reader = child_arg(node, "mmdb-asn")
+                            .and_then(|p| open_mmdb(p, "mmdb-asn", &mut errs));
+                        let city_reader = child_arg(node, "mmdb-city")
+                            .and_then(|p| open_mmdb(p, "mmdb-city", &mut errs));
                         geoip = Some(GeoipCfg {
                             country_header,
                             log_fields,
@@ -600,9 +919,14 @@ impl Config {
                     Ok(l) => listeners.push(l),
                     Err(e) => errs.push(e),
                 },
-                "alias" => {
-                    alias_prefix = prop_str(node, "prefix").map(str::to_owned);
-                }
+                "alias" => match prop_str(node, "prefix").filter(|p| !p.is_empty()) {
+                    Some(p) => alias_prefix = Some(p.to_string()),
+                    // `alias "staging"` (positional) or `alias prefix=""` silently
+                    // disabled aliasing before — make it an explicit error.
+                    None => {
+                        errs.push("alias: needs a non-empty prefix=\"...\" property".to_string())
+                    }
+                },
                 "acme" => {
                     let enabled = child_bool(node, "enabled").unwrap_or(true);
                     if enabled {
@@ -622,20 +946,26 @@ impl Config {
                 }
                 "cache-store" => match child_arg(node, "dir") {
                     Some(dir) => {
-                        let size = |name: &str, default: u64, errs: &mut Vec<String>| {
-                            match child_arg(node, name) {
+                        let size =
+                            |name: &str, default: u64, errs: &mut Vec<String>| match child_arg(
+                                node, name,
+                            ) {
                                 Some(s) => parse_size(s).unwrap_or_else(|e| {
                                     errs.push(format!("cache-store {name}: {e}"));
                                     default
                                 }),
                                 None => default,
-                            }
-                        };
+                            };
                         let max_size = size("max-size", 10 * 1024 * 1024 * 1024, &mut errs);
                         let min_free = size("min-free", 1024 * 1024 * 1024, &mut errs);
                         let max_files = child_int(node, "max-files")
                             .map(|v| v.max(1) as u64)
                             .unwrap_or(1_000_000);
+                        // Surface an unusable dir now (create it if missing),
+                        // rather than silently failing every cache write later.
+                        if let Err(e) = std::fs::create_dir_all(dir) {
+                            errs.push(format!("cache-store dir {dir:?}: {e}"));
+                        }
                         disk_cache = Some(DiskCacheCfg {
                             dir: dir.to_string(),
                             max_size,
@@ -652,7 +982,9 @@ impl Config {
                     if let Some(v) = child_int(node, "unknown-host") {
                         match u16::try_from(v) {
                             Ok(c) if (100..=599).contains(&c) => unknown_host = c,
-                            _ => errs.push(format!("defaults unknown-host: {v} is not a valid HTTP status")),
+                            _ => errs.push(format!(
+                                "defaults unknown-host: {v} is not a valid HTTP status"
+                            )),
                         }
                     }
                 }
@@ -663,6 +995,10 @@ impl Config {
                 _ => unreachable!(),
             }
         }
+
+        // Reject mistyped directives/props inside blocks (typos → errors, not
+        // silent no-ops) — the nested-block counterpart to the top-level check.
+        validate_unknowns(&doc, &mut errs);
 
         // apply default hsts to sites that didn't set their own
         for s in &mut sites {
@@ -682,16 +1018,35 @@ impl Config {
         if listeners.is_empty() {
             errs.push("no `listener` defined".to_string());
         }
+        // Two acceptors on one address both try to bind → the second fails at
+        // startup, after --check said ok. Catch it here.
+        for (i, l) in listeners.iter().enumerate() {
+            if listeners[..i].iter().any(|p| p.addr == l.addr) {
+                errs.push(format!("duplicate listener address `{}`", l.addr));
+            }
+        }
+        // metrics-addr is bound at startup; validate it like a listener address.
+        if let Some(m) = &server.metrics_addr {
+            if m.parse::<std::net::SocketAddr>().is_err() {
+                errs.push(format!(
+                    "server metrics-addr {m:?}: not a valid socket address"
+                ));
+            }
+        }
         let has_acme_listener = listeners
             .iter()
             .any(|l| matches!(l.kind, ListenerKind::TlsAcme { .. }));
         if acme.is_none() && has_acme_listener {
-            errs.push("a listener uses `tls acme=true` but there is no `acme {}` block".to_string());
+            errs.push(
+                "a listener uses `tls acme=true` but there is no `acme {}` block".to_string(),
+            );
         }
         // HTTP-01 challenges are answered on the :80 redirect listener; without one
         // ACME can never validate.
         if has_acme_listener
-            && !listeners.iter().any(|l| matches!(l.kind, ListenerKind::RedirectHttps))
+            && !listeners
+                .iter()
+                .any(|l| matches!(l.kind, ListenerKind::RedirectHttps))
         {
             errs.push(
                 "`tls acme=true` needs a `listener \"0.0.0.0:80\" { redirect-to-https true }` \
@@ -705,16 +1060,20 @@ impl Config {
             errs.push("a site sets `acme true` but there is no `acme {}` block".to_string());
         }
         if any_acme_site && !has_acme_listener {
-            errs.push(
-                "a site sets `acme true` but no listener uses `tls acme=true`".to_string(),
-            );
+            errs.push("a site sets `acme true` but no listener uses `tls acme=true`".to_string());
         }
         if sites.is_empty() {
             errs.push("no `site` defined".to_string());
         }
 
         if trusted_proxies.is_empty() {
-            trusted_proxies = CF_RANGES.clone();
+            if trusted_proxies_set {
+                // The user configured trusted-proxies but none parsed — don't
+                // silently fall back to trusting Cloudflare (wrong peers).
+                errs.push("client-ip trusted-proxies: no valid CIDR was given".to_string());
+            } else {
+                trusted_proxies = CF_RANGES.clone();
+            }
         }
 
         if errs.is_empty() {
@@ -761,24 +1120,41 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
         .map_err(|_| format!("listener {addr:?}: not a valid socket address"))?;
 
     if child_bool(node, "redirect-to-https").unwrap_or(false) {
-        return Ok(Listener { addr, kind: ListenerKind::RedirectHttps });
+        if child(node, "tls").is_some() {
+            return Err(format!(
+                "listener {addr:?}: `redirect-to-https` and a `tls` block are mutually exclusive"
+            ));
+        }
+        return Ok(Listener {
+            addr,
+            kind: ListenerKind::RedirectHttps,
+        });
     }
-    let tls = child(node, "tls")
-        .ok_or_else(|| format!("listener {addr:?}: needs a `tls` block or `redirect-to-https true`"))?;
+    let tls = child(node, "tls").ok_or_else(|| {
+        format!("listener {addr:?}: needs a `tls` block or `redirect-to-https true`")
+    })?;
     let http2 = child_bool(node, "http2").unwrap_or(false);
 
     // ACME-managed certs (needs a top-level `acme {}` block).
     if prop_bool(tls, "acme").unwrap_or(false) {
-        return Ok(Listener { addr, kind: ListenerKind::TlsAcme { http2 } });
+        return Ok(Listener {
+            addr,
+            kind: ListenerKind::TlsAcme { http2 },
+        });
     }
     // Dynamic SNI certs from a directory, or a single cert/key pair.
     if let Some(dir) = prop_str(tls, "cert-dir") {
         if !Path::new(dir).is_dir() {
-            return Err(format!("listener {addr:?}: cert-dir not a directory: {dir}"));
+            return Err(format!(
+                "listener {addr:?}: cert-dir not a directory: {dir}"
+            ));
         }
         return Ok(Listener {
             addr,
-            kind: ListenerKind::TlsDynamic { cert_dir: dir.to_string(), http2 },
+            kind: ListenerKind::TlsDynamic {
+                cert_dir: dir.to_string(),
+                http2,
+            },
         });
     }
     let cert = prop_str(tls, "cert")
@@ -793,16 +1169,26 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
     if !Path::new(&key).exists() {
         return Err(format!("listener {addr:?}: key file not found: {key}"));
     }
-    Ok(Listener { addr, kind: ListenerKind::Tls { cert, key, http2 } })
+    Ok(Listener {
+        addr,
+        kind: ListenerKind::Tls { cert, key, http2 },
+    })
 }
 
 /// Collect `deny "<regex>"` children into compiled regexes.
 fn parse_deny(node: &KdlNode, host: &str) -> Result<Vec<Regex>, String> {
     let mut deny = Vec::new();
     if let Some(children) = node.children() {
-        for d in children.nodes().iter().filter(|n| n.name().value() == "deny") {
-            let pat = first_arg(d).ok_or_else(|| format!("site `{host}`: deny needs a path regex"))?;
-            deny.push(Regex::new(pat).map_err(|e| format!("site `{host}`: deny regex {pat:?}: {e}"))?);
+        for d in children
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "deny")
+        {
+            let pat =
+                first_arg(d).ok_or_else(|| format!("site `{host}`: deny needs a path regex"))?;
+            deny.push(
+                Regex::new(pat).map_err(|e| format!("site `{host}`: deny regex {pat:?}: {e}"))?,
+            );
         }
     }
     Ok(deny)
@@ -810,7 +1196,9 @@ fn parse_deny(node: &KdlNode, host: &str) -> Result<Vec<Regex>, String> {
 
 fn parse_max_body(node: &KdlNode, host: &str) -> Result<Option<u64>, String> {
     match child_arg(node, "max-body") {
-        Some(s) => Ok(Some(parse_size(s).map_err(|e| format!("site `{host}`: {e}"))?)),
+        Some(s) => Ok(Some(
+            parse_size(s).map_err(|e| format!("site `{host}`: {e}"))?,
+        )),
         None => Ok(None),
     }
 }
@@ -823,7 +1211,10 @@ fn parse_cache(node: &KdlNode, host: &str) -> Result<Option<CacheCfg>, String> {
                 Some(s) => parse_size(s).map_err(|e| format!("site `{host}`: cache {e}"))? as usize,
                 None => 8 * 1024 * 1024,
             };
-            Ok(Some(CacheCfg { ttl: Duration::from_secs(ttl), max_object }))
+            Ok(Some(CacheCfg {
+                ttl: Duration::from_secs(ttl),
+                max_object,
+            }))
         }
         None => Ok(None),
     }
@@ -838,7 +1229,11 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
     }
     let mut balance = Balance::RoundRobin;
     if let Some(children) = node.children() {
-        for s in children.nodes().iter().filter(|n| n.name().value() == "server") {
+        for s in children
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "server")
+        {
             let a = first_arg(s)
                 .ok_or_else(|| format!("site `{host}`: upstream server needs an address"))?;
             let mut u = parse_upstream(a).map_err(|e| format!("site `{host}`: {e}"))?;
@@ -847,7 +1242,9 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
                 // would build a multi-GB hash ring and OOM at load/reload. 1000:1
                 // is already an extreme ratio.
                 if !(1..=1000).contains(&w) {
-                    return Err(format!("site `{host}`: server {a:?} weight must be 1..=1000"));
+                    return Err(format!(
+                        "site `{host}`: server {a:?} weight must be 1..=1000"
+                    ));
                 }
                 u.weight = w as u32;
             }
@@ -881,7 +1278,12 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
     } else {
         Vec::new()
     };
-    Ok(UpstreamGroup { servers, balance, health_check, ring })
+    Ok(UpstreamGroup {
+        servers,
+        balance,
+        health_check,
+        ring,
+    })
 }
 
 fn parse_health_check(node: &KdlNode, host: &str) -> Result<HealthCheck, String> {
@@ -900,15 +1302,22 @@ fn parse_health_check(node: &KdlNode, host: &str) -> Result<HealthCheck, String>
         }
         None => (200, 399),
     };
-    Ok(HealthCheck { path, interval, timeout, healthy, unhealthy, expect_status })
+    Ok(HealthCheck {
+        path,
+        interval,
+        timeout,
+        healthy,
+        unhealthy,
+        expect_status,
+    })
 }
 
 /// The backend of a site or location: exactly one of `upstream` / `file-server`.
 fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
     match (child(node, "upstream"), child(node, "file-server")) {
-        (Some(_), Some(_)) => {
-            Err(format!("site `{host}`: set either upstream or file-server, not both"))
-        }
+        (Some(_), Some(_)) => Err(format!(
+            "site `{host}`: set either upstream or file-server, not both"
+        )),
         (Some(u), None) => {
             let mut group = parse_upstream_group(u, host)?;
             if let Some(h) = child_arg(node, "upstream-host") {
@@ -928,7 +1337,9 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
                 .ok_or_else(|| format!("site `{host}`: file-server missing root"))?
                 .to_string();
             if !Path::new(&root).is_dir() {
-                return Err(format!("site `{host}`: file-server root not a directory: {root}"));
+                return Err(format!(
+                    "site `{host}`: file-server root not a directory: {root}"
+                ));
             }
             let index = child_arg(f, "index").unwrap_or("index.html").to_string();
             Ok(Handler::File { root, index })
@@ -945,14 +1356,21 @@ fn parse_read_timeout(node: &KdlNode) -> Option<Duration> {
 fn parse_sub_filters(node: &KdlNode, host: &str) -> Result<(Vec<SubFilter>, usize), String> {
     let mut fs = Vec::new();
     if let Some(children) = node.children() {
-        for f in children.nodes().iter().filter(|n| n.name().value() == "sub-filter") {
+        for f in children
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "sub-filter")
+        {
             let from = prop_str(f, "from")
                 .ok_or_else(|| format!("site `{host}`: sub-filter needs from=\"...\""))?;
             if from.is_empty() {
                 return Err(format!("site `{host}`: sub-filter from must be non-empty"));
             }
             let to = prop_str(f, "to").unwrap_or("");
-            fs.push(SubFilter { from: from.as_bytes().to_vec(), to: to.as_bytes().to_vec() });
+            fs.push(SubFilter {
+                from: from.as_bytes().to_vec(),
+                to: to.as_bytes().to_vec(),
+            });
         }
     }
     let max = fs.iter().map(|f| f.from.len()).max().unwrap_or(0);
@@ -962,8 +1380,8 @@ fn parse_sub_filters(node: &KdlNode, host: &str) -> Result<(Vec<SubFilter>, usiz
 /// A `location "<matcher>" { ... }` block. `~` prefix on the matcher = regex,
 /// otherwise a path prefix.
 fn parse_location(node: &KdlNode, host: &str) -> Result<Location, String> {
-    let m = first_arg(node)
-        .ok_or_else(|| format!("site `{host}`: location needs a path matcher"))?;
+    let m =
+        first_arg(node).ok_or_else(|| format!("site `{host}`: location needs a path matcher"))?;
     let matcher = if let Some(rx) = m.strip_prefix('~') {
         Matcher::Regex(
             Regex::new(rx.trim())
@@ -989,9 +1407,17 @@ fn parse_location(node: &KdlNode, host: &str) -> Result<Location, String> {
 /// A `waf { block field=".." match=".." }` block (site-wide request filtering).
 fn parse_waf(node: &KdlNode, host: &str) -> Result<Vec<WafRule>, String> {
     let mut rules = Vec::new();
-    let Some(w) = child(node, "waf") else { return Ok(rules) };
-    let Some(children) = w.children() else { return Ok(rules) };
-    for b in children.nodes().iter().filter(|n| n.name().value() == "block") {
+    let Some(w) = child(node, "waf") else {
+        return Ok(rules);
+    };
+    let Some(children) = w.children() else {
+        return Ok(rules);
+    };
+    for b in children
+        .nodes()
+        .iter()
+        .filter(|n| n.name().value() == "block")
+    {
         let field_s = prop_str(b, "field")
             .ok_or_else(|| format!("site `{host}`: waf block needs field=\"...\""))?;
         let field = if let Some(h) = field_s.strip_prefix("header:") {
@@ -1011,8 +1437,7 @@ fn parse_waf(node: &KdlNode, host: &str) -> Result<Vec<WafRule>, String> {
         };
         let pat = prop_str(b, "match")
             .ok_or_else(|| format!("site `{host}`: waf block needs match=\"...\""))?;
-        let re =
-            Regex::new(pat).map_err(|e| format!("site `{host}`: waf regex {pat:?}: {e}"))?;
+        let re = Regex::new(pat).map_err(|e| format!("site `{host}`: waf regex {pat:?}: {e}"))?;
         let raw = prop_int(b, "status").unwrap_or(403);
         let status = u16::try_from(raw)
             .ok()
@@ -1032,7 +1457,11 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
     // site-level bare `upstream`/`file-server` as an implicit catch-all "/".
     let mut locations = Vec::new();
     if let Some(children) = node.children() {
-        for l in children.nodes().iter().filter(|n| n.name().value() == "location") {
+        for l in children
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "location")
+        {
             locations.push(parse_location(l, &host)?);
         }
     }
@@ -1066,19 +1495,29 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
 
     let rate_limit = match child(node, "rate-limit") {
         Some(r) => {
-            let rps = prop_int(r, "rps").unwrap_or(0) as f64;
-            let burst = prop_int(r, "burst").map(|b| b as f64).unwrap_or(rps);
+            // Accept both `rps=50` and `rps=0.5` (the fields are f64).
+            let rps = prop_f64(r, "rps").unwrap_or(0.0);
+            let burst = prop_f64(r, "burst").unwrap_or(rps);
             if rps <= 0.0 {
                 return Err(format!("site `{host}`: rate-limit needs rps > 0"));
             }
-            Some(RateLimit { rps, burst: burst.max(rps) })
+            if burst < rps {
+                return Err(format!(
+                    "site `{host}`: rate-limit burst ({burst}) must be >= rps ({rps})"
+                ));
+            }
+            Some(RateLimit { rps, burst })
         }
         None => None,
     };
 
     let mut redirects = Vec::new();
     if let Some(children) = node.children() {
-        for r in children.nodes().iter().filter(|n| n.name().value() == "redirect") {
+        for r in children
+            .nodes()
+            .iter()
+            .filter(|n| n.name().value() == "redirect")
+        {
             let pat = prop_str(r, "match")
                 .ok_or_else(|| format!("site `{host}`: redirect missing match"))?;
             let re = Regex::new(pat)
@@ -1090,7 +1529,9 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
             let status = u16::try_from(raw_status)
                 .ok()
                 .filter(|s| (300..=399).contains(s))
-                .ok_or_else(|| format!("site `{host}`: redirect status {raw_status} not in 300..=399"))?;
+                .ok_or_else(|| {
+                    format!("site `{host}`: redirect status {raw_status} not in 300..=399")
+                })?;
             redirects.push(Redirect { re, target, status });
         }
     }
@@ -1106,4 +1547,76 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         redirects,
         acme,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `Config` isn't `Debug`, so extract the error without `unwrap_err`.
+    fn parse_err(s: &str) -> String {
+        match Config::parse(s) {
+            Err(e) => e,
+            Ok(_) => panic!("expected a config error"),
+        }
+    }
+
+    #[test]
+    fn size_parsing() {
+        assert_eq!(parse_size("1024").unwrap(), 1024);
+        assert_eq!(parse_size("32MiB").unwrap(), 32 * 1024 * 1024);
+        assert_eq!(parse_size("10GB").unwrap(), 10_000_000_000);
+        assert_eq!(parse_size("512KB").unwrap(), 512_000);
+        assert!(parse_size("nope").is_err());
+    }
+
+    #[test]
+    fn stable_hash_matches_fnv1a_vector() {
+        // Published FNV-1a-64 test vectors — pins the algorithm so a change
+        // (which would reshuffle every ketama client) is caught.
+        assert_eq!(stable_hash(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(stable_hash("a"), 0xaf63_dc4c_8601_ec8c);
+    }
+
+    #[test]
+    fn rejects_unknown_directive() {
+        let e = parse_err(
+            "server {\n threds 4\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n",
+        );
+        assert!(e.contains("unknown directive `threds`"), "{e}");
+    }
+
+    #[test]
+    fn rejects_ketama_weight_over_1000() {
+        let e = parse_err(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream {\n server \"127.0.0.1:9\" weight=5000\n balance \"ketama\"\n }\n}\n",
+        );
+        assert!(e.contains("weight must be 1..=1000"), "{e}");
+    }
+
+    #[test]
+    fn rate_limit_accepts_float() {
+        // rps=0.5 must parse and be stored (not rejected as "needs rps > 0").
+        let c = Config::parse(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n rate-limit rps=0.5 burst=1\n}\n",
+        )
+        .expect("float rps should parse");
+        assert_eq!(c.sites[0].rate_limit.unwrap().rps, 0.5);
+    }
+
+    #[test]
+    fn rate_limit_rejects_burst_below_rps() {
+        let e = parse_err(
+            "listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n rate-limit rps=50 burst=10\n}\n",
+        );
+        assert!(e.contains("burst"), "{e}");
+    }
+
+    #[test]
+    fn duplicate_singleton_block_errors() {
+        let e = parse_err(
+            "server {\n threads 1\n}\nserver {\n threads 2\n}\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n",
+        );
+        assert!(e.contains("duplicate `server` block"), "{e}");
+    }
 }

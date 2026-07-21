@@ -1,9 +1,9 @@
 //! Dynamic, SNI-based certificate store served through Pingora's TLS callback.
 //!
 //! Certs live in an `ArcSwap<CertStore>` so they can be hot-swapped at runtime
-//! (config reload, cert rotation, or a future ACME renewal) without restarting
-//! or rebinding the listener. This is the Pingora-specific foundation any
-//! auto-TLS / multi-domain-cert feature builds on.
+//! (the ACME renewal loop swaps in a new store) without restarting or rebinding
+//! the listener. NOTE: a `cert-dir` store is currently built once at startup and
+//! is NOT re-read on SIGHUP — rotating a file in `cert-dir` needs a restart.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -32,7 +32,17 @@ impl Cert {
         }
         let leaf = stack.remove(0);
         let key = PKey::private_key_from_pem(key_pem).map_err(|e| e.to_string())?;
-        Ok(Cert { leaf, chain: stack, key })
+        // Reject a mismatched pair now (a clear load error) rather than letting the
+        // TLS handshake fail opaquely later with a cert but no usable key.
+        let cert_pub = leaf.public_key().map_err(|e| e.to_string())?;
+        if !key.public_eq(&cert_pub) {
+            return Err("private key does not match the certificate".to_string());
+        }
+        Ok(Cert {
+            leaf,
+            chain: stack,
+            key,
+        })
     }
 
     pub fn from_files(cert_path: &str, key_path: &str) -> Result<Cert, String> {
@@ -59,7 +69,8 @@ impl CertStore {
     }
 
     /// Load every `<host>.crt` + `<host>.key` pair from a directory; the file
-    /// stem is the SNI hostname. Returns the store and any per-file errors.
+    /// stem is the SNI hostname. A single bad pair is logged and skipped (it does
+    /// not abort the whole load); only an empty result is an error.
     pub fn from_dir(dir: &str) -> Result<CertStore, String> {
         let mut store = CertStore::default();
         let entries = std::fs::read_dir(dir).map_err(|e| format!("{dir}: {e}"))?;
@@ -77,12 +88,14 @@ impl CertStore {
             let crt = format!("{dir}/{host}.crt");
             let key = format!("{dir}/{host}.key");
             if Path::new(&key).exists() {
-                let cert = Cert::from_files(&crt, &key)?;
-                store.insert(host, cert);
+                match Cert::from_files(&crt, &key) {
+                    Ok(cert) => store.insert(host, cert),
+                    Err(e) => log::error!("cert-dir: skipping {host}: {e}"),
+                }
             }
         }
         if store.map.is_empty() {
-            return Err(format!("no <host>.crt/<host>.key pairs in {dir}"));
+            return Err(format!("no usable <host>.crt/<host>.key pairs in {dir}"));
         }
         Ok(store)
     }
@@ -101,7 +114,10 @@ pub struct DynamicCert {
 impl TlsAccept for DynamicCert {
     async fn certificate_callback(&self, ssl: &mut SslRef) {
         let store = self.store.load();
-        let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("").to_string();
+        let sni = ssl
+            .servername(NameType::HOST_NAME)
+            .unwrap_or("")
+            .to_string();
         match store.pick(&sni) {
             Some(cert) => {
                 if let Err(e) = ext::ssl_use_certificate(ssl, &cert.leaf) {
@@ -118,7 +134,9 @@ impl TlsAccept for DynamicCert {
             }
             // No cert and no fallback → the handshake will fail closed. Log it so a
             // dead :443 (e.g. an ACME cert that never issued) is diagnosable.
-            None => log::warn!("tls: no certificate for SNI {sni:?} (and no fallback); handshake will fail"),
+            None => log::warn!(
+                "tls: no certificate for SNI {sni:?} (and no fallback); handshake will fail"
+            ),
         }
     }
 }

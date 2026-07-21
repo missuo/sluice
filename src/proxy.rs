@@ -10,16 +10,18 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use ipnet::IpNet;
 use maxminddb::geoip2;
+use pingora::http::{RequestHeader, ResponseHeader};
+use pingora::prelude::*;
+use pingora::proxy::{ProxyHttp, Session};
 use pingora_cache::cache_control::CacheControl;
 use pingora_cache::eviction::simple_lru::Manager as LruEviction;
 use pingora_cache::eviction::EvictionManager;
 use pingora_cache::filters as cache_filters;
 use pingora_cache::lock::CacheLock;
 use pingora_cache::storage::Storage;
-use pingora_cache::{CacheKey, CacheMeta, CacheMetaDefaults, MemCache, NoCacheReason, RespCacheable};
-use pingora::http::{RequestHeader, ResponseHeader};
-use pingora::prelude::*;
-use pingora::proxy::{ProxyHttp, Session};
+use pingora_cache::{
+    CacheKey, CacheMeta, CacheMetaDefaults, MemCache, NoCacheReason, RespCacheable,
+};
 
 use crate::config::{
     Balance, Config, Handler, RateLimit, SubFilter, Upstream, UpstreamGroup, WafField, CF_RANGES,
@@ -34,20 +36,28 @@ fn in_cloudflare(ip: IpAddr) -> bool {
 
 fn host_of(session: &Session) -> Option<String> {
     let rh = session.req_header();
-    let raw = rh
-        .uri
-        .host()
-        .map(str::to_owned)
-        .or_else(|| rh.headers.get("host").and_then(|v| v.to_str().ok()).map(str::to_owned))?;
+    let raw = rh.uri.host().map(str::to_owned).or_else(|| {
+        rh.headers
+            .get("host")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    })?;
     Some(raw.split(':').next().unwrap_or(&raw).to_ascii_lowercase())
 }
 
 fn header_val<'a>(session: &'a Session, name: &str) -> Option<&'a str> {
-    session.req_header().headers.get(name).and_then(|v| v.to_str().ok())
+    session
+        .req_header()
+        .headers
+        .get(name)
+        .and_then(|v| v.to_str().ok())
 }
 
 fn peer_ip(session: &Session) -> Option<IpAddr> {
-    session.client_addr().and_then(|a| a.as_inet()).map(|i| i.ip())
+    session
+        .client_addr()
+        .and_then(|a| a.as_inet())
+        .map(|i| i.ip())
 }
 
 /// Trusted client IP. The configured header (e.g. CF-Connecting-IP) is honored
@@ -56,13 +66,18 @@ fn peer_ip(session: &Session) -> Option<IpAddr> {
 fn real_client_ip(session: &Session, trusted_header: &str, trusted_proxies: &[IpNet]) -> String {
     let peer = peer_ip(session);
     if is_trusted_peer(peer, trusted_proxies) {
-        if let Some(v) = header_val(session, trusted_header).map(str::trim).filter(|s| !s.is_empty()) {
-            return v.to_string();
+        // Honor the trusted header only if it parses as an IP — a garbage value
+        // (e.g. `X-Forwarded-For: not-an-ip`) must NOT become the client IP, or
+        // it would parse-fail downstream and silently skip the per-IP rate limit.
+        // Normalize via IpAddr so it's canonical for the limiter/geo keys.
+        if let Some(ip) = header_val(session, trusted_header)
+            .map(str::trim)
+            .and_then(|s| s.parse::<IpAddr>().ok())
+        {
+            return ip.to_string();
         }
-        // Deliberately no X-Forwarded-For fallback: its leftmost entry is
-        // client-controlled, so trusting it would let a client behind the proxy
-        // spoof its address (and evade the per-IP rate limiter). If the trusted
-        // header is absent, fall through to the peer IP.
+        // Absent or malformed header → fall through to the peer IP (no
+        // X-Forwarded-For fallback: its leftmost entry is client-controlled).
     }
     peer.map(|p| p.to_string()).unwrap_or_default()
 }
@@ -87,6 +102,38 @@ fn hex_val(b: u8) -> Option<u8> {
         b'A'..=b'F' => Some(b - b'A' + 10),
         _ => None,
     }
+}
+
+/// Percent-decode a query and turn `+` into space, for WAF query matching. Lossy
+/// on invalid UTF-8 so an ASCII payload still matches. Used alongside the raw
+/// query, so both `union select` and `union%20select`/`union+select` are caught.
+fn decode_query(q: &str) -> String {
+    let b = q.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if i + 2 < b.len() => match (hex_val(b[i + 1]), hex_val(b[i + 2])) {
+                (Some(h), Some(l)) => {
+                    out.push(h * 16 + l);
+                    i += 3;
+                }
+                _ => {
+                    out.push(b[i]);
+                    i += 1;
+                }
+            },
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Normalize a request path the way backends do, so WAF / `deny` / location
@@ -117,7 +164,7 @@ fn normalize_path(raw: &str) -> Option<String> {
     let mut segs: Vec<&str> = Vec::new();
     for seg in s.split('/') {
         match seg {
-            "" | "." => {}          // collapse `//` and `.`
+            "" | "." => {} // collapse `//` and `.`
             ".." => {
                 segs.pop();
             }
@@ -132,7 +179,12 @@ fn normalize_path(raw: &str) -> Option<String> {
     Some(out)
 }
 
-async fn redirect(session: &mut Session, status: u16, location: String, hsts: Option<&str>) -> Result<()> {
+async fn redirect(
+    session: &mut Session,
+    status: u16,
+    location: String,
+    hsts: Option<&str>,
+) -> Result<()> {
     let mut resp = ResponseHeader::build(status, Some(3))?;
     resp.insert_header("Location", location)?;
     resp.insert_header("Content-Length", "0")?;
@@ -166,7 +218,19 @@ async fn serve_file(
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
-    let is_head = session.req_header().method.as_str() == "HEAD";
+    // A file server only answers GET/HEAD; anything else (POST/PUT/…) gets 405.
+    let method = session.req_header().method.as_str();
+    if method != "GET" && method != "HEAD" {
+        let mut resp = ResponseHeader::build(405, Some(2))?;
+        resp.insert_header("Allow", "GET, HEAD")?;
+        resp.insert_header("Content-Length", "0")?;
+        if let Some(h) = hsts {
+            resp.insert_header("Strict-Transport-Security", h)?;
+        }
+        session.write_response_header(Box::new(resp), true).await?;
+        return Ok(());
+    }
+    let is_head = method == "HEAD";
     let rel = req_path.trim_start_matches('/');
     if rel.split('/').any(|c| c == "..") {
         return send_status(session, 403, hsts).await;
@@ -207,7 +271,9 @@ async fn serve_file(
         resp.insert_header("Strict-Transport-Security", h)?;
     }
     // HEAD: send headers (incl. the GET Content-Length) but no body.
-    session.write_response_header(Box::new(resp), is_head).await?;
+    session
+        .write_response_header(Box::new(resp), is_head)
+        .await?;
     if is_head {
         return Ok(());
     }
@@ -266,7 +332,9 @@ fn geo_lookup(cfg: &Config, ctx: &mut Ctx, session: &Session) {
             }
         }
     }
-    let Ok(ip) = ctx.client_ip.parse::<IpAddr>() else { return };
+    let Ok(ip) = ctx.client_ip.parse::<IpAddr>() else {
+        return;
+    };
     if let Some(r) = &g.asn_reader {
         if let Ok(res) = r.lookup(ip) {
             if let Ok(Some(asn)) = res.decode::<geoip2::Asn>() {
@@ -376,13 +444,9 @@ fn rewrite_stream(
     (out, data[i..].to_vec())
 }
 
-/// Stable string hash (matches the Ketama ring builder in config.rs).
-fn str_hash(s: &str) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    s.hash(&mut h);
-    h.finish()
-}
+/// Stable string hash — re-exported from config so the Ketama ring build and the
+/// per-request lookup use the identical (version-stable FNV-1a) hash.
+use crate::config::stable_hash as str_hash;
 
 /// Weighted random selection: pick a point in [0, total_weight) and walk.
 fn weighted_random(servers: &[Upstream]) -> usize {
@@ -430,7 +494,10 @@ struct ActiveHealth {
 fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, ActiveHealth>>) {
     use crate::config::HealthCheck;
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(r) => r,
             Err(e) => {
                 log::error!("health: cannot start runtime: {e}");
@@ -514,7 +581,10 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
     let req = format!(
         "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: sluice-health\r\nConnection: close\r\n\r\n"
     );
-    if tokio::time::timeout(hc.timeout, stream.write_all(req.as_bytes())).await.is_err() {
+    if tokio::time::timeout(hc.timeout, stream.write_all(req.as_bytes()))
+        .await
+        .is_err()
+    {
         return false;
     }
     let mut buf = [0u8; 256];
@@ -524,7 +594,11 @@ async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &st
     };
     // Parse the status code from "HTTP/1.x NNN ...".
     let head = String::from_utf8_lossy(&buf[..n]);
-    match head.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()) {
+    match head
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok())
+    {
         Some(s) => s >= hc.expect_status.0 && s <= hc.expect_status.1,
         None => false,
     }
@@ -618,7 +692,11 @@ impl SluiceProxy {
     /// Is this backend out of rotation — either passively (recent connect failure,
     /// within cooldown) or actively (a configured health check marked it down)?
     fn is_down(&self, addr: &str) -> bool {
-        if self.health.get(addr).is_some_and(|until| Instant::now() < *until) {
+        if self
+            .health
+            .get(addr)
+            .is_some_and(|until| Instant::now() < *until)
+        {
             return true;
         }
         self.health_active.get(addr).is_some_and(|h| !h.healthy)
@@ -626,7 +704,8 @@ impl SluiceProxy {
 
     /// Mark a backend down for the cooldown after a connect failure.
     fn mark_down(&self, addr: &str) {
-        self.health.insert(addr.to_string(), Instant::now() + HEALTH_COOLDOWN);
+        self.health
+            .insert(addr.to_string(), Instant::now() + HEALTH_COOLDOWN);
     }
 
     /// Primary pool index for this request per the balance policy (failover then
@@ -708,7 +787,10 @@ impl SluiceProxy {
         let mut b = self
             .limiter
             .entry((host.to_string(), ip))
-            .or_insert(Bucket { tokens: rl.burst, last: now });
+            .or_insert(Bucket {
+                tokens: rl.burst,
+                last: now,
+            });
         let elapsed = now.duration_since(b.last).as_secs_f64();
         b.tokens = (b.tokens + elapsed * rl.rps).min(rl.burst);
         b.last = now;
@@ -802,12 +884,11 @@ impl ProxyHttp for SluiceProxy {
                         Some(&*CACHE_LOCK),
                         None,
                     );
-                    // Cap the cached object size mid-stream (aborts the cache
-                    // write when exceeded, without affecting the client stream) —
-                    // this bounds chunked responses that have no Content-Length.
-                    if cc.max_object > 0 {
-                        session.cache.set_max_file_size_bytes(cc.max_object);
-                    }
+                    // NOTE: we deliberately do NOT call set_max_file_size_bytes —
+                    // pingora surfaces its "response too large" as a proxy error
+                    // (a 500 to the client), not a graceful uncached passthrough.
+                    // max-object is enforced by the Content-Length check in
+                    // response_cache_filter, and total on-disk size by the reaper.
                 }
             }
         }
@@ -850,7 +931,9 @@ impl ProxyHttp for SluiceProxy {
     ) -> Result<RespCacheable> {
         let uncacheable = || RespCacheable::Uncacheable(NoCacheReason::OriginNotCache);
         let Some(ttl) = ctx.cache_ttl else {
-            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom("cache off")));
+            return Ok(RespCacheable::Uncacheable(NoCacheReason::Custom(
+                "cache off",
+            )));
         };
         // A response that sets a cookie is per-user — never cache it.
         if resp.headers.contains_key("set-cookie") {
@@ -863,7 +946,10 @@ impl ProxyHttp for SluiceProxy {
         if let Some(vary) = resp.headers.get("vary") {
             let ok = vary
                 .to_str()
-                .map(|v| v.split(',').all(|s| s.trim().eq_ignore_ascii_case("accept-encoding")))
+                .map(|v| {
+                    v.split(',')
+                        .all(|s| s.trim().eq_ignore_ascii_case("accept-encoding"))
+                })
                 .unwrap_or(false);
             if !ok {
                 return Ok(uncacheable());
@@ -915,7 +1001,13 @@ impl ProxyHttp for SluiceProxy {
         }
         if resp.status.as_u16() == 200 {
             let now = SystemTime::now();
-            Ok(RespCacheable::Cacheable(CacheMeta::new(now + ttl, now, 0, 0, resp.clone())))
+            Ok(RespCacheable::Cacheable(CacheMeta::new(
+                now + ttl,
+                now,
+                0,
+                0,
+                resp.clone(),
+            )))
         } else {
             Ok(uncacheable())
         }
@@ -970,12 +1062,15 @@ impl ProxyHttp for SluiceProxy {
         };
 
         // WAF (site-wide) → block matching requests.
+        let raw_query = session.req_header().uri.query().unwrap_or("").to_owned();
+        let decoded_query = decode_query(&raw_query);
         for rule in &site.waf {
             let blocked = match &rule.field {
                 WafField::Path => rule.re.is_match(&path),
-                WafField::Query => {
-                    rule.re.is_match(session.req_header().uri.query().unwrap_or(""))
-                }
+                // Match both the raw query AND a percent/`+`-decoded form, so an
+                // attacker can't slip `union%20select` / `union+select` past a
+                // rule written against the literal payload.
+                WafField::Query => rule.re.is_match(&raw_query) || rule.re.is_match(&decoded_query),
                 WafField::Method => rule.re.is_match(session.req_header().method.as_str()),
                 // Every value (duplicate-header smuggling), lossily decoded so a
                 // non-UTF-8 byte can't hide the payload from the regex.
@@ -1076,7 +1171,9 @@ impl ProxyHttp for SluiceProxy {
     async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Ctx) -> Result<Box<HttpPeer>> {
         let cfg = ctx.cfg.clone();
         let si = ctx.site.ok_or_else(|| Error::new_str("no site matched"))?;
-        let li = ctx.location.ok_or_else(|| Error::new_str("no location matched"))?;
+        let li = ctx
+            .location
+            .ok_or_else(|| Error::new_str("no location matched"))?;
         let loc = &cfg.sites[si].locations[li];
         let Handler::Proxy(group) = &loc.handler else {
             return Err(Error::new_str("file-server location reached upstream_peer"));
@@ -1221,7 +1318,12 @@ impl ProxyHttp for SluiceProxy {
                     .unwrap_or(false);
                 if uncompressed && text {
                     ctx.rewrite = true;
+                    // The body is about to change: drop Content-Length (streams
+                    // chunked) and the now-stale integrity/validator headers.
                     upstream_response.remove_header("Content-Length");
+                    upstream_response.remove_header("Content-MD5");
+                    upstream_response.remove_header("Digest");
+                    upstream_response.remove_header("ETag");
                 }
             }
         }
@@ -1253,7 +1355,8 @@ impl ProxyHttp for SluiceProxy {
         if let Some(chunk) = body.take() {
             data.extend_from_slice(&chunk);
         }
-        let (emit, carry) = rewrite_stream(&data, &loc.sub_filters, loc.sub_max_from, end_of_stream);
+        let (emit, carry) =
+            rewrite_stream(&data, &loc.sub_filters, loc.sub_max_from, end_of_stream);
         ctx.rewrite_carry = carry;
         *body = if emit.is_empty() {
             None
@@ -1266,18 +1369,35 @@ impl ProxyHttp for SluiceProxy {
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Ctx) {
         INFLIGHT.dec();
         self.release_conn(ctx); // release the least-conn tally for this request
-        let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
+        let status = session
+            .response_written()
+            .map(|r| r.status.as_u16())
+            .unwrap_or(0);
         // Only a matched site becomes a metric label; an unmatched (attacker-
         // controlled) Host is collapsed to "-" so it can't inflate cardinality.
-        let host = if ctx.site.is_some() { ctx.host.as_str() } else { "-" };
+        let host = if ctx.site.is_some() {
+            ctx.host.as_str()
+        } else {
+            "-"
+        };
         let elapsed = ctx.start.elapsed();
 
-        REQUESTS.with_label_values(&[host, &format!("{}xx", status / 100)]).inc();
-        RESPONSES.with_label_values(&[host, &status.to_string()]).inc();
-        LATENCY.with_label_values(&[host]).observe(elapsed.as_secs_f64());
-        RESP_BYTES.with_label_values(&[host]).inc_by(session.body_bytes_sent() as u64);
-        REQ_BYTES.with_label_values(&[host]).inc_by(session.body_bytes_read() as u64);
-        if e.is_some() || matches!(status, 502 | 503 | 504) {
+        REQUESTS
+            .with_label_values(&[host, &format!("{}xx", status / 100)])
+            .inc();
+        RESPONSES
+            .with_label_values(&[host, &status.to_string()])
+            .inc();
+        LATENCY
+            .with_label_values(&[host])
+            .observe(elapsed.as_secs_f64());
+        RESP_BYTES
+            .with_label_values(&[host])
+            .inc_by(session.body_bytes_sent() as u64);
+        REQ_BYTES
+            .with_label_values(&[host])
+            .inc_by(session.body_bytes_read() as u64);
+        if e.is_some() || matches!(status, 502..=504) {
             UPSTREAM_ERRORS.with_label_values(&[host]).inc();
         }
         let country_metric = ctx
@@ -1286,7 +1406,9 @@ impl ProxyHttp for SluiceProxy {
             .as_ref()
             .is_some_and(|g| g.metric_labels.iter().any(|l| l == "country"));
         if country_metric && !ctx.country.is_empty() {
-            REQUESTS_BY_COUNTRY.with_label_values(&[ctx.country.as_str()]).inc();
+            REQUESTS_BY_COUNTRY
+                .with_label_values(&[ctx.country.as_str()])
+                .inc();
         }
 
         // geo fields for the access log, per configured log-fields
@@ -1315,11 +1437,19 @@ impl ProxyHttp for SluiceProxy {
             })
             .unwrap_or_default();
 
-        let client = if ctx.client_ip.is_empty() { "-" } else { ctx.client_ip.as_str() };
+        let client = if ctx.client_ip.is_empty() {
+            "-"
+        } else {
+            ctx.client_ip.as_str()
+        };
         let method = session.req_header().method.as_str().to_owned();
         let path = session.req_header().uri.path().to_owned();
         let err = e.map(|e| format!(" err={e}")).unwrap_or_default();
-        let up = if ctx.up_addr.is_empty() { "-" } else { ctx.up_addr.as_str() };
+        let up = if ctx.up_addr.is_empty() {
+            "-"
+        } else {
+            ctx.up_addr.as_str()
+        };
         // Sub-millisecond precision: static/short-circuit responses are < 1ms,
         // which as_millis() truncates to a misleading "0ms".
         log::info!(
@@ -1382,5 +1512,59 @@ impl ProxyHttp for RedirectProxy {
         _ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>> {
         Err(Error::new_str("redirect listener never proxies"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::SubFilter;
+
+    #[test]
+    fn normalize_defeats_encoding_and_traversal() {
+        assert_eq!(normalize_path("/a/../b").as_deref(), Some("/b"));
+        assert_eq!(normalize_path("//admin").as_deref(), Some("/admin"));
+        assert_eq!(normalize_path("/%61dmin").as_deref(), Some("/admin"));
+        assert_eq!(normalize_path("/a/./b/").as_deref(), Some("/a/b/"));
+        assert_eq!(
+            normalize_path("/x/../../etc/passwd").as_deref(),
+            Some("/etc/passwd")
+        );
+        assert!(normalize_path("/a\u{0}b").is_none()); // NUL rejected
+    }
+
+    #[test]
+    fn decode_query_catches_encoded_forms() {
+        assert_eq!(decode_query("union%20select"), "union select");
+        assert_eq!(decode_query("union+select"), "union select");
+        assert_eq!(decode_query("union%09select"), "union\tselect");
+        assert_eq!(decode_query("plain=1"), "plain=1");
+    }
+
+    #[test]
+    fn rewrite_stream_matches_pattern_split_across_chunks() {
+        let f = [SubFilter {
+            from: b"foobar".to_vec(),
+            to: b"X".to_vec(),
+        }];
+        // "foobar" straddles the two chunks; max_from=6.
+        let (e1, carry) = rewrite_stream(b"aa foo", &f, 6, false);
+        let mut second = carry;
+        second.extend_from_slice(b"bar bb");
+        let (e2, _) = rewrite_stream(&second, &f, 6, true);
+        let mut out = e1;
+        out.extend_from_slice(&e2);
+        assert_eq!(String::from_utf8_lossy(&out), "aa X bb");
+    }
+
+    #[test]
+    fn rewrite_stream_no_match_passes_through() {
+        let f = [SubFilter {
+            from: b"zzz".to_vec(),
+            to: b"Q".to_vec(),
+        }];
+        let (out, carry) = rewrite_stream(b"hello world", &f, 3, true);
+        assert!(carry.is_empty());
+        assert_eq!(&out, b"hello world");
     }
 }

@@ -31,7 +31,10 @@ pub fn spawn(
     challenges: ChallengeStore,
 ) {
     std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(rt) => rt,
             Err(e) => {
                 log::error!("acme: cannot start runtime: {e}");
@@ -42,30 +45,36 @@ pub fn spawn(
         load_cached(&cfg, &domains, &cert_store);
         rt.block_on(async move {
             // One ACME account, created once and reused for every domain and every
-            // renewal cycle. Registering a fresh account per provision would hit
-            // Let's Encrypt's new-account rate limit as soon as there are several
-            // domains. Credentials are cached per environment (staging vs prod).
-            let account = match get_account(&cfg).await {
-                Ok(a) => a,
-                Err(e) => {
-                    log::error!("acme: cannot initialize account: {e}");
-                    return;
-                }
-            };
+            // renewal cycle (a fresh account per provision would hit Let's
+            // Encrypt's new-account rate limit). A transient failure retries — it
+            // must NOT permanently kill the renewal thread.
+            let mut account: Option<Account> = None;
             loop {
+                if account.is_none() {
+                    match get_account(&cfg).await {
+                        Ok(a) => account = Some(a),
+                        Err(e) => {
+                            log::error!("acme: account init failed ({e}); retrying in 60s");
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                            continue;
+                        }
+                    }
+                }
+                let account = account.as_ref().unwrap();
                 for d in &domains {
                     if !needs_cert(&cfg, d) {
                         continue;
                     }
-                    match provision(&account, d, &challenges).await {
+                    match provision(account, d, &challenges).await {
                         Ok((cert_pem, key_pem)) => {
-                            let _ = std::fs::write(format!("{}/{}.crt", cfg.cache_dir, d), &cert_pem);
-                            // The private key must not be world-readable.
-                            if let Err(e) =
-                                write_private(&format!("{}/{}.key", cfg.cache_dir, d), key_pem.as_bytes())
-                            {
-                                log::warn!("acme: {d}: could not write private key: {e}");
+                            let (crt_p, key_p) = cert_paths(&cfg, d);
+                            // Write the key first (0600), then the cert, so a
+                            // present .crt always implies a present .key on disk.
+                            if let Err(e) = write_private(&key_p, key_pem.as_bytes()) {
+                                log::warn!("acme: {d}: could not write key: {e}; skipping");
+                                continue;
                             }
+                            let _ = std::fs::write(&crt_p, &cert_pem);
                             match Cert::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()) {
                                 Ok(c) => {
                                     let mut store = (**cert_store.load()).clone();
@@ -85,12 +94,25 @@ pub fn spawn(
     });
 }
 
+/// Per-environment cert/key file paths, so switching `staging` on/off doesn't
+/// serve the other environment's (e.g. untrusted staging) cert.
+fn cert_paths(cfg: &AcmeCfg, domain: &str) -> (String, String) {
+    let env = if cfg.staging { "staging" } else { "production" };
+    (
+        format!("{}/{env}-{domain}.crt", cfg.cache_dir),
+        format!("{}/{env}-{domain}.key", cfg.cache_dir),
+    )
+}
+
 /// Create the cache dir with owner-only permissions (it holds private keys).
 fn create_private_dir(dir: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir);
+        let _ = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir);
     }
     #[cfg(not(unix))]
     let _ = std::fs::create_dir_all(dir);
@@ -101,14 +123,17 @@ fn write_private(path: &str, data: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
             .mode(0o600)
             .open(path)?;
-        f.write_all(data)
+        f.write_all(data)?;
+        // mode() only applies on create — force 0600 on an existing (possibly
+        // world-readable) file too.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
     }
     #[cfg(not(unix))]
     std::fs::write(path, data)
@@ -118,8 +143,7 @@ fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertS
     let mut store = (**cert_store.load()).clone();
     let mut any = false;
     for d in domains {
-        let crt = format!("{}/{}.crt", cfg.cache_dir, d);
-        let key = format!("{}/{}.key", cfg.cache_dir, d);
+        let (crt, key) = cert_paths(cfg, d);
         if let Ok(c) = Cert::from_files(&crt, &key) {
             store.insert(d.clone(), c);
             any = true;
@@ -130,14 +154,20 @@ fn load_cached(cfg: &AcmeCfg, domains: &[String], cert_store: &Arc<ArcSwap<CertS
     }
 }
 
-/// Re-issue if the cert is missing or older than 60 days (LE certs last 90).
+/// Re-issue if either file is missing or the cert is older than 60 days (LE
+/// certs last 90). A future mtime (clock skew) is treated as "fresh" — NOT as
+/// "needs cert" — so a skewed clock can't trigger an every-12h re-issue storm
+/// that would hit Let's Encrypt's rate limit.
 fn needs_cert(cfg: &AcmeCfg, domain: &str) -> bool {
-    let crt = format!("{}/{}.crt", cfg.cache_dir, domain);
+    let (crt, key) = cert_paths(cfg, domain);
+    if !std::path::Path::new(&key).exists() {
+        return true;
+    }
     match std::fs::metadata(&crt).and_then(|m| m.modified()) {
         Ok(mtime) => mtime
             .elapsed()
             .map(|e| e > Duration::from_secs(60 * 24 * 3600))
-            .unwrap_or(true),
+            .unwrap_or(false),
         Err(_) => true,
     }
 }
@@ -199,6 +229,27 @@ async fn provision(
     domain: &str,
     challenges: &ChallengeStore,
 ) -> Result<(String, String), String> {
+    let mut published: Vec<String> = Vec::new();
+    let result = provision_inner(account, domain, challenges, &mut published).await;
+    // Always unpublish the challenge tokens — on success AND on any early error —
+    // so :80 stops answering them and the challenge map can't grow across
+    // retries/renewals.
+    if !published.is_empty() {
+        let mut map = (**challenges.load()).clone();
+        for t in &published {
+            map.remove(t);
+        }
+        challenges.store(Arc::new(map));
+    }
+    result
+}
+
+async fn provision_inner(
+    account: &Account,
+    domain: &str,
+    challenges: &ChallengeStore,
+    published: &mut Vec<String>,
+) -> Result<(String, String), String> {
     let ids = [Identifier::Dns(domain.to_string())];
     let mut order = account
         .new_order(&NewOrder::new(&ids))
@@ -208,7 +259,6 @@ async fn provision(
     // Publish the HTTP-01 response for each pending authorization, then tell the
     // server it's ready. `authorizations()` borrows the order, so scope it so the
     // borrow is released before we poll the order below.
-    let mut published: Vec<String> = Vec::new();
     {
         let mut authzs = order.authorizations();
         while let Some(res) = authzs.next().await {
@@ -234,17 +284,10 @@ async fn provision(
     }
 
     // Back off until the order is validated (Ready) or fails.
-    let poll = order.poll_ready(&RetryPolicy::default()).await;
-    // The tokens have served their purpose — stop answering them on :80 and keep
-    // the challenge map from growing across renewals (do this whatever the outcome).
-    if !published.is_empty() {
-        let mut map = (**challenges.load()).clone();
-        for t in &published {
-            map.remove(t);
-        }
-        challenges.store(Arc::new(map));
-    }
-    let status = poll.map_err(|e| format!("poll ready: {e}"))?;
+    let status = order
+        .poll_ready(&RetryPolicy::default())
+        .await
+        .map_err(|e| format!("poll ready: {e}"))?;
     if status != OrderStatus::Ready {
         return Err(format!(
             "order {status:?} — HTTP-01 validation failed (is the domain resolving \
@@ -253,7 +296,10 @@ async fn provision(
     }
 
     // finalize() generates the cert key pair internally and returns its PEM.
-    let key_pem = order.finalize().await.map_err(|e| format!("finalize: {e}"))?;
+    let key_pem = order
+        .finalize()
+        .await
+        .map_err(|e| format!("finalize: {e}"))?;
     let cert_pem = order
         .poll_certificate(&RetryPolicy::default())
         .await

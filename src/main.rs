@@ -63,21 +63,30 @@ fn main() {
             "{config_path}: ok — {} site(s), {} listener(s){}",
             config.sites.len(),
             config.listeners.len(),
-            if config.geoip.is_some() { ", geoip on" } else { "" }
+            if config.geoip.is_some() {
+                ", geoip on"
+            } else {
+                ""
+            }
         );
         return;
     }
 
     // Server config from the file.
-    let mut conf = ServerConf::default();
-    conf.threads = if config.server.threads > 0 {
+    let threads = if config.server.threads > 0 {
         config.server.threads
     } else {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     };
-    conf.grace_period_seconds = Some(config.server.grace_period_secs);
-    conf.graceful_shutdown_timeout_seconds = Some(config.server.graceful_shutdown_secs);
-    conf.upstream_keepalive_pool_size = config.server.upstream_keepalive_pool;
+    let mut conf = ServerConf {
+        threads,
+        grace_period_seconds: Some(config.server.grace_period_secs),
+        graceful_shutdown_timeout_seconds: Some(config.server.graceful_shutdown_secs),
+        upstream_keepalive_pool_size: config.server.upstream_keepalive_pool,
+        ..Default::default()
+    };
     if let Some(sock) = &config.server.upgrade_sock {
         conf.upgrade_sock = sock.clone();
     } else if upgrade {
@@ -92,7 +101,10 @@ fn main() {
 
     // `upgrade` makes bootstrap acquire the listening FDs from the old process
     // (via `upgrade-sock`) instead of binding fresh — zero-downtime upgrade.
-    let opt = Opt { upgrade, ..Default::default() };
+    let opt = Opt {
+        upgrade,
+        ..Default::default()
+    };
     let mut server = Server::new_with_opt_and_conf(opt, conf);
     server.bootstrap();
     let threads = server.configuration.threads;
@@ -103,8 +115,12 @@ fn main() {
     let acme_cfg = config.acme.clone();
     // Only provision hosts that opted in with `acme true` — a CF-fronted host
     // can't pass HTTP-01, so enrolling every site would fail forever.
-    let acme_domains: Vec<String> =
-        config.sites.iter().filter(|s| s.acme).map(|s| s.host.clone()).collect();
+    let acme_domains: Vec<String> = config
+        .sites
+        .iter()
+        .filter(|s| s.acme)
+        .map(|s| s.host.clone())
+        .collect();
     if config
         .listeners
         .iter()
@@ -134,7 +150,10 @@ fn main() {
     let mut proxy = http_proxy_service(&server.configuration, SluiceProxy::new(cfg.clone()));
     let mut redirector = http_proxy_service(
         &server.configuration,
-        RedirectProxy { cfg: cfg.clone(), challenges: acme_challenges.clone() },
+        RedirectProxy {
+            cfg: cfg.clone(),
+            challenges: acme_challenges.clone(),
+        },
     );
     let mut n_tls = 0;
     let mut n_redirect = 0;
@@ -182,7 +201,9 @@ fn main() {
         }
     }
 
-    log::info!("sluice: {n_tls} tls + {n_redirect} redirect listener(s), {threads} worker thread(s)");
+    log::info!(
+        "sluice: {n_tls} tls + {n_redirect} redirect listener(s), {threads} worker thread(s)"
+    );
     if n_tls > 0 {
         server.add_service(proxy);
     }

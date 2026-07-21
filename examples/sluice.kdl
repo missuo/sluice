@@ -79,6 +79,7 @@ site "api.example.com" {
         block field="user-agent" match="(?i)sqlmap|nikto"
         block field="query" match=r"(?i)union\s+select"
     }
+    rate-limit rps=50 burst=100          // token bucket per client IP (site-wide)
 
     // Locations match in order; first match wins (put specific paths first).
     location "/static/" {
@@ -116,7 +117,6 @@ site "api.example.com" {
         cache {
             ttl-secs 60                  // fallback TTL; origin Cache-Control wins
         }
-        rate-limit rps=50 burst=100      // token bucket per client IP
         // Streaming response-body rewrite (nginx sub_filter). Text responses
         // only; the origin is asked for an uncompressed body. Repeatable.
         sub-filter from="http://internal.local" to="https://api.example.com"
