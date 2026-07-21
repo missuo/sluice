@@ -83,6 +83,18 @@ site "api.example.com" {
             server "10.0.0.1:8080"
             server "10.0.0.2:8080"
             balance "round-robin"        // round-robin | random | ip-hash
+            // Active health checks (like Caddy). Omit this block for passive-only
+            // (a backend is skipped for 10s after a failed connect). With it, a
+            // background task probes each backend and takes it out of rotation
+            // proactively — catching a backend that connects but is unhealthy.
+            health-check {
+                path "/healthz"          // omit → TCP-connect check
+                interval-secs 3
+                timeout-secs 2
+                unhealthy 3              // consecutive fails → down
+                healthy 2                // consecutive oks → back up
+                // expect-status 200     // default: any 200–399
+            }
         }
         read-timeout-secs 300            // SSE / streaming
         max-body "32MiB"

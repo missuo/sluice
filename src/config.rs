@@ -164,6 +164,23 @@ pub enum Balance {
 pub struct UpstreamGroup {
     pub servers: Vec<Upstream>,
     pub balance: Balance,
+    /// Active background health checking for this pool (None = passive only).
+    pub health_check: Option<HealthCheck>,
+}
+
+/// Active health check (like Caddy's `health_checks active`): a background task
+/// probes each backend on an interval; a backend is taken out of rotation after
+/// `unhealthy` consecutive failures and returned after `healthy` successes.
+#[derive(Debug, Clone)]
+pub struct HealthCheck {
+    /// HTTP GET path to probe (plaintext backends). None = TCP-connect check.
+    pub path: Option<String>,
+    pub interval: Duration,
+    pub timeout: Duration,
+    pub healthy: u32,
+    pub unhealthy: u32,
+    /// Inclusive expected HTTP status range for an HTTP check.
+    pub expect_status: (u16, u16),
 }
 
 /// How a `location` matches the request path.
@@ -751,7 +768,30 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
     if servers.is_empty() {
         return Err(format!("site `{host}`: upstream has no servers"));
     }
-    Ok(UpstreamGroup { servers, balance })
+    let health_check = match child(node, "health-check") {
+        Some(h) => Some(parse_health_check(h, host)?),
+        None => None,
+    };
+    Ok(UpstreamGroup { servers, balance, health_check })
+}
+
+fn parse_health_check(node: &KdlNode, host: &str) -> Result<HealthCheck, String> {
+    let path = child_arg(node, "path").map(str::to_owned);
+    let interval = Duration::from_secs(child_int(node, "interval-secs").unwrap_or(5).max(1) as u64);
+    let timeout = Duration::from_secs(child_int(node, "timeout-secs").unwrap_or(2).max(1) as u64);
+    let healthy = child_int(node, "healthy").unwrap_or(2).max(1) as u32;
+    let unhealthy = child_int(node, "unhealthy").unwrap_or(3).max(1) as u32;
+    let expect_status = match child_int(node, "expect-status") {
+        Some(v) => {
+            let s = u16::try_from(v)
+                .ok()
+                .filter(|s| (100..=599).contains(s))
+                .ok_or_else(|| format!("site `{host}`: health-check expect-status {v} invalid"))?;
+            (s, s)
+        }
+        None => (200, 399),
+    };
+    Ok(HealthCheck { path, interval, timeout, healthy, unhealthy, expect_status })
 }
 
 /// The backend of a site or location: exactly one of `upstream` / `file-server`.

@@ -20,7 +20,10 @@ against live Let's Encrypt (staging + production).
   `~regex`, first match wins) — nginx-style routing to different backends per path.
 - **Load-balanced upstream pools**: `upstream { server …; server …; balance … }`
   with **round-robin / random / ip-hash** selection and connect-failure
-  **failover** to the next member.
+  **failover** to the next member. **Health checks**: passive by default (skip a
+  backend for 10s after a failed connect) and optional **active** probing
+  (`health-check { path … interval-secs … }`, like Caddy) that takes an
+  unhealthy-but-reachable backend out of rotation proactively.
 - **Response cache** (`cache { ttl-secs … }`, backed by `pingora-cache`): in-memory
   LRU with a thundering-herd lock; honors the origin's `Cache-Control` (never
   caches `no-store`/`private`/`Set-Cookie`) and applies the location TTL otherwise.

@@ -323,6 +323,122 @@ fn fast_rand() -> u64 {
 /// How long a backend stays marked down after a connect failure.
 const HEALTH_COOLDOWN: Duration = Duration::from_secs(10);
 
+/// Active-health state for one backend (populated only when a pool configures a
+/// `health-check`). Starts healthy (optimistic, like Caddy) and flips after
+/// `unhealthy`/`healthy` consecutive probe results.
+struct ActiveHealth {
+    healthy: bool,
+    ok_streak: u32,
+    fail_streak: u32,
+    last_probe: Instant,
+}
+
+/// Background active health checker: every second it re-reads the live config
+/// (so reloads are picked up), probes each backend whose pool set a
+/// `health-check` when its interval is due, and flips its health state.
+fn spawn_health_prober(cfg: Arc<ArcSwap<Config>>, health: Arc<DashMap<String, ActiveHealth>>) {
+    use crate::config::HealthCheck;
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                log::error!("health: cannot start runtime: {e}");
+                return;
+            }
+        };
+        rt.block_on(async move {
+            loop {
+                // Collect probe targets from the current config: addr → (check, tls, host).
+                let snap = cfg.load();
+                let mut targets: std::collections::HashMap<String, (HealthCheck, bool, String)> =
+                    std::collections::HashMap::new();
+                for site in &snap.sites {
+                    for loc in &site.locations {
+                        if let Handler::Proxy(g) = &loc.handler {
+                            if let Some(hc) = &g.health_check {
+                                for s in &g.servers {
+                                    targets
+                                        .entry(format!("{}:{}", s.host, s.port))
+                                        .or_insert_with(|| (hc.clone(), s.tls, s.host.clone()));
+                                }
+                            }
+                        }
+                    }
+                }
+                // Forget backends no longer under a health check.
+                health.retain(|k, _| targets.contains_key(k));
+
+                let now = Instant::now();
+                for (addr, (hc, tls, host)) in &targets {
+                    let due = health
+                        .get(addr)
+                        .map(|h| now.duration_since(h.last_probe) >= hc.interval)
+                        .unwrap_or(true);
+                    if !due {
+                        continue;
+                    }
+                    let ok = probe(addr, hc, *tls, host).await;
+                    let mut e = health.entry(addr.clone()).or_insert(ActiveHealth {
+                        healthy: true,
+                        ok_streak: 0,
+                        fail_streak: 0,
+                        last_probe: now,
+                    });
+                    e.last_probe = now;
+                    if ok {
+                        e.fail_streak = 0;
+                        e.ok_streak = e.ok_streak.saturating_add(1);
+                        if !e.healthy && e.ok_streak >= hc.healthy {
+                            e.healthy = true;
+                            log::info!("health: {addr} is UP");
+                        }
+                    } else {
+                        e.ok_streak = 0;
+                        e.fail_streak = e.fail_streak.saturating_add(1);
+                        if e.healthy && e.fail_streak >= hc.unhealthy {
+                            e.healthy = false;
+                            log::warn!("health: {addr} is DOWN");
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+    });
+}
+
+/// Probe one backend. TCP-connect check by default; an HTTP GET check when a
+/// `path` is set on a plaintext backend (TLS backends fall back to connect-level).
+async fn probe(addr: &str, hc: &crate::config::HealthCheck, tls: bool, host: &str) -> bool {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let conn = tokio::time::timeout(hc.timeout, tokio::net::TcpStream::connect(addr)).await;
+    let mut stream = match conn {
+        Ok(Ok(s)) => s,
+        _ => return false,
+    };
+    let path = match &hc.path {
+        Some(p) if !tls => p,
+        _ => return true, // TCP-connect (or TLS backend) → connect success is enough
+    };
+    let req = format!(
+        "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: sluice-health\r\nConnection: close\r\n\r\n"
+    );
+    if tokio::time::timeout(hc.timeout, stream.write_all(req.as_bytes())).await.is_err() {
+        return false;
+    }
+    let mut buf = [0u8; 256];
+    let n = match tokio::time::timeout(hc.timeout, stream.read(&mut buf)).await {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return false,
+    };
+    // Parse the status code from "HTTP/1.x NNN ...".
+    let head = String::from_utf8_lossy(&buf[..n]);
+    match head.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()) {
+        Some(s) => s >= hc.expect_status.0 && s <= hc.expect_status.1,
+        None => false,
+    }
+}
+
 pub struct SluiceProxy {
     cfg: Arc<ArcSwap<Config>>,
     limiter: Arc<DashMap<(String, IpAddr), Bucket>>,
@@ -330,6 +446,8 @@ pub struct SluiceProxy {
     rr: Arc<DashMap<(String, usize), u64>>,
     /// Passive health: "host:port" → instant until which it's considered down.
     health: Arc<DashMap<String, Instant>>,
+    /// Active health: "host:port" → probe state (only for pools with a health-check).
+    health_active: Arc<DashMap<String, ActiveHealth>>,
 }
 
 impl SluiceProxy {
@@ -342,17 +460,25 @@ impl SluiceProxy {
             std::thread::sleep(Duration::from_secs(60));
             sweep.retain(|_, b: &mut Bucket| b.last.elapsed() < Duration::from_secs(600));
         });
+        // Background active health checker (reads the live config each cycle).
+        let health_active: Arc<DashMap<String, ActiveHealth>> = Arc::new(DashMap::new());
+        spawn_health_prober(cfg.clone(), health_active.clone());
         SluiceProxy {
             cfg,
             limiter,
             rr: Arc::new(DashMap::new()),
             health: Arc::new(DashMap::new()),
+            health_active,
         }
     }
 
-    /// Is this backend currently marked down (within its cooldown)?
+    /// Is this backend out of rotation — either passively (recent connect failure,
+    /// within cooldown) or actively (a configured health check marked it down)?
     fn is_down(&self, addr: &str) -> bool {
-        self.health.get(addr).is_some_and(|until| Instant::now() < *until)
+        if self.health.get(addr).is_some_and(|until| Instant::now() < *until) {
+            return true;
+        }
+        self.health_active.get(addr).is_some_and(|h| !h.healthy)
     }
 
     /// Mark a backend down for the cooldown after a connect failure.
