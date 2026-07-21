@@ -163,6 +163,9 @@ pub enum Balance {
     /// Sticky by client IP via a consistent-hash ring: adding/removing a backend
     /// only remaps ~1/n of clients, and `weight` scales each backend's share.
     Ketama,
+    /// Fewest in-flight requests wins (weighted): sends each request to the least
+    /// busy backend — best when request durations vary a lot.
+    LeastConn,
 }
 
 /// One or more backends selected by a `Balance` policy, with connect-failure
@@ -799,9 +802,11 @@ fn parse_upstream_group(node: &KdlNode, host: &str) -> Result<UpstreamGroup, Str
                 "random" => Balance::Random,
                 "ip-hash" => Balance::IpHash,
                 "ketama" => Balance::Ketama,
+                "least-conn" => Balance::LeastConn,
                 other => {
                     return Err(format!(
-                        "site `{host}`: unknown balance {other:?} (round-robin|random|ip-hash|ketama)"
+                        "site `{host}`: unknown balance {other:?} \
+                         (round-robin|random|ip-hash|ketama|least-conn)"
                     ))
                 }
             };

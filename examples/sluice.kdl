@@ -82,9 +82,10 @@ site "api.example.com" {
         upstream {
             server "10.0.0.1:8080" weight=3   // gets 3× the traffic of the next
             server "10.0.0.2:8080"            // weight defaults to 1
-            balance "round-robin"        // round-robin | random | ip-hash | ketama
-            //   ketama = consistent hashing by client IP (scaling the pool only
-            //   remaps ~1/n of clients; weight scales each backend's share)
+            balance "round-robin"        // round-robin | random | ip-hash | ketama | least-conn
+            //   ketama     = consistent hashing by client IP (scaling the pool
+            //                only remaps ~1/n of clients; weight scales the share)
+            //   least-conn = fewest in-flight requests wins (adapts to load)
             // Active health checks (like Caddy). Omit this block for passive-only
             // (a backend is skipped for 10s after a failed connect). With it, a
             // background task probes each backend and takes it out of rotation

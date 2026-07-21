@@ -485,6 +485,8 @@ pub struct SluiceProxy {
     health: Arc<DashMap<String, Instant>>,
     /// Active health: "host:port" → probe state (only for pools with a health-check).
     health_active: Arc<DashMap<String, ActiveHealth>>,
+    /// In-flight request count per backend "host:port", for `balance least-conn`.
+    conns: Arc<DashMap<String, i64>>,
 }
 
 impl SluiceProxy {
@@ -506,6 +508,28 @@ impl SluiceProxy {
             rr: Arc::new(DashMap::new()),
             health: Arc::new(DashMap::new()),
             health_active,
+            conns: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Move this request's active-connection tally to `addr` (for least-conn):
+    /// decrement whatever it was counted against before (e.g. a failover
+    /// attempt), increment `addr`, and remember it on the ctx.
+    fn count_conn(&self, ctx: &mut Ctx, addr: &str) {
+        if ctx.counted_addr.as_deref() == Some(addr) {
+            return;
+        }
+        if let Some(prev) = ctx.counted_addr.take() {
+            *self.conns.entry(prev).or_insert(0) -= 1;
+        }
+        *self.conns.entry(addr.to_string()).or_insert(0) += 1;
+        ctx.counted_addr = Some(addr.to_string());
+    }
+
+    /// Release this request's active-connection tally at the end (in `logging`).
+    fn release_conn(&self, ctx: &mut Ctx) {
+        if let Some(addr) = ctx.counted_addr.take() {
+            *self.conns.entry(addr).or_insert(0) -= 1;
         }
     }
 
@@ -535,6 +559,35 @@ impl SluiceProxy {
             Balance::Random => weighted_random(&group.servers),
             Balance::IpHash => (str_hash(client_ip) % n as u64) as usize,
             Balance::Ketama => ketama_pick(&group.ring, client_ip),
+            Balance::LeastConn => self.least_conn(&group.servers),
+        }
+    }
+
+    /// Weighted least-connections: the up backend with the smallest
+    /// active-requests / weight ratio. Ties break toward the earlier server.
+    fn least_conn(&self, servers: &[Upstream]) -> usize {
+        let mut best = 0usize;
+        let mut best_score = f64::MAX;
+        let mut any_up = false;
+        for (i, s) in servers.iter().enumerate() {
+            let addr = format!("{}:{}", s.host, s.port);
+            if self.is_down(&addr) {
+                continue;
+            }
+            any_up = true;
+            let active = self.conns.get(&addr).map(|v| *v).unwrap_or(0).max(0) as f64;
+            let score = active / s.weight.max(1) as f64;
+            if score < best_score {
+                best_score = score;
+                best = i;
+            }
+        }
+        // If every backend is down, fall back to server 0; the skip-down walk in
+        // upstream_peer will still try to find a live one.
+        if any_up {
+            best
+        } else {
+            0
         }
     }
 
@@ -601,6 +654,8 @@ pub struct Ctx {
     up_addr: String,
     /// Host header to send to the chosen upstream (None = preserve client Host).
     up_host_header: Option<String>,
+    /// Backend "host:port" this request is currently counted against (least-conn).
+    counted_addr: Option<String>,
     client_ip: String,
     country: String,
     asn: String,
@@ -630,6 +685,7 @@ impl ProxyHttp for SluiceProxy {
             tries: 0,
             up_addr: String::new(),
             up_host_header: None,
+            counted_addr: None,
             client_ip: String::new(),
             country: String::new(),
             asn: String::new(),
@@ -946,8 +1002,12 @@ impl ProxyHttp for SluiceProxy {
             }
         }
         let up = &group.servers[chosen];
-        ctx.up_addr = format!("{}:{}", up.host, up.port);
+        let addr = format!("{}:{}", up.host, up.port);
+        // Account this request against the chosen backend for least-conn (moves
+        // the tally if a failover changed the target).
+        self.count_conn(ctx, &addr);
         ctx.up_host_header = up.host_header.clone();
+        ctx.up_addr = addr;
 
         // tls + sni for https upstreams (OpenAI/S3); plaintext for bare host:port.
         let mut peer = HttpPeer::new((up.host.as_str(), up.port), up.tls, up.sni.clone());
@@ -1044,6 +1104,7 @@ impl ProxyHttp for SluiceProxy {
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Ctx) {
         INFLIGHT.dec();
+        self.release_conn(ctx); // release the least-conn tally for this request
         let status = session.response_written().map(|r| r.status.as_u16()).unwrap_or(0);
         // Only a matched site becomes a metric label; an unmatched (attacker-
         // controlled) Host is collapsed to "-" so it can't inflate cardinality.
