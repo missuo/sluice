@@ -12,6 +12,7 @@ use http::uri::Authority;
 use ipnet::IpNet;
 use maxminddb::geoip2;
 use pingora::apps::ServerApp;
+use pingora::connectors::TransportConnector;
 use pingora::http::{RequestHeader, ResponseHeader};
 use pingora::listeners::ConnectionFilter;
 use pingora::prelude::*;
@@ -1064,6 +1065,10 @@ fn spawn_health_prober(
             }
         };
         rt.block_on(async move {
+            // One TLS client connector for every TLS health probe: it builds the
+            // verifying SSL context once and each `new_stream` opens a FRESH,
+            // never-pooled connection (so a probe always tests a real handshake).
+            let connector = Arc::new(TransportConnector::new(None));
             loop {
                 // Collect probe targets from the current config. The map key is the
                 // *probe identity* — (site host, location index, backend addr) — not
@@ -1072,8 +1077,21 @@ fn spawn_health_prober(
                 // their own probe config, instead of colliding on one entry.
                 let snap = cfg.load();
                 // key: probe identity → (addr "host:port", host, port, hc, tls,
-                // probe Host, config fingerprint).
-                type ProbeTarget = (String, String, u16, HealthCheck, bool, String, u64);
+                // probe Host, SNI, verify, config fingerprint). SNI + verify are
+                // carried so a TLS probe uses the SAME cert-verification policy as
+                // the request path, and a change to either re-probes (they're in
+                // the fingerprint below).
+                type ProbeTarget = (
+                    String,
+                    String,
+                    u16,
+                    HealthCheck,
+                    bool,
+                    String,
+                    String,
+                    bool,
+                    u64,
+                );
                 let mut targets: std::collections::HashMap<String, ProbeTarget> =
                     std::collections::HashMap::new();
                 // DNS parameters for the probe path (reload-aware).
@@ -1101,8 +1119,11 @@ fn spawn_health_prober(
                                         .unwrap_or_else(|| s.host.clone());
                                     // Fingerprint the effective probe config so a
                                     // reload that changes it resets the state.
+                                    // Includes SNI + verify so switching either the
+                                    // cert-hostname or the verification policy
+                                    // re-probes instead of trusting a stale verdict.
                                     let fp = str_hash(&format!(
-                                        "{:?}|{:?}|{:?}|{}|{}|{:?}|{}|{probe_host}",
+                                        "{:?}|{:?}|{:?}|{}|{}|{:?}|{}|{}|{}|{probe_host}",
                                         hc.path,
                                         hc.interval,
                                         hc.timeout,
@@ -1110,6 +1131,8 @@ fn spawn_health_prober(
                                         hc.unhealthy,
                                         hc.expect_status,
                                         s.tls,
+                                        s.sni,
+                                        s.verify,
                                     ));
                                     targets
                                         .entry(active_health_key(&site.host, li, &addr))
@@ -1121,6 +1144,8 @@ fn spawn_health_prober(
                                                 hc.clone(),
                                                 s.tls,
                                                 probe_host,
+                                                s.sni.clone(),
+                                                s.verify,
                                                 fp,
                                             )
                                         });
@@ -1137,7 +1162,7 @@ fn spawn_health_prober(
                 // not delay the others — one cycle is bounded by one timeout, not
                 // by the sum over the pool).
                 let mut tasks = Vec::new();
-                for (key, (_addr, be_host, be_port, hc, tls, host, fp)) in targets {
+                for (key, (_addr, be_host, be_port, hc, tls, host, sni, verify, fp)) in targets {
                     let due = health
                         .get(&key)
                         .map(|h| h.fp != fp || now.duration_since(h.last_probe) >= hc.interval)
@@ -1146,6 +1171,7 @@ fn spawn_health_prober(
                         continue;
                     }
                     let dns = dns.clone();
+                    let connector = connector.clone();
                     tasks.push(tokio::spawn(async move {
                         // Resolve the backend through the SHARED, bounded DnsCache
                         // (singleflight + backoff + concurrency cap, coalesced with
@@ -1161,7 +1187,7 @@ fn spawn_health_prober(
                                 // request path's address failover).
                                 let mut up = false;
                                 for a in addrs {
-                                    if probe(a, &hc, tls, &host).await {
+                                    if probe(a, &hc, tls, &sni, verify, &host, &connector).await {
                                         up = true;
                                         break;
                                     }
@@ -1219,38 +1245,102 @@ fn spawn_health_prober(
     });
 }
 
-/// Probe one backend at an ALREADY-RESOLVED socket address. TCP-connect check by
-/// default; an HTTP GET check when a `path` is set on a plaintext backend (TLS
-/// backends fall back to connect-level). Connecting to a `SocketAddr` (not a
-/// hostname) means the health prober never triggers the non-cancellable system
-/// resolver itself — DNS is resolved beforehand through the shared, bounded
-/// `DnsCache` (round-22 finding 4).
-async fn probe(addr: SocketAddr, hc: &crate::config::HealthCheck, tls: bool, host: &str) -> bool {
+/// Probe one backend at an ALREADY-RESOLVED socket address. Connecting to a
+/// `SocketAddr` (not a hostname) means the prober never triggers the
+/// non-cancellable system resolver itself — DNS is resolved beforehand through
+/// the shared, bounded `DnsCache` (round-22 finding 4).
+///
+/// The check performed depends on the backend:
+///  * **No health path** → TCP connect success is the check (liveness only).
+///  * **Plaintext + path** → TCP connect, HTTP `GET path`, validate the status
+///    is inside `expect_status`.
+///  * **TLS + path** → a VERIFIED TLS client handshake using the backend's SNI
+///    and the SAME `verify_cert`/`verify_hostname` policy as the request-path
+///    [`HttpPeer`], then the same HTTP `GET` + status validation over TLS. A
+///    backend with an expired/wrong certificate, a broken TLS stack, or a 5xx
+///    health endpoint therefore counts as DOWN instead of staying in rotation
+///    on a bare open port (KNOWN_ISSUES 3.2).
+///
+/// ONE absolute deadline (`now + hc.timeout`) bounds the whole probe — connect,
+/// TLS handshake, request write, and status read together — so a stall at any
+/// stage flips the backend DOWN at the deadline rather than compounding.
+async fn probe(
+    addr: SocketAddr,
+    hc: &crate::config::HealthCheck,
+    tls: bool,
+    sni: &str,
+    verify: bool,
+    host: &str,
+    connector: &TransportConnector,
+) -> bool {
+    let deadline = tokio::time::Instant::now() + hc.timeout;
+    match (&hc.path, tls) {
+        // TLS backend with a health path: verified handshake + HTTP status.
+        (Some(path), true) => {
+            // Build the SAME peer the request path builds (literal SocketAddr →
+            // no DNS, cannot panic), carrying the original SNI and verification
+            // policy so cert-hostname/chain verification matches production.
+            let mut peer = HttpPeer::new(addr, true, sni.to_string());
+            peer.options.verify_cert = verify;
+            peer.options.verify_hostname = verify;
+            // Secondary bound on the connect+handshake; the outer `timeout_at` is
+            // the authoritative single deadline.
+            peer.options.connection_timeout = Some(hc.timeout);
+            let stream = match tokio::time::timeout_at(deadline, connector.new_stream(&peer)).await
+            {
+                Ok(Ok(s)) => s,    // TCP + verified TLS handshake succeeded
+                _ => return false, // connect / handshake / verification failure or deadline
+            };
+            http_status_ok(stream, path, host, hc, deadline).await
+        }
+        // Plaintext backend with a health path: HTTP GET + status validation.
+        (Some(path), false) => {
+            let stream =
+                match tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => return false,
+                };
+            http_status_ok(stream, path, host, hc, deadline).await
+        }
+        // No health path: a successful TCP connect is the liveness check.
+        (None, _) => matches!(
+            tokio::time::timeout_at(deadline, tokio::net::TcpStream::connect(addr)).await,
+            Ok(Ok(_))
+        ),
+    }
+}
+
+/// Send `GET path` with `Host: host` on an already-connected stream (plaintext
+/// TCP or a verified TLS stream) and decide health from the response STATUS line.
+/// `deadline` is the single absolute cutoff shared with the connect/handshake, so
+/// write + status read cannot extend the probe past it.
+async fn http_status_ok<S>(
+    mut stream: S,
+    path: &str,
+    host: &str,
+    hc: &crate::config::HealthCheck,
+    deadline: tokio::time::Instant,
+) -> bool
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let conn = tokio::time::timeout(hc.timeout, tokio::net::TcpStream::connect(addr)).await;
-    let mut stream = match conn {
-        Ok(Ok(s)) => s,
-        _ => return false,
-    };
-    let path = match &hc.path {
-        Some(p) if !tls => p,
-        _ => return true, // TCP-connect (or TLS backend) → connect success is enough
-    };
     let req = format!(
         "GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: sluice-health\r\nConnection: close\r\n\r\n"
     );
-    if tokio::time::timeout(hc.timeout, stream.write_all(req.as_bytes()))
-        .await
-        .is_err()
-    {
+    if !matches!(
+        tokio::time::timeout_at(deadline, stream.write_all(req.as_bytes())).await,
+        Ok(Ok(()))
+    ) {
         return false;
     }
     // Read until the status line is complete (first CRLF), EOF, a 1 KiB cap, or
-    // the timeout — a backend that flushes the status line in fragments (e.g.
+    // the deadline — a backend that flushes the status line in fragments (e.g.
     // "HTTP/1." then "1 200 OK\r\n") must not be misread as DOWN off a single
     // short read().
     let mut buf: Vec<u8> = Vec::with_capacity(256);
-    let _ = tokio::time::timeout(hc.timeout, async {
+    let _ = tokio::time::timeout_at(deadline, async {
         let mut chunk = [0u8; 256];
         loop {
             match stream.read(&mut chunk).await {
@@ -1311,6 +1401,14 @@ async fn probe(addr: SocketAddr, hc: &crate::config::HealthCheck, tls: bool, hos
 /// are exact (guard drop is immediate on close); pending slots self-heal via the
 /// TTL AND a periodic global sweep, so abandoned handshakes never leave a
 /// permanent entry (see [`ConnLimiter::spawn_sweeper`]).
+/// Slack added to the TLS handshake timeout to form the pending-slot TTL (see
+/// [`ConnLimiter::for_handshake_timeout`]). Generously covers the delay between a
+/// connection being accepted (when its pending slot is timestamped) and its spawned
+/// handshake task actually starting its timeout, plus cleanup — under any realistic
+/// executor saturation — so the pre-handshake reservation NEVER expires before the
+/// handshake it covers could still be live.
+const PENDING_GRACE: Duration = Duration::from_secs(30);
+
 #[derive(Debug)]
 pub struct ConnLimiter {
     max: u32,
@@ -1348,16 +1446,39 @@ impl IpConns {
 
 impl ConnLimiter {
     pub fn new(max: u32) -> Self {
-        // Match Pingora's hardcoded 60s downstream-handshake timeout: a pending
-        // socket is gone (handshaked or dropped) by then, so a slightly-generous
-        // TTL never under-counts a live pre-handshake connection.
+        // Default TTL matches Pingora's former hardcoded 60s downstream-handshake
+        // timeout. Production wires the configurable value via `with_pending_ttl`.
+        Self::with_pending_ttl(max, Duration::from_secs(60))
+    }
+
+    /// Like [`ConnLimiter::new`] but with an explicit pending-slot TTL.
+    pub fn with_pending_ttl(max: u32, pending_ttl: Duration) -> Self {
         ConnLimiter {
             max,
-            pending_ttl: Duration::from_secs(60),
+            pending_ttl,
             sweep_interval: Duration::from_secs(10),
             max_entries: 1_000_000,
             state: DashMap::new(),
         }
+    }
+
+    /// Build a limiter whose pending-slot TTL is derived from the downstream TLS
+    /// `handshake_timeout` — but strictly LONGER than it.
+    ///
+    /// A pending slot is timestamped at ACCEPT, while the vendored accept loop starts
+    /// its `timeout(handshake_timeout, ..)` only AFTER the spawned handshake task is
+    /// scheduled. So the handshake can stay live until `accept + scheduling_delay +
+    /// handshake_timeout`. If the TTL were exactly `handshake_timeout` the slot would
+    /// expire at `accept + handshake_timeout` — BEFORE that deadline under executor
+    /// saturation — letting a new connection reclaim the slot while the original is
+    /// still live and briefly exceeding the per-IP pre-handshake cap. Adding
+    /// [`PENDING_GRACE`] keeps the accounting expiry safely past the handshake
+    /// deadline plus a generous scheduling/cleanup margin. (A successful handshake
+    /// retires its slot far sooner via `promote`; the TTL is only the crash-safety
+    /// fallback for handshakes that never promote — where over-counting a lingering
+    /// slot is the safe direction.)
+    pub fn for_handshake_timeout(max: u32, handshake_timeout: Duration) -> Self {
+        Self::with_pending_ttl(max, handshake_timeout.saturating_add(PENDING_GRACE))
     }
 
     pub fn enabled(&self) -> bool {
@@ -3327,6 +3448,44 @@ mod tests {
     }
 
     #[test]
+    fn pending_ttl_outlives_the_handshake_deadline_and_scheduling_slack() {
+        // Finding 4: the pending slot is timestamped at ACCEPT, but the vendored
+        // accept loop starts `timeout(handshake_timeout, ..)` only after the spawned
+        // task is scheduled. If the TTL equalled the handshake timeout, the slot
+        // would expire (accept + hs) BEFORE the handshake deadline (accept + delay +
+        // hs) under executor saturation, letting a new conn reclaim the slot while
+        // the original is still live and briefly exceeding the per-IP cap.
+        // `for_handshake_timeout` adds a generous grace so that cannot happen.
+        let hs = Duration::from_secs(10);
+        let lim = ConnLimiter::for_handshake_timeout(1, hs);
+        assert!(
+            lim.pending_ttl > hs,
+            "pending TTL must strictly exceed the handshake timeout"
+        );
+        assert_eq!(lim.pending_ttl, hs + PENDING_GRACE);
+
+        // Boundary via the prune primitive (simulating a delayed handshake-task poll).
+        let t0 = Instant::now();
+        let mut e = IpConns::default();
+        e.pending.push(t0);
+        // A handshake scheduled after a large delay: its deadline is t0+delay+hs, and
+        // the slot must still be counted there (not reclaimed at t0+hs).
+        let delay = PENDING_GRACE / 2;
+        e.prune(t0 + delay + hs, lim.pending_ttl);
+        assert_eq!(
+            e.in_flight(),
+            1,
+            "a delayed-then-live handshake's slot must survive to its deadline"
+        );
+        // The slot is only reclaimed after the FULL TTL (crash-safety fallback).
+        e.prune(
+            t0 + hs + PENDING_GRACE + Duration::from_secs(1),
+            lim.pending_ttl,
+        );
+        assert_eq!(e.in_flight(), 0, "slot reclaimed after the full TTL");
+    }
+
+    #[test]
     fn conn_limiter_aggregates_ipv6_by_64() {
         // Two addresses in the SAME /64 must share one budget (a subscriber can
         // pick any interface-identifier bits), while a DIFFERENT /64 is independent.
@@ -3984,8 +4143,9 @@ mod tests {
                 unhealthy: 1,
                 expect_status: (200, 200),
             };
+            let connector = TransportConnector::new(None);
             assert!(
-                probe(addr, &hc, false, "vhost.test").await,
+                probe(addr, &hc, false, "", false, "vhost.test", &connector).await,
                 "fragmented 200 status line must count as UP"
             );
             let miss = crate::config::HealthCheck {
@@ -3993,7 +4153,7 @@ mod tests {
                 ..hc
             };
             assert!(
-                !probe(addr, &miss, false, "vhost.test").await,
+                !probe(addr, &miss, false, "", false, "vhost.test", &connector).await,
                 "status outside the expected range must count as DOWN"
             );
         });
@@ -4029,9 +4189,238 @@ mod tests {
                 unhealthy: 1,
                 expect_status: (200, 200),
             };
+            let connector = TransportConnector::new(None);
             assert!(
-                !probe(addr, &hc, false, "vhost.test").await,
+                !probe(addr, &hc, false, "", false, "vhost.test", &connector).await,
                 "a status line with no CRLF (hung backend) must be DOWN"
+            );
+        });
+    }
+
+    // ---- HTTPS-upstream active-health probe tests (KNOWN_ISSUES 3.2) ----
+    // Both the test TLS backend and the probe client go through Pingora's
+    // backend-neutral TLS facade, so these run identically under the openssl and
+    // boringssl features.
+
+    fn hc_tls(expect: (u16, u16), timeout_ms: u64) -> crate::config::HealthCheck {
+        crate::config::HealthCheck {
+            path: Some("/health".into()),
+            interval: Duration::from_secs(1),
+            timeout: Duration::from_millis(timeout_ms),
+            healthy: 1,
+            unhealthy: 1,
+            expect_status: expect,
+        }
+    }
+
+    fn probe_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    // A self-signed TLS backend for SAN `san` that replies with `response` after
+    // completing the handshake and reading the request. Returns its bound address.
+    // The acceptor is built from an in-memory rcgen cert through the SAME TLS
+    // backend the proxy uses (`pingora::tls`).
+    async fn spawn_tls_backend(san: &str, response: &'static [u8]) -> SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let mut params = rcgen::CertificateParams::new(vec![san.to_string()]).unwrap();
+        params.not_before = time::OffsetDateTime::now_utc() - time::Duration::days(1);
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(30);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let x = pingora::tls::x509::X509::from_pem(cert.pem().as_bytes()).unwrap();
+        let k =
+            pingora::tls::pkey::PKey::private_key_from_pem(key.serialize_pem().as_bytes()).unwrap();
+        let mut b = pingora::tls::ssl::SslAcceptor::mozilla_intermediate_v5(
+            pingora::tls::ssl::SslMethod::tls(),
+        )
+        .unwrap();
+        b.set_certificate(&x).unwrap();
+        b.set_private_key(&k).unwrap();
+        let acceptor = Arc::new(b.build());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(ssl) = pingora::tls::ext::ssl_from_acceptor(&acceptor) else {
+                        return;
+                    };
+                    let Ok(mut tls) = pingora::protocols::tls::SslStream::new(ssl, tcp) else {
+                        return;
+                    };
+                    if tls.accept().await.is_err() {
+                        return;
+                    }
+                    let mut buf = [0u8; 512];
+                    let _ = tls.read(&mut buf).await;
+                    let _ = tls.write_all(response).await;
+                    let _ = tls.flush().await;
+                });
+            }
+        });
+        addr
+    }
+
+    const RESP_200: &[u8] = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn tls_probe_healthy_backend_is_up() {
+        probe_rt().block_on(async {
+            let addr = spawn_tls_backend("backend.test", RESP_200).await;
+            let connector = TransportConnector::new(None);
+            let hc = hc_tls((200, 299), 2000);
+            // verify=false exercises that the TLS handshake completes AND the HTTP
+            // status is read/validated (not just the TCP connect).
+            assert!(
+                probe(
+                    addr,
+                    &hc,
+                    true,
+                    "backend.test",
+                    false,
+                    "backend.test",
+                    &connector
+                )
+                .await,
+                "a healthy TLS backend returning 200 must be UP"
+            );
+        });
+    }
+
+    #[test]
+    fn tls_probe_cert_verification_failure_is_down() {
+        probe_rt().block_on(async {
+            let addr = spawn_tls_backend("backend.test", RESP_200).await;
+            let connector = TransportConnector::new(None);
+            let hc = hc_tls((200, 299), 2000);
+            // verify=true against an untrusted self-signed cert: verification fails,
+            // so the handshake fails and the backend is DOWN even though its TCP
+            // port is open and the app would answer 200.
+            assert!(
+                !probe(
+                    addr,
+                    &hc,
+                    true,
+                    "backend.test",
+                    true,
+                    "backend.test",
+                    &connector
+                )
+                .await,
+                "verify=true against an untrusted self-signed cert must be DOWN"
+            );
+        });
+    }
+
+    #[test]
+    fn tls_probe_handshake_stall_is_down_at_deadline() {
+        probe_rt().block_on(async {
+            // A plain TCP server that accepts but never speaks TLS: the client's
+            // ClientHello gets no ServerHello, so the handshake stalls to the
+            // deadline and must flip DOWN there (not hang).
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((s, _)) = listener.accept().await else {
+                        return;
+                    };
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                    drop(s);
+                }
+            });
+            let connector = TransportConnector::new(None);
+            let hc = hc_tls((200, 299), 300);
+            let t0 = tokio::time::Instant::now();
+            assert!(
+                !probe(
+                    addr,
+                    &hc,
+                    true,
+                    "backend.test",
+                    false,
+                    "backend.test",
+                    &connector
+                )
+                .await,
+                "a TLS handshake that never completes must be DOWN"
+            );
+            assert!(
+                t0.elapsed() < Duration::from_secs(5),
+                "must flip DOWN at the deadline, not hang"
+            );
+        });
+    }
+
+    #[test]
+    fn tls_probe_5xx_health_response_is_down() {
+        probe_rt().block_on(async {
+            let addr = spawn_tls_backend(
+                "backend.test",
+                b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n",
+            )
+            .await;
+            let connector = TransportConnector::new(None);
+            let hc = hc_tls((200, 299), 2000);
+            assert!(
+                !probe(
+                    addr,
+                    &hc,
+                    true,
+                    "backend.test",
+                    false,
+                    "backend.test",
+                    &connector
+                )
+                .await,
+                "a 5xx health response over verified TLS must be DOWN"
+            );
+        });
+    }
+
+    #[test]
+    fn tls_probe_multi_address_failover_uses_a_healthy_address() {
+        probe_rt().block_on(async {
+            // First address: a closed port (connect refused). Second: a healthy TLS
+            // backend. The prober's "any resolved address answers" fold must report
+            // the pool UP.
+            let dead = {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let a = l.local_addr().unwrap();
+                drop(l); // close → connect refused
+                a
+            };
+            let live = spawn_tls_backend("backend.test", RESP_200).await;
+            let connector = TransportConnector::new(None);
+            let hc = hc_tls((200, 299), 2000);
+            let mut up = false;
+            for a in [dead, live] {
+                if probe(
+                    a,
+                    &hc,
+                    true,
+                    "backend.test",
+                    false,
+                    "backend.test",
+                    &connector,
+                )
+                .await
+                {
+                    up = true;
+                    break;
+                }
+            }
+            assert!(
+                up,
+                "a healthy second address must keep the pool UP after a dead first address"
             );
         });
     }

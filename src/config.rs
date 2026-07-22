@@ -140,6 +140,13 @@ pub struct ServerCfg {
     /// the whole connection/file-descriptor budget with held-open connections.
     /// NOTE: leave 0 when fronted by Cloudflare (all peers share CF edge IPs).
     pub max_conn_per_ip: u32,
+    /// Absolute timeout (seconds) for the downstream TLS handshake, replacing
+    /// Pingora's former hardcoded 60s. A partial ClientHello otherwise retains a
+    /// socket/task for the whole window before any Sluice code runs (pre-HTTP
+    /// Slowloris on direct exposure). Also used as the per-IP connection limiter's
+    /// pending-slot TTL so pre-handshake accounting tracks the same window. Minimum
+    /// 1s. Default 10s.
+    pub tls_handshake_timeout_secs: u64,
     /// Idle-connection timeout (seconds) for a downstream HTTP/2 connection that
     /// has NO active streams. Stock Pingora waits for the next stream forever, so
     /// a client that completes the H2 handshake and then opens no stream (or goes
@@ -198,6 +205,7 @@ impl Default for ServerCfg {
             downstream_write_timeout_secs: 60,
             min_send_rate_bytes: 0,
             max_conn_per_ip: 0,
+            tls_handshake_timeout_secs: 10,
             h2_idle_timeout_secs: 60,
             h2_handshake_timeout_secs: 10,
             upstream_dns_timeout_secs: 5,
@@ -217,13 +225,13 @@ pub struct GeoipCfg {
     pub city_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listener {
     pub addr: String,
     pub kind: ListenerKind,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ListenerKind {
     Tls {
         cert: String,
@@ -245,7 +253,7 @@ pub enum ListenerKind {
 
 /// Disk-backed response cache. When set, cached responses persist to `dir`
 /// (survive restarts, hold far more than memory) instead of the in-memory LRU.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiskCacheCfg {
     pub dir: String,
     /// Soft cap on total on-disk size; a reaper evicts the oldest entries.
@@ -258,7 +266,7 @@ pub struct DiskCacheCfg {
 
 /// Automatic TLS via ACME (Let's Encrypt). Provisions a cert per `site` host
 /// over HTTP-01 — requires each domain to resolve to this server with :80 open.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcmeCfg {
     pub contact: String,
     pub staging: bool,
@@ -871,6 +879,7 @@ static SERVER_SPEC: Spec = Spec {
         ("downstream-write-timeout-secs", Rep::Once, &SECS0),
         ("min-send-rate-bytes", Rep::Once, &RATE0),
         ("max-conn-per-ip", Rep::Once, &POOL0),
+        ("tls-handshake-timeout-secs", Rep::Once, &SECS1),
         ("h2-idle-timeout-secs", Rep::Once, &SECS0),
         ("h2-handshake-timeout-secs", Rep::Once, &SECS1),
         ("upstream-dns-timeout-secs", Rep::Once, &SECS1),
@@ -1369,6 +1378,9 @@ impl Config {
                     if let Some(v) = child_int(node, "max-conn-per-ip") {
                         server.max_conn_per_ip = v.max(0) as u32;
                     }
+                    if let Some(v) = child_int(node, "tls-handshake-timeout-secs") {
+                        server.tls_handshake_timeout_secs = v.max(1) as u64;
+                    }
                     if let Some(v) = child_int(node, "h2-idle-timeout-secs") {
                         server.h2_idle_timeout_secs = v.max(0) as u64;
                     }
@@ -1737,7 +1749,7 @@ fn parse_listener(node: &KdlNode) -> Result<Listener, String> {
         // Actually load the store at --check time so an empty directory or one
         // with only malformed pairs is caught now, not when the server boots and
         // immediately exits. (`--check` must reject anything startup would.)
-        if let Err(e) = crate::certs::CertStore::from_dir(dir) {
+        if let Err(e) = crate::certs::CertStore::from_dir_strict(dir) {
             return Err(format!("listener {addr:?}: cert-dir: {e}"));
         }
         return Ok(Listener {
@@ -2387,6 +2399,29 @@ mod tests {
         assert!(
             e.contains("out of range"),
             "0 dns timeout must be rejected: {e}"
+        );
+    }
+
+    #[test]
+    fn tls_handshake_timeout_secs_defaults_finite_and_rejects_zero() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        // Absent → finite default of 10s.
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.tls_handshake_timeout_secs, 10);
+        // Explicit value honored.
+        let c = Config::parse(&format!(
+            "server {{\n tls-handshake-timeout-secs 3\n}}{site}"
+        ))
+        .unwrap();
+        assert_eq!(c.server.tls_handshake_timeout_secs, 3);
+        // Must stay finite (>= 1s): 0 is rejected by the schema.
+        let e = parse_err(&format!(
+            "server {{\n tls-handshake-timeout-secs 0\n}}{site}"
+        ));
+        assert!(
+            e.contains("out of range"),
+            "0 tls handshake timeout must be rejected: {e}"
         );
     }
 

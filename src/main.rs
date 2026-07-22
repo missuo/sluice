@@ -125,6 +125,7 @@ fn main() {
     // Clone what we need to build listeners, then move Config into the ArcSwap.
     let listeners = config.listeners.clone();
     let max_conn_per_ip = config.server.max_conn_per_ip;
+    let tls_handshake_timeout_secs = config.server.tls_handshake_timeout_secs.max(1);
     let h2_idle_timeout_secs = config.server.h2_idle_timeout_secs;
     let h2_handshake_timeout_secs = config.server.h2_handshake_timeout_secs;
     let graceful_shutdown_secs = config.server.graceful_shutdown_secs;
@@ -177,8 +178,10 @@ fn main() {
         acme_challenges = Some(chs);
     }
 
-    // SIGHUP → hot reload (fail-safe: a bad edit keeps the old config).
-    spawn_reload(cfg.clone(), config_path.clone());
+    // Registry of hot-reloadable cert-dir stores (populated while building the TLS
+    // listeners below), so SIGHUP can atomically re-read rotated certs. The SIGHUP
+    // handler is installed AFTER the listeners are built so it has this registry.
+    let mut cert_dir_registry: Vec<CertDirStore> = Vec::new();
 
     // One shared per-IP in-flight connection limiter across BOTH public listeners
     // (TLS proxy + :80 redirect/ACME), so a client's connections to either are
@@ -189,7 +192,15 @@ fn main() {
     //  - `ConnCapApp` holds an exact per-connection guard across `process_new` for
     //    the connection's whole life, released on close.
     // (max 0 = disabled, a no-op fast path everywhere.)
-    let conn_limiter = Arc::new(ConnLimiter::new(max_conn_per_ip));
+    // Pending-slot TTL is derived from the configurable TLS-handshake timeout, but
+    // strictly LONGER (handshake timeout + a scheduling/cleanup grace) so the
+    // pre-handshake per-IP accounting can never expire before the vendored accept
+    // loop's handshake deadline — which starts only after the accepted connection's
+    // task is scheduled (see ConnLimiter::for_handshake_timeout).
+    let conn_limiter = Arc::new(ConnLimiter::for_handshake_timeout(
+        max_conn_per_ip,
+        std::time::Duration::from_secs(tls_handshake_timeout_secs),
+    ));
     if max_conn_per_ip > 0 {
         log::info!("sluice: max {max_conn_per_ip} in-flight connection(s) per client IP");
         // Reclaim expired pending slots even when the source IP never returns
@@ -242,6 +253,13 @@ fn main() {
         conn_limiter.clone(),
     );
     let mut redirector = Service::new("Sluice :80 redirect".to_string(), redirect_app);
+    // Bound the downstream (TLS) handshake with a finite, short deadline (vendored
+    // Patch 7): a partial ClientHello otherwise retains a socket/task for the whole
+    // window before any Sluice code runs (pre-HTTP Slowloris on direct exposure).
+    // Applied to BOTH the TLS proxy and the :80 redirect service.
+    let hs_timeout = std::time::Duration::from_secs(tls_handshake_timeout_secs);
+    proxy.set_handshake_timeout(hs_timeout);
+    redirector.set_handshake_timeout(hs_timeout);
     // Install the pre-handshake accept filter on both services (no-op when the cap
     // is disabled, so it's cheap to always attach).
     if conn_limiter.enabled() {
@@ -264,9 +282,14 @@ fn main() {
                 n_tls += 1;
             }
             ListenerKind::TlsDynamic { cert_dir, http2 } => {
-                let store = certs::CertStore::from_dir(cert_dir)
+                let store = certs::CertStore::from_dir_strict(cert_dir)
                     .unwrap_or_else(|e| fatal(&format!("cert-dir {cert_dir}: {e}")));
                 let store = Arc::new(ArcSwap::from_pointee(store));
+                // Retain a handle so SIGHUP can re-read this dir's rotated certs.
+                cert_dir_registry.push(CertDirStore {
+                    cert_dir: cert_dir.clone(),
+                    store: store.clone(),
+                });
                 let mut tls = TlsSettings::with_callbacks(Box::new(certs::DynamicCert { store }))
                     .unwrap_or_else(|e| fatal(&format!("dynamic TLS for {}: {e}", l.addr)));
                 if *http2 {
@@ -293,6 +316,11 @@ fn main() {
             }
         }
     }
+
+    // SIGHUP → hot reload (fail-safe: a bad edit keeps the old config; a bad cert
+    // replacement or a listener-topology change keeps the old config AND certs).
+    // Installed now that the cert-dir registry is populated.
+    spawn_reload(cfg.clone(), config_path.clone(), cert_dir_registry);
 
     log::info!(
         "sluice: {n_tls} tls + {n_redirect} redirect listener(s), {threads} worker thread(s)"
@@ -567,9 +595,154 @@ fn validate_socket_dir(dir: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reload the config on SIGHUP. On parse/validation failure the running config
-/// is kept untouched, so a bad edit never takes the proxy down.
-fn spawn_reload(cfg: Arc<ArcSwap<Config>>, path: String) {
+/// A hot-reloadable `cert-dir` store: the directory path plus the live `ArcSwap`
+/// that the TLS callback reads. On SIGHUP the directory is re-read and the store
+/// atomically swapped, so a rotated cert is served without a restart.
+struct CertDirStore {
+    cert_dir: String,
+    store: Arc<ArcSwap<certs::CertStore>>,
+}
+
+/// Server settings that are baked into the process at STARTUP (into the pingora
+/// `ServerConf`, the per-`Service` handshake timeout, the `ConnLimiter`, the H2
+/// `HttpServerOptions`, the DNS-cache semaphore, or the metrics service) and are
+/// NOT re-read per request. A SIGHUP that changes any of them would silently have
+/// no effect, so the reload is rejected rather than giving false assurance that a
+/// tightened security window (e.g. `tls-handshake-timeout-secs`) took effect.
+///
+/// Fields read per request (e.g. `downstream-*-timeout-secs`, `request-timeout-secs`,
+/// `min-send-rate-bytes`, `upstream-dns-{timeout,ttl,stale}-secs`) are deliberately
+/// NOT here — those DO take effect on reload.
+fn changed_startup_settings(old: &Config, new: &Config) -> Vec<&'static str> {
+    let (o, n) = (&old.server, &new.server);
+    let mut changed = Vec::new();
+    macro_rules! chk {
+        ($field:ident, $name:literal) => {
+            if o.$field != n.$field {
+                changed.push($name);
+            }
+        };
+    }
+    chk!(threads, "threads");
+    chk!(metrics_addr, "metrics-addr");
+    chk!(grace_period_secs, "grace-period-secs");
+    chk!(graceful_shutdown_secs, "graceful-shutdown-secs");
+    chk!(upstream_keepalive_pool, "upstream-keepalive-pool");
+    chk!(upgrade_sock, "upgrade-sock");
+    chk!(allow_root, "allow-root");
+    chk!(run_user, "user");
+    chk!(run_group, "group");
+    chk!(max_conn_per_ip, "max-conn-per-ip");
+    chk!(tls_handshake_timeout_secs, "tls-handshake-timeout-secs");
+    chk!(h2_idle_timeout_secs, "h2-idle-timeout-secs");
+    chk!(h2_handshake_timeout_secs, "h2-handshake-timeout-secs");
+    chk!(upstream_dns_max_concurrent, "upstream-dns-max-concurrent");
+
+    // Startup-bound state that lives OUTSIDE `ServerCfg`. Each is baked into a
+    // live worker at startup and cannot be moved by a SIGHUP, so a change must be
+    // rejected rather than logged as a successful no-op (false assurance):
+    //   * `disk_cache` provisions the on-disk storage + eviction reaper (backend,
+    //     dir, and size/file/free limits) once at startup.
+    //   * the top-level `acme` block (contact / staging / cache dir) configures the
+    //     background ACME worker once at startup.
+    //   * the SET of `acme`-enabled site hosts is captured into that worker's
+    //     domain list at startup — newly-enabled hosts would silently get no cert.
+    if old.disk_cache != new.disk_cache {
+        changed.push("disk-cache");
+    }
+    if old.acme != new.acme {
+        changed.push("acme");
+    }
+    if acme_host_set(old) != acme_host_set(new) {
+        changed.push("acme-hosts");
+    }
+    changed
+}
+
+/// The normalized SET of `acme`-enabled site hosts (lowercased, deduped, order-
+/// independent) — what the startup ACME worker provisions. Compared across a
+/// reload so enabling/disabling `acme` on a site, which the running worker can't
+/// pick up, is rejected instead of silently ignored.
+fn acme_host_set(cfg: &Config) -> std::collections::BTreeSet<String> {
+    cfg.sites
+        .iter()
+        .filter(|s| s.acme)
+        .map(|s| s.host.to_ascii_lowercase())
+        .collect()
+}
+
+/// Apply a SIGHUP reload, or leave EVERYTHING (config + certs) untouched.
+///
+/// Steps, any failure of which returns `Err` with the OLD config + certs still in
+/// force (fail-before-commit):
+///   1. Reject if the listener topology / TLS source paths changed — listeners are
+///      startup-only.
+///   2. Reject if any STARTUP-ONLY server setting changed (see
+///      [`changed_startup_settings`]) — swapping it would not affect the live
+///      services/limiter and would give false assurance.
+///   3. Load every replacement `cert-dir` store STRICTLY and COMPLETELY up front,
+///      so a partially-rotated / malformed / empty replacement never leaves a stale
+///      or wrong store live.
+///   4. Only once all loads succeed, swap every store and then the config.
+///
+/// ATOMICITY: each individual `ArcSwap` swap is atomic — a TLS callback always sees
+/// a complete OLD or NEW cert store, and a request always sees a complete OLD or NEW
+/// config — and NOTHING is committed if any step above fails. This is NOT a single
+/// global publication boundary, however: the cert stores and the config are separate
+/// `ArcSwap`s swapped in sequence, so during a successful reload a caller could
+/// momentarily observe a new store with the old config (or two dynamic listeners at
+/// different generations). That window is memory-safe (each callback retains its
+/// loaded `Arc`) and benign for SNI-keyed cert stores, which are selected
+/// independently per handshake; global cross-store/config atomicity is intentionally
+/// not provided.
+fn apply_reload(
+    cfg: &Arc<ArcSwap<Config>>,
+    new: Config,
+    registry: &[CertDirStore],
+) -> Result<(usize, usize), String> {
+    let current = cfg.load();
+    if new.listeners != current.listeners {
+        return Err(
+            "listener topology or TLS source paths changed (listeners are \
+                    startup-only); a restart is required — keeping the old config + certs"
+                .to_string(),
+        );
+    }
+    let changed = changed_startup_settings(&current, &new);
+    if !changed.is_empty() {
+        return Err(format!(
+            "startup-only server setting(s) changed ({}); these take effect only on \
+             restart — keeping the old config + certs",
+            changed.join(", ")
+        ));
+    }
+    // Load ALL replacements strictly before swapping ANY (fail-before-commit).
+    let mut loaded: Vec<(&Arc<ArcSwap<certs::CertStore>>, certs::CertStore)> = Vec::new();
+    for entry in registry {
+        match certs::CertStore::from_dir_strict(&entry.cert_dir) {
+            Ok(store) => loaded.push((&entry.store, store)),
+            Err(e) => {
+                return Err(format!(
+                    "cert-dir {:?} failed to reload ({e}) — keeping the old config + certs",
+                    entry.cert_dir
+                ));
+            }
+        }
+    }
+    // All loads succeeded: swap every cert store (each swap atomic), then the config.
+    let n_stores = loaded.len();
+    for (store, new_store) in loaded {
+        store.store(Arc::new(new_store));
+    }
+    let n_sites = new.sites.len();
+    cfg.store(Arc::new(new));
+    Ok((n_sites, n_stores))
+}
+
+/// Reload the config + cert-dir stores on SIGHUP. On ANY failure (parse, listener
+/// topology change, or a bad cert-dir replacement) the running config AND certs are
+/// kept untouched, so a bad edit or half-rotated cert never takes the proxy down.
+fn spawn_reload(cfg: Arc<ArcSwap<Config>>, path: String, registry: Vec<CertDirStore>) {
     use signal_hook::consts::SIGHUP;
     use signal_hook::iterator::Signals;
     std::thread::spawn(move || {
@@ -582,11 +755,12 @@ fn spawn_reload(cfg: Arc<ArcSwap<Config>>, path: String) {
         };
         for _ in signals.forever() {
             match Config::load(&path) {
-                Ok(new) => {
-                    let n = new.sites.len();
-                    cfg.store(Arc::new(new));
-                    log::info!("SIGHUP: reloaded {path} ({n} site(s))");
-                }
+                Ok(new) => match apply_reload(&cfg, new, &registry) {
+                    Ok((n_sites, n_stores)) => log::info!(
+                        "SIGHUP: reloaded {path} ({n_sites} site(s), {n_stores} cert-dir store(s))"
+                    ),
+                    Err(e) => log::error!("SIGHUP: reload REJECTED: {e}"),
+                },
                 Err(e) => log::error!("SIGHUP: reload FAILED, keeping old config:\n{e}"),
             }
         }
@@ -684,5 +858,359 @@ mod tests {
         };
         let overlong = format!("/run/sluice/{}", "a".repeat(sun_path_max));
         assert!(validate_upgrade_sock_path(Some(&overlong), true).is_err());
+    }
+
+    // ---- cert-dir hot-reload (SIGHUP) tests ----
+
+    /// A unique temp directory under the system temp dir.
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        // A monotonic-ish unique suffix without external crates.
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let d = std::env::temp_dir().join(format!(
+            "sluice-reload-{tag}-{n}-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Write a self-signed `<host>.crt` + `<host>.key` pair into `dir`.
+    fn write_self_signed(dir: &std::path::Path, host: &str) {
+        let ck = rcgen::generate_simple_self_signed(vec![host.to_string()]).unwrap();
+        std::fs::write(dir.join(format!("{host}.crt")), ck.cert.pem()).unwrap();
+        std::fs::write(dir.join(format!("{host}.key")), ck.key_pair.serialize_pem()).unwrap();
+    }
+
+    /// Build a config string with ONE cert-dir listener at `addr` + `n_sites` sites.
+    fn cfg_text(addr: &str, cert_dir: &std::path::Path, n_sites: usize) -> String {
+        let mut s = format!(
+            "listener \"{addr}\" {{\n tls cert-dir=\"{}\"\n}}\n",
+            cert_dir.display()
+        );
+        for i in 0..n_sites {
+            s.push_str(&format!(
+                "site \"s{i}.test\" {{\n upstream \"127.0.0.1:9001\"\n}}\n"
+            ));
+        }
+        s
+    }
+
+    fn store_of(dir: &std::path::Path) -> Arc<ArcSwap<certs::CertStore>> {
+        Arc::new(ArcSwap::from_pointee(
+            certs::CertStore::from_dir_strict(dir.to_str().unwrap()).unwrap(),
+        ))
+    }
+
+    #[test]
+    fn reload_serves_a_rotated_cert_and_swaps_config() {
+        let dir = temp_dir("rotate");
+        write_self_signed(&dir, "a.test");
+        let cur = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 1)).unwrap();
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+        // Before: only a.test.
+        assert!(store.load().has_host("a.test"));
+        assert!(!store.load().has_host("b.test"));
+
+        // Rotate: add a second cert to the dir, and grow the config's site set.
+        write_self_signed(&dir, "b.test");
+        let new = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 2)).unwrap();
+        let (n_sites, n_stores) = apply_reload(&cfg, new, &registry).expect("reload ok");
+        assert_eq!((n_sites, n_stores), (2, 1));
+        // The store was re-read (now has b.test too) and the config was swapped.
+        assert!(
+            store.load().has_host("b.test"),
+            "rotated cert must be served after reload"
+        );
+        assert_eq!(
+            cfg.load().sites.len(),
+            2,
+            "config must be swapped on a successful reload"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_with_a_malformed_replacement_keeps_the_old_cert() {
+        let dir = temp_dir("malformed");
+        write_self_signed(&dir, "a.test");
+        let cur = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 1)).unwrap();
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let old_store_ptr = store.load_full();
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+        // A new config that PARSED while the dir was valid, then the dir is corrupted
+        // before we apply — models a bad rotation racing the reload.
+        let new = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 2)).unwrap();
+        std::fs::write(
+            dir.join("a.test.crt"),
+            b"-----BEGIN CERTIFICATE-----\ngarbage\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("a.test.key"), b"not a key").unwrap();
+
+        let err = apply_reload(&cfg, new, &registry).expect_err("reload must be rejected");
+        assert!(err.contains("failed to reload"), "{err}");
+        // The OLD cert store is still live (same Arc), and the config was NOT swapped.
+        assert!(
+            Arc::ptr_eq(&old_store_ptr, &store.load_full()),
+            "old cert must stay live"
+        );
+        assert!(store.load().has_host("a.test"));
+        assert_eq!(
+            cfg.load().sites.len(),
+            1,
+            "config must not be swapped on a failed reload"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_rejects_a_listener_topology_change_and_keeps_old_config() {
+        let dir = temp_dir("topology");
+        write_self_signed(&dir, "a.test");
+        let cur = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 1)).unwrap();
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let old_store_ptr = store.load_full();
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+        // New config changes the listener ADDRESS (topology) — listeners are
+        // startup-only, so the whole reload must be rejected.
+        let new = Config::parse(&cfg_text("127.0.0.1:8444", &dir, 2)).unwrap();
+        let err = apply_reload(&cfg, new, &registry).expect_err("topology change must be rejected");
+        assert!(err.contains("topology"), "{err}");
+        // Nothing changed: old config + old certs still live.
+        assert!(Arc::ptr_eq(&old_store_ptr, &store.load_full()));
+        assert_eq!(cfg.load().sites.len(), 1, "old config must be retained");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Finding 1: a PARTIALLY-broken multi-host dir must be rejected, keeping the
+    /// complete old store (not replaced by a partial store that drops a host).
+    #[test]
+    fn reload_rejects_a_partial_multi_host_dir_and_keeps_the_complete_old_store() {
+        // Each break mode leaves a.test valid but b.test broken a different way.
+        for mode in ["missing-key", "malformed-crt", "mismatched-key"] {
+            let dir = temp_dir(&format!("partial-{mode}"));
+            write_self_signed(&dir, "a.test");
+            write_self_signed(&dir, "b.test");
+            let cur = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 1)).unwrap();
+            let cfg = Arc::new(ArcSwap::from_pointee(cur));
+            let store = store_of(&dir);
+            let old_store_ptr = store.load_full();
+            // The OLD (complete) store has BOTH hosts.
+            assert!(store.load().has_host("a.test") && store.load().has_host("b.test"));
+            let registry = vec![CertDirStore {
+                cert_dir: dir.to_str().unwrap().to_string(),
+                store: store.clone(),
+            }];
+            // Parse the new config while the dir is still complete, then break b.test.
+            let new = Config::parse(&cfg_text("127.0.0.1:8443", &dir, 2)).unwrap();
+            match mode {
+                "missing-key" => {
+                    std::fs::remove_file(dir.join("b.test.key")).unwrap();
+                }
+                "malformed-crt" => {
+                    std::fs::write(dir.join("b.test.crt"), b"not a cert").unwrap();
+                }
+                "mismatched-key" => {
+                    // A valid key, but for a DIFFERENT cert → key/cert mismatch.
+                    let other =
+                        rcgen::generate_simple_self_signed(vec!["other".to_string()]).unwrap();
+                    std::fs::write(dir.join("b.test.key"), other.key_pair.serialize_pem()).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let err = apply_reload(&cfg, new, &registry)
+                .expect_err(&format!("mode {mode}: partial dir must be rejected"));
+            assert!(err.contains("failed to reload"), "mode {mode}: {err}");
+            // The complete OLD store is still live: BOTH hosts, same Arc; config kept.
+            assert!(
+                Arc::ptr_eq(&old_store_ptr, &store.load_full()),
+                "mode {mode}: old store must stay live"
+            );
+            assert!(
+                store.load().has_host("a.test") && store.load().has_host("b.test"),
+                "mode {mode}: old complete store (a.test + b.test) must remain — a partial \
+                 store would drop b.test and mis-serve its SNI"
+            );
+            assert_eq!(
+                cfg.load().sites.len(),
+                1,
+                "mode {mode}: config must be retained"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// Finding 2: a SIGHUP that changes a startup-only server setting (e.g.
+    /// `tls-handshake-timeout-secs`) must be REJECTED — those never take effect
+    /// without a restart, so accepting the reload gives false assurance.
+    #[test]
+    fn reload_rejects_a_startup_only_setting_change_and_keeps_old_config() {
+        let dir = temp_dir("startup-only");
+        write_self_signed(&dir, "a.test");
+        let base = cfg_text("127.0.0.1:8443", &dir, 1);
+        let cur = Config::parse(&format!(
+            "server {{\n tls-handshake-timeout-secs 10\n}}\n{base}"
+        ))
+        .unwrap();
+        assert_eq!(cur.server.tls_handshake_timeout_secs, 10);
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let old_store_ptr = store.load_full();
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+        // Change ONLY the startup-only handshake timeout (listeners unchanged).
+        let new = Config::parse(&format!(
+            "server {{\n tls-handshake-timeout-secs 3\n}}\n{base}"
+        ))
+        .unwrap();
+        let err =
+            apply_reload(&cfg, new, &registry).expect_err("startup-only change must be rejected");
+        assert!(err.contains("tls-handshake-timeout-secs"), "{err}");
+        assert!(err.contains("startup-only"), "{err}");
+        // Old config + certs retained (the live 10s window is unchanged).
+        assert!(Arc::ptr_eq(&old_store_ptr, &store.load_full()));
+        assert_eq!(cfg.load().server.tls_handshake_timeout_secs, 10);
+
+        // Control: changing ONLY a per-request field IS accepted (it reloads).
+        let new_ok = Config::parse(&format!(
+            "server {{\n tls-handshake-timeout-secs 10\n request-timeout-secs 45\n}}\n{base}"
+        ))
+        .unwrap();
+        apply_reload(&cfg, new_ok, &registry).expect("a per-request setting change must reload");
+        assert_eq!(cfg.load().server.request_timeout_secs, 45);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // The startup fingerprint must also cover state that lives OUTSIDE `ServerCfg`
+    // — the disk cache, the ACME block, and the ACME-enabled host set are all
+    // provisioned into live workers at startup, so a SIGHUP that changes one must
+    // be REJECTED (retaining old config + stores), not logged as a no-op success.
+    // Fields are set directly on an already-parsed config to isolate the
+    // fingerprint under test from KDL filesystem validation.
+
+    #[test]
+    fn reload_rejects_a_disk_cache_change_and_keeps_old_config() {
+        let dir = temp_dir("disk-cache");
+        write_self_signed(&dir, "a.test");
+        let base = cfg_text("127.0.0.1:8443", &dir, 1);
+        let cur = Config::parse(&base).unwrap();
+        assert!(cur.disk_cache.is_none());
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let old_store_ptr = store.load_full();
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+
+        // Enable the disk cache — the storage + reaper are startup-bound.
+        let mut new = Config::parse(&base).unwrap();
+        new.disk_cache = Some(sluice::config::DiskCacheCfg {
+            dir: "/var/cache/sluice".into(),
+            max_size: 1 << 30,
+            max_files: 1000,
+            min_free: 1 << 20,
+        });
+        let err =
+            apply_reload(&cfg, new, &registry).expect_err("disk-cache change must be rejected");
+        assert!(err.contains("disk-cache"), "{err}");
+        assert!(err.contains("startup-only"), "{err}");
+        // Old config + certs retained.
+        assert!(Arc::ptr_eq(&old_store_ptr, &store.load_full()));
+        assert!(
+            cfg.load().disk_cache.is_none(),
+            "old config (no disk cache) must be retained"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_rejects_an_acme_config_change_and_keeps_old_config() {
+        let dir = temp_dir("acme-cfg");
+        write_self_signed(&dir, "a.test");
+        let base = cfg_text("127.0.0.1:8443", &dir, 1);
+        let cur = Config::parse(&base).unwrap();
+        assert!(cur.acme.is_none());
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let old_store_ptr = store.load_full();
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+
+        // Add a top-level ACME block — the ACME worker is startup-bound.
+        let mut new = Config::parse(&base).unwrap();
+        new.acme = Some(sluice::config::AcmeCfg {
+            contact: "ops@example.com".into(),
+            staging: false,
+            cache_dir: "/var/lib/sluice/acme".into(),
+        });
+        let err =
+            apply_reload(&cfg, new, &registry).expect_err("acme config change must be rejected");
+        assert!(err.contains("acme"), "{err}");
+        assert!(err.contains("startup-only"), "{err}");
+        assert!(
+            cfg.load().acme.is_none(),
+            "old config (no acme) must be retained"
+        );
+        assert!(Arc::ptr_eq(&old_store_ptr, &store.load_full()));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reload_rejects_an_acme_host_set_change_and_keeps_old_config() {
+        let dir = temp_dir("acme-hosts");
+        write_self_signed(&dir, "a.test");
+        let base = cfg_text("127.0.0.1:8443", &dir, 1);
+        let cur = Config::parse(&base).unwrap();
+        assert!(!cur.sites[0].acme, "base sites are not ACME-enabled");
+        let cfg = Arc::new(ArcSwap::from_pointee(cur));
+        let store = store_of(&dir);
+        let old_store_ptr = store.load_full();
+        let registry = vec![CertDirStore {
+            cert_dir: dir.to_str().unwrap().to_string(),
+            store: store.clone(),
+        }];
+
+        // Newly enable ACME on a site host — the worker's domain list is fixed at
+        // startup, so the new host would silently never get a cert.
+        let mut new = Config::parse(&base).unwrap();
+        new.sites[0].acme = true;
+        let err =
+            apply_reload(&cfg, new, &registry).expect_err("acme-host-set change must be rejected");
+        assert!(err.contains("acme-hosts"), "{err}");
+        assert!(err.contains("startup-only"), "{err}");
+        assert!(
+            !cfg.load().sites[0].acme,
+            "old config (no ACME host) must be retained"
+        );
+        assert!(Arc::ptr_eq(&old_store_ptr, &store.load_full()));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -272,11 +272,22 @@ fn load_cached(
     }
 }
 
-/// Re-issue if the cached cert won't load as a valid pair, or if it's older than
-/// 60 days (LE certs last 90). A future mtime (clock skew) is treated as "fresh"
-/// so a skewed clock can't trigger an every-12h re-issue storm. (mtime, not
-/// X.509 notAfter — pingora's TLS facade doesn't re-export the asn1 module;
-/// tracked in KNOWN_ISSUES.)
+/// How close to `notAfter` a cert must be before we renew it. Let's Encrypt
+/// issues 90-day certs; renewing inside the last 30 days matches LE's own
+/// recommendation and leaves ample retry runway before an outage.
+const RENEW_BEFORE_EXPIRY: i64 = 30 * 24 * 3600;
+
+/// Re-issue if the cached cert won't load as a valid pair, or if its X.509
+/// `notAfter` is within [`RENEW_BEFORE_EXPIRY`] of now (including already
+/// expired). Scheduling is driven by the certificate's real expiry, NOT file
+/// mtime: a restore/copy/out-of-band replacement can refresh mtime without
+/// extending validity, so an mtime clock could defer renewal past `notAfter` and
+/// cause a TLS outage (KNOWN_ISSUES 1.3). mtime is kept only as legacy migration
+/// metadata (see [`load_or_migrate`]), never as the renewal decision.
+///
+/// Fail-safe toward renewing: if the file is missing/unreadable, doesn't load as
+/// a matching pair, or its expiry can't be parsed, we renew. A cert whose
+/// `notAfter` is in the far future (even one written with a future mtime) is kept.
 fn needs_cert(cfg: &AcmeCfg, dir: &crate::dirs::SecureDir, domain: &str) -> bool {
     let name = cert_name(cfg, domain);
     let Ok(f) = dir.open_read(&name) else {
@@ -288,13 +299,16 @@ fn needs_cert(cfg: &AcmeCfg, dir: &crate::dirs::SecureDir, domain: &str) -> bool
     if f2.read_to_end(&mut buf).is_err() || Cert::from_combined_pem(&buf).is_err() {
         return true;
     }
-    match f2.metadata().and_then(|m| m.modified()) {
-        Ok(mtime) => mtime
-            .elapsed()
-            .map(|e| e > Duration::from_secs(60 * 24 * 3600))
-            .unwrap_or(false),
-        Err(_) => true,
-    }
+    // Renew from real expiry. A parse failure here is fail-safe → renew.
+    let Some(not_after) = crate::certs::leaf_not_after_unix(&buf) else {
+        return true;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        // A clock before the Unix epoch is absurd; renewing is the safe choice.
+        .unwrap_or(i64::MAX);
+    not_after - now <= RENEW_BEFORE_EXPIRY
 }
 
 /// Load the cached ACME account for this environment, or register a new one and
@@ -490,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn migrates_legacy_pair_and_preserves_renewal_clock() {
+    fn migrates_legacy_pair_and_preserves_mtime() {
         let (path, dir) = test_dir("mig");
         let cfg = AcmeCfg {
             contact: "t@example.com".into(),
@@ -500,7 +514,8 @@ mod tests {
         let (crt, key) = legacy_names(&cfg, "legacy.test");
         std::fs::write(format!("{path}/{crt}"), CERT_PEM).unwrap();
         std::fs::write(format!("{path}/{key}"), KEY_PEM).unwrap();
-        // A 70-day-old legacy cert: must keep serving AND be due for renewal.
+        // Stamp a distinctive legacy mtime. Renewal no longer keys on mtime, but
+        // migration still preserves it as legacy metadata (see `load_or_migrate`).
         set_mtime_secs_ago(&format!("{path}/{crt}"), 70 * 24 * 3600);
 
         let c = load_or_migrate(&cfg, &dir, "legacy.test");
@@ -508,22 +523,101 @@ mod tests {
         let pem = format!("{path}/{}", cert_name(&cfg, "legacy.test"));
         Cert::from_combined_pem(&std::fs::read(&pem).unwrap())
             .expect("migrated combined file must load");
-        // The migrated file keeps the legacy mtime → the 60-day clock says renew.
+        // The migrated combined file keeps the legacy mtime (metadata only).
         let drift = mtime_unix(&pem).abs_diff(mtime_unix(&format!("{path}/{crt}")));
         assert!(drift < 5, "migration must preserve mtime (drift {drift}s)");
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Write a combined key+cert PEM (matching pair) for `domain` with a leaf
+    /// whose `notAfter` is `days_from_now` days out (negative = already expired).
+    fn write_combined_with_expiry(path: &str, cfg: &AcmeCfg, domain: &str, days_from_now: i64) {
+        use time::{Duration as TD, OffsetDateTime};
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()])
+            .expect("cert params for a plain DNS SAN");
+        let now = OffsetDateTime::now_utc();
+        params.not_before = now - TD::days(1);
+        params.not_after = now + TD::days(days_from_now);
+        let key = rcgen::KeyPair::generate().expect("generate P-256 key");
+        let cert = params.self_signed(&key).expect("self-sign");
+        let combined = format!("{}\n{}", key.serialize_pem().trim_end(), cert.pem());
+        // Round-trip through the same loader production uses, to be sure the pair
+        // matches before we rely on it for the schedule assertions.
+        Cert::from_combined_pem(combined.as_bytes()).expect("generated pair must load");
+        std::fs::write(format!("{path}/{}", cert_name(cfg, domain)), combined).unwrap();
+    }
+
+    fn set_mtime_secs_ahead(path: &str, secs: u64) {
+        let t = std::time::SystemTime::now() + Duration::from_secs(secs);
+        let d = t.duration_since(std::time::UNIX_EPOCH).unwrap();
+        let ts = libc::timespec {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_nsec: d.subsec_nanos() as _,
+        };
+        let c = std::ffi::CString::new(path).unwrap();
+        assert_eq!(
+            unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), [ts, ts].as_ptr(), 0) },
+            0
+        );
+    }
+
+    // Renewal is scheduled from the X.509 `notAfter`, NOT file mtime. Runs
+    // unchanged under both the OpenSSL and BoringSSL features (the expiry parse is
+    // pure-Rust and backend-neutral; `Cert::from_combined_pem` is the only
+    // backend-specific step and both parse the ECDSA P-256 pair).
+    #[test]
+    fn needs_cert_schedules_from_notafter() {
+        let (path, dir) = test_dir("nafter");
+        let cfg = AcmeCfg {
+            contact: "t@example.com".into(),
+            staging: false,
+            cache_dir: path.clone(),
+        };
+
+        // >30 days to expiry → keep.
+        write_combined_with_expiry(&path, &cfg, "keep.test", 60);
         assert!(
-            needs_cert(&cfg, &dir, "legacy.test"),
-            "70d-old cert must renew"
+            !needs_cert(&cfg, &dir, "keep.test"),
+            "a cert 60 days from expiry must be kept"
         );
 
-        // A fresh legacy pair must NOT trigger an immediate CA round-trip.
-        std::fs::remove_file(&pem).unwrap();
-        set_mtime_secs_ago(&format!("{path}/{crt}"), 5 * 24 * 3600);
-        load_or_migrate(&cfg, &dir, "legacy.test").unwrap();
+        // <=30 days to expiry → renew.
+        write_combined_with_expiry(&path, &cfg, "soon.test", 10);
         assert!(
-            !needs_cert(&cfg, &dir, "legacy.test"),
-            "5d-old cert is fresh"
+            needs_cert(&cfg, &dir, "soon.test"),
+            "a cert 10 days from expiry must renew"
         );
+
+        // Already expired → renew.
+        write_combined_with_expiry(&path, &cfg, "expired.test", -1);
+        assert!(
+            needs_cert(&cfg, &dir, "expired.test"),
+            "an expired cert must renew"
+        );
+
+        // Malformed cert file → renew (fail-safe toward renewing).
+        std::fs::write(
+            format!("{path}/{}", cert_name(&cfg, "bad.test")),
+            b"-----BEGIN CERTIFICATE-----\nnot base64\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(
+            needs_cert(&cfg, &dir, "bad.test"),
+            "a malformed cert must renew"
+        );
+
+        // Near expiry but with a far-FUTURE mtime: mtime must not defer renewal
+        // (the exact restore/copy hazard KNOWN_ISSUES 1.3 describes).
+        write_combined_with_expiry(&path, &cfg, "skew.test", 5);
+        set_mtime_secs_ahead(
+            &format!("{path}/{}", cert_name(&cfg, "skew.test")),
+            365 * 24 * 3600,
+        );
+        assert!(
+            needs_cert(&cfg, &dir, "skew.test"),
+            "a near-expiry cert with a future mtime must still renew"
+        );
+
         let _ = std::fs::remove_dir_all(&path);
     }
 
