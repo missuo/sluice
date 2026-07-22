@@ -365,8 +365,10 @@ benefit. Tracked as M5.
   unbuffered (tested).
 - **M5 — auto-TLS — DONE + LIVE-VERIFIED:** dynamic SNI cert store + Pingora TLS
   callback (certs from a `cert-dir`, multi-domain; the store hot-swaps at runtime
-  for ACME renewals, but a `cert-dir` is read once at startup — rotating a file
-  there needs a restart) AND the ACME
+  for ACME renewals, and a `cert-dir` is re-read strictly + per-store atomically
+  on **SIGHUP** so a rotated cert is served without a restart — a malformed /
+  half-rotated / empty dir is rejected and the old certs stay live; only the
+  single `cert`/`key` files still need a restart to rotate) AND the ACME
   client (`instant-acme` 0.8 + HTTP-01, `tls acme=true` + `acme {}`): a background
   thread provisions/renews a cert per site host, the `:80` listener answers the
   HTTP-01 challenge, certs land in the hot-swappable store. **Verified end-to-end
@@ -416,17 +418,20 @@ benefit. Tracked as M5.
   is read-only. CPU hot-path micro-benchmarks live in `benches/`. Verified live +
   unit-tested; **not** claimed as "all blockers closed" — see KNOWN_ISSUES.md for
   standing gaps and the review-loop discipline.
-- **Still later:** config file-watch, `cert-dir` SIGHUP hot-reload, per-location
-  header add/remove, JSON access log, least-conn EWMA, weighted `ip-hash`, a
-  general high-cardinality rate limiter, committed end-to-end load/perf numbers
-  (P50/P99, million-file reaper), SHA-pinned CI actions. See
-  **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items deliberately not built or
-  blocked upstream (notAfter-based ACME renewal, HTTP/3, Rustls, full scripting).
+- **Still later:** automatic config file-watch (SIGHUP reload IS built, including
+  strict `cert-dir` hot-reload), per-location header add/remove, JSON access log,
+  least-conn EWMA, weighted `ip-hash`, a general high-cardinality rate limiter,
+  committed end-to-end load/perf numbers (P50/P99, million-file reaper), SHA-pinned
+  CI actions. See **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)** for the items deliberately
+  not built or blocked upstream (HTTP/3, Rustls, full scripting).
 
 "nginx-like general tool" is explicitly out of scope (months, not weeks). By
-design, reload does not re-read `server{}`/listeners (those need a restart). The
-rate-limiter map is swept every 10 minutes (buckets idle >10 min are dropped), so
-it does not grow unboundedly with distinct client IPs.
+design, reload does not re-read `server{}`/listeners, the single `cert`/`key`
+files, `cache-store`, or the ACME config/host set (those need a restart) — and a
+SIGHUP that changes any of them is **rejected** (old config + certs retained)
+rather than silently ignored. The rate-limiter map is swept every 10 minutes
+(buckets idle >10 min are dropped), so it does not grow unboundedly with distinct
+client IPs.
 
 ## 9. Risks
 

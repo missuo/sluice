@@ -175,17 +175,23 @@ Two categories:
   longer mints empty dirs, the number of empty shards is bounded by the fan-out
   (≤ 65 536 inodes) — accepted over the write-failure race.
 
-### 2.3 Config file-watch / `cert-dir` hot-reload
-- **What:** config reload is **SIGHUP-triggered**, not automatic on file change.
-  A `cert-dir` store is built **once at process startup** and is **not re-read on
-  SIGHUP** — only the ACME renewal loop hot-swaps certs into the in-memory store.
-  So rotating a file in a `cert-dir` requires a **process restart** (a SIGHUP will
-  reload routing/other config but will **not** pick up new/rotated cert files).
-- **Why not fixed:** SIGHUP is explicit and predictable; a file-watcher adds a
-  dependency and races (partial writes).
-- **What it would take:** rebuild the `CertStore` inside the SIGHUP reload path
-  (and/or a debounced `notify` watcher) feeding the same `ArcSwap`. Small, just
-  not yet prioritised.
+### 2.3 Config file-watch / `cert-dir` hot-reload — **BUILT**
+- **What (now):** SIGHUP re-reads every `cert-dir` store and swaps it into the
+  live `ArcSwap`, so a rotated cert is served **without a restart**. The reload is
+  **strict + per-store atomic with fail-before-commit**: each replacement store is
+  loaded completely up front, and only once ALL loads succeed is any store (then
+  the config) swapped. A malformed, half-rotated (a `.crt` without its `.key`, or
+  a `.key` without its `.crt`), or empty `cert-dir` is **rejected**, leaving the
+  old certs and old config live. Config reload stays **SIGHUP-triggered**, not an
+  automatic file-watch (a watcher races partial two-file rotations).
+- **Still restart-only:** the single `cert`/`key` files, listener/TLS topology,
+  `cache-store`, the ACME block, the set of `acme`-enabled hosts, and `server{}`
+  settings are startup-bound. A SIGHUP that changes any of them is **rejected**
+  (old config + certs retained) rather than logged as a silent no-op success.
+- **Note:** this is **not** a single global publication boundary — the cert
+  stores and the config are separate `ArcSwap`s swapped in sequence, so a caller
+  could momentarily see a new store with the old config. That window is
+  memory-safe (each callback holds its own `Arc`) and benign for SNI-keyed stores.
 
 ### 2.4 Full Lua/Rhai scripting / WAF programmability
 - **What:** the WAF is **declarative** (`waf { block field=… match=… }` over

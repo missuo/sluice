@@ -16,9 +16,14 @@ against live Let's Encrypt (staging + production).
   directives, missing/duplicate fields, bad regex, missing cert/mmdb files).
 - **Hot reload on SIGHUP** — re-parses the file and atomically swaps; a bad edit
   is rejected and the running config is kept (never takes the proxy down). This
-  covers the request path (sites, routing, upstreams, WAF, rate limits, GeoIP);
-  **listeners/TLS, `cert-dir`, `cache-store`, ACME, and `server{}` are fixed at
-  startup** and need a restart to change (see DESIGN.md §3).
+  covers the request path (sites, routing, upstreams, WAF, rate limits, GeoIP)
+  **and `cert-dir` certificate rotation** — each `cert-dir` store is re-read
+  strictly and swapped per-store atomically, so a rotated cert is served after
+  SIGHUP while a malformed / half-rotated / empty directory is rejected and the
+  old certs stay live (fail-before-commit). **Listener/TLS topology, the single
+  `cert`/`key` files, `cache-store`, ACME, and `server{}` settings are fixed at
+  startup** and need a restart to change; a SIGHUP that changes any of them is
+  rejected rather than silently ignored (see DESIGN.md §3).
 - Host-routed **sites**, then **path-routed `location` blocks** (prefix or
   `~regex`, first match wins) — nginx-style routing to different backends per path.
 - **Load-balanced upstream pools**: `upstream { server …; server …; balance … }`
@@ -54,8 +59,11 @@ against live Let's Encrypt (staging + production).
   **auto-TLS via ACME/Let's Encrypt** (`tls acme=true` + an `acme {}` block,
   HTTP-01, like Caddy — for domains that resolve directly to the server with :80
   open; behind Cloudflare use an Origin CA cert instead). ACME-renewed certs
-  hot-swap at runtime via the TLS callback — no restart. (`cert-dir` and single
-  `cert`/`key` files are read once at startup; rotating them needs a restart.)
+  hot-swap at runtime via the TLS callback — no restart. **`cert-dir` stores also
+  reload on SIGHUP** — strict + per-store atomic, so a rotated cert appears after
+  SIGHUP while a malformed / half-rotated / empty dir is rejected and the old
+  certs stay live. The single `cert`/`key` files are read once at startup;
+  rotating those needs a restart.
   Auto-TLS is **verified end-to-end
   against live Let's Encrypt** (staging and production): a browser-trusted cert
   issues over HTTP-01 with zero manual steps and is served by SNI at runtime.

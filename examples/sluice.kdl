@@ -48,6 +48,13 @@ server {
     // LEAVE 0 when fronted by Cloudflare (all peers share CF edge IPs); set it for
     // direct exposure.
     // max-conn-per-ip 100
+    // Absolute timeout (seconds) for the downstream TLS handshake, before any HTTP
+    // code runs. A partial ClientHello otherwise retains a socket/task for the whole
+    // window (pre-HTTP Slowloris on direct exposure). The per-IP connection
+    // limiter's pending-slot TTL is derived from this — this window PLUS a fixed
+    // scheduling grace — so pre-handshake accounting never expires before the
+    // handshake it covers could still be live. Min 1. Default 10.
+    tls-handshake-timeout-secs 10
     // Idle-connection timeout (seconds) for a downstream HTTP/2 connection with NO
     // active streams. Stock Pingora waits for the next stream forever, so a client
     // that completes the H2 handshake and then stays silent would pin the
