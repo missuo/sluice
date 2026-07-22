@@ -66,3 +66,38 @@ pub static REQUESTS_BY_COUNTRY: LazyLock<IntCounterVec> = LazyLock::new(|| {
     )
     .unwrap()
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prometheus::{Encoder, TextEncoder};
+
+    /// The `gather()` + `TextEncoder` path Pingora's `prometheus_http_service`
+    /// uses must produce valid, non-empty Prometheus exposition text. This also
+    /// guards the metrics API across the prometheus 0.13 -> 0.14 bump (protobuf 3
+    /// / RUSTSEC-2024-0437 fix): a registered+incremented counter must appear in
+    /// the scraped text with its `# HELP` / `# TYPE` lines.
+    #[test]
+    fn gathered_metrics_encode_to_valid_prometheus_text() {
+        REQUESTS.with_label_values(&["metrics.test", "2xx"]).inc();
+        INFLIGHT.set(1);
+
+        let mut buf = Vec::new();
+        let encoder = TextEncoder::new();
+        encoder.encode(&prometheus::gather(), &mut buf).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+
+        assert!(
+            text.contains("# TYPE sluice_requests_total counter"),
+            "expected the counter's TYPE line in:\n{text}"
+        );
+        assert!(
+            text.contains("sluice_requests_total{host=\"metrics.test\",status=\"2xx\"} 1"),
+            "expected the incremented sample in:\n{text}"
+        );
+        assert!(
+            text.contains("sluice_inflight_requests 1"),
+            "expected the gauge sample in:\n{text}"
+        );
+    }
+}

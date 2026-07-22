@@ -6,9 +6,21 @@ published release — there is no newer version to bump to) with a small set of
 the workspace `Cargo.toml`.
 
 The upstream `examples/` directory and its `[[example]]` manifest targets were
-removed (this crate is vendored only as a library dependency); nothing else in
-the manifest changed. Every source change is delimited by
+removed (this crate is vendored only as a library dependency). The only other
+manifest change is the **`prometheus` dependency bump `0.13` → `0.14`** (see
+below); nothing else in the manifest changed. Every source change is delimited by
 `// ---- sluice vendored patch ... ----` markers.
+
+## Manifest change — `prometheus` 0.13 → 0.14 (RUSTSEC-2024-0437)
+
+`[dependencies.prometheus]` was bumped from `0.13` to `0.14` to match the
+workspace's direct dependency. Prometheus 0.14 pulls `protobuf 3.7.x` instead of
+`protobuf 2.28`, which removes [RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437.html)
+(uncontrolled recursion in `protobuf` 2.x) from the dependency graph. This crate
+only uses the small, stable Prometheus API (`prometheus::gather()` and
+`Encoder`/`TextEncoder` in `src/apps/prometheus_http_app.rs`), which is unchanged
+across the bump, so **no source patch was required** — the change is manifest-only
+and the `/metrics` app compiles and serves valid Prometheus text as before.
 
 ## Patch 1 — `HEAD` + interim `1xx` ends the response early
 

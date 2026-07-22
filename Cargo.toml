@@ -1,6 +1,6 @@
 [package]
 name = "sluice"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2021"
 description = "A config-driven edge proxy on Pingora. Routes and regulates HTTP traffic from a KDL config, no recompile per change."
 license = "MIT"
@@ -14,7 +14,7 @@ kdl = { version = "6", features = ["v1"] }
 regex = "1"
 log = "0.4"
 env_logger = "0.11"
-prometheus = "0.13"
+prometheus = "0.14"
 signal-hook = "0.3"
 maxminddb = "0.28"
 ipnet = "2"
@@ -25,7 +25,7 @@ serde_json = "1"
 pingora-cache = "0.8"
 pingora-error = "0.8"
 libc = "0.2"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "io-util", "net"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "io-util", "net", "sync"] }
 # Pure-Rust X.509 parser: reads the leaf certificate's `notAfter` to schedule
 # ACME renewal from real expiry (not file mtime). Backend-neutral — it does no
 # TLS and links neither OpenSSL nor BoringSSL, so it behaves identically under
