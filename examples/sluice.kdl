@@ -7,6 +7,11 @@
 server {
     threads 0                          // 0 = all cores
     metrics-addr "127.0.0.1:9090"      // Prometheus, loopback only
+    // Access-log line format: "text" (default, compact human-readable) or "json"
+    // (one JSON object per request for structured ingestion — status, latency,
+    // bytes, client, host, upstream, protocol, method, geo, bounded error; every
+    // field JSON-escaped). Both log the path only, never the query or credentials.
+    access-log-format "text"
     grace-period-secs 30
     graceful-shutdown-secs 300
     upstream-keepalive-pool 256
@@ -197,6 +202,13 @@ site "docs.example.com" {              // pure static file server
     file-server {
         root "/var/www/docs"
         index "index.html"
+        // Hot-file cache: small files (<= 64 KiB) are held in memory and served
+        // for up to this many seconds before a fresh secure re-open revalidates
+        // them (bounded staleness). 0 disables the content cache. Default 1.
+        // The cache is bounded (entries + total bytes) and scoped to THIS docroot,
+        // and every fill/revalidation still uses the fd-pinned, no-symlink open —
+        // a symlinked path is refused on the cached path too.
+        cache-ttl-secs 1
     }
 }
 

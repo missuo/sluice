@@ -48,7 +48,15 @@ against live Let's Encrypt (staging + production).
   (enforced while streaming), **read timeouts**, **websocket** passthrough, **HSTS**.
 - **Static file server** (`file-server { root … }`, index files, content-type by
   extension, path-traversal protection, **streamed** off the async runtime) —
-  as a whole site or a single `location`.
+  as a whole site or a single `location`. The docroot is **fd-pinned** and opened
+  component-by-component with `O_NOFOLLOW` (no symlink is ever followed, no path
+  is re-resolved). A **bounded per-docroot hot-file cache** holds small files
+  (≤ 64 KiB) in memory and serves them for up to `cache-ttl-secs` (default 1s,
+  `0` disables) before a fresh **secure** re-open revalidates them; the cache is
+  bounded by entry count and total bytes, scoped to the exact pinned root, and
+  every fill/revalidation goes through the same no-symlink open — so a symlinked
+  path is refused on the cached path too. Small/medium files are opened, `fstat`'d
+  and read in a single blocking hop; large files stream the exact length.
 - **Path `deny`** rules (regex → 403), like nginx `deny`.
 
 > Regexes go in KDL **raw strings** when they contain a backslash:
@@ -81,7 +89,12 @@ against live Let's Encrypt (staging + production).
 - **GeoIP**: country from the `CF-IPCountry` header (free) + optional **MaxMind
   ASN/city** (`maxminddb`); enriches the access log per `log-fields`; country as a
   Prometheus label.
-- **Prometheus** metrics + a per-request **access log** (text; JSON is on the roadmap).
+- **Prometheus** metrics + a per-request **access log**, selectable with
+  `server { access-log-format "text"|"json" }` (default `text`). `json` emits one
+  JSON object per request (status, latency, request/response bytes, client, host,
+  upstream, protocol, method, geo, bounded error) with every field JSON-escaped —
+  structured ingestion without log-injection risk. Both formats log the request
+  **path only** — never the query string or credentials.
 - **Request hardening to an nginx/Caddy security bar:**
   - **Strict Host/authority:** exactly one syntactically valid authority per
     request — duplicate `Host` lines, an absolute-form / HTTP/2 `:authority` that
@@ -215,3 +228,18 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sluice
 See [`examples/sluice.service`](examples/sluice.service) for the full unit and
 setup notes. If you genuinely cannot use it, `server { allow-root true }` (or
 `SLUICE_ALLOW_ROOT=1`) overrides the refusal — discouraged.
+
+## Deployment
+
+Deploying sluice as an nginx/caddy replacement — installing the release binary,
+the hardened systemd unit, TLS/ACME, and the full KDL config — is documented as a
+step-by-step, agent-actionable skill:
+
+- **[`skills/deploy-sluice/SKILL.md`](skills/deploy-sluice/SKILL.md)** — install +
+  privilege separation + systemd + validate/run/reload + nginx/caddy migration +
+  troubleshooting.
+- **[`skills/deploy-sluice/reference/config.md`](skills/deploy-sluice/reference/config.md)**
+  — the complete KDL directive reference and copy-paste recipes (auto-HTTPS static
+  site, reverse proxy, cert files, multi-SNI cert-dir, load balancing + health
+  checks, response/disk cache, WAF + rate limiting, sub-filter, WebSockets, DoS
+  knobs, JSON logging).

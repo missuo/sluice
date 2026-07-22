@@ -321,19 +321,23 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   end-to-end throughput / P50-P99 number: `scripts/loadtest.sh` (needs `oha`)
   drives a running server for that, but the results aren't checked in, and the
   reaper's full-scan cost at the million-file ceiling is still un-benchmarked.
-- **CI actions are major-tag pinned, not SHA-pinned.** All actions run on Node 24
-  (no deprecated Node-20 actions), but they use `@v5`/`@v2`-style tags. Full
-  commit-SHA pinning (a moved tag can't inject code) is the stricter posture and
-  is not yet applied.
-- **`protobuf` 2.28 has a CURRENT RustSec advisory —
-  [RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437.html)
-  (uncontrolled recursion → crash), fixed only in protobuf >= 3.7.** It reaches
-  us transitively (`prometheus` ← both sluice and `pingora-core`), so the
-  upgrade is blocked on upstream pingora/prometheus bumps. The risk is
-  **accepted**, not merely historical: Sluice never parses attacker-controlled
-  protobuf on the request path (the crate only serves Prometheus text/protobuf
-  *encoding*). CI runs `cargo audit` with exactly this one advisory ignored —
-  any other advisory fails the build. Re-evaluate on every pingora bump.
+- **CI actions are SHA-pinned — RESOLVED.** Every GitHub Action in
+  `.github/workflows/ci.yml` is pinned to a full commit SHA (a moved/compromised
+  tag can't inject code), with the human-readable version in a trailing comment:
+  `actions/checkout` v5.1.0, `dtolnay/rust-toolchain` stable, `Swatinem/rust-cache`
+  v2.9.1, `taiki-e/install-action` v2.84.1 — all current Node-24 majors.
+  `.github/dependabot.yml` proposes reviewed SHA bumps weekly. The Rust toolchain
+  is intentionally left at `stable` (evolving clippy/rustfmt lints should be
+  tracked; the *action* that installs it is what's SHA-pinned).
+- **`protobuf` 2.28 RustSec advisory
+  ([RUSTSEC-2024-0437](https://rustsec.org/advisories/RUSTSEC-2024-0437.html)) —
+  RESOLVED.** Both the direct and vendored `pingora-core` `prometheus`
+  dependencies were bumped from 0.13 to **0.14**, which pulls **protobuf 3.7.2**
+  (>= 3.7), removing the advisory. The metrics API (`gather` / `TextEncoder` /
+  the register macros) is unchanged across the bump, so no vendored-Prometheus
+  patch was needed; the `/metrics` scrape still returns valid Prometheus text
+  (verified live + a `src/metrics.rs` encode test). CI now runs `cargo audit`
+  with **zero ignores** — any advisory fails the build.
 
 ---
 
