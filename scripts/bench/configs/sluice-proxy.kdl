@@ -1,0 +1,13 @@
+server {
+    threads 0
+    metrics-addr "127.0.0.1:19090"
+    upstream-keepalive-pool 256
+}
+
+listener "127.0.0.1:18081" {
+    tls cert="/srv/bench/cert.pem" key="/srv/bench/key.pem"
+}
+
+site "127.0.0.1" {
+    upstream "127.0.0.1:18000"
+}
