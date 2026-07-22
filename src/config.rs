@@ -105,6 +105,80 @@ pub struct ServerCfg {
     pub graceful_shutdown_secs: u64,
     pub upstream_keepalive_pool: usize,
     pub upgrade_sock: Option<String>,
+    /// Allow the process to keep running as UID 0. Off by default: sluice refuses
+    /// to serve as root (a memory-safety bug in the TLS/proxy path would be a full
+    /// host compromise) unless this is set or `SLUICE_ALLOW_ROOT=1` is exported.
+    /// The supported deployment drops to a dedicated user via the systemd unit.
+    pub allow_root: bool,
+    /// Drop to this user/group after binding (Pingora privilege drop, used when
+    /// daemonizing). The primary supported path is the systemd `User=`/`Group=`.
+    pub run_user: Option<String>,
+    pub run_group: Option<String>,
+    /// Per-read downstream receive timeout (seconds). Tightens Pingora's inherited
+    /// 60s per-read timeout so a slow/incomplete request body or a slow keepalive
+    /// header read is cut sooner (Slowloris hardening).
+    pub downstream_read_timeout_secs: u64,
+    /// Absolute wall-clock deadline (seconds) for receiving the full request body
+    /// once headers are complete. A body that drips past this is aborted, so a
+    /// per-read timeout can't be reset forever by trickling one byte per interval.
+    pub request_timeout_secs: u64,
+    /// Per-write downstream response timeout (seconds). Bounds a slow-read (H1) or
+    /// withheld-`WINDOW_UPDATE` (H2) client that stalls the response write and would
+    /// otherwise pin a connection/FD/task with near-zero bandwidth. Applied to
+    /// EVERY request on BOTH protocols, independent of `min_send_rate_bytes`. It is
+    /// a PER-WRITE timeout (reset on each successful write), so a steadily-reading
+    /// client is unaffected; only a fully stalled writer is cut. 0 = disabled
+    /// (explicit opt-out; a config warning fires for an unprotected listener).
+    pub downstream_write_timeout_secs: u64,
+    /// Minimum downstream send rate (bytes/sec) for the response. 0 = off. The
+    /// stricter, adaptive H1 policy (a no-op on H2); when set it takes priority over
+    /// the flat `downstream_write_timeout_secs` on H1. Guards against a slow-read
+    /// client holding a connection while draining the response one byte at a time.
+    pub min_send_rate_bytes: usize,
+    /// Maximum concurrent downstream connections per client IP. 0 = off. Enforced
+    /// at TCP accept (before the TLS handshake), so a single source cannot tie up
+    /// the whole connection/file-descriptor budget with held-open connections.
+    /// NOTE: leave 0 when fronted by Cloudflare (all peers share CF edge IPs).
+    pub max_conn_per_ip: u32,
+    /// Idle-connection timeout (seconds) for a downstream HTTP/2 connection that
+    /// has NO active streams. Stock Pingora waits for the next stream forever, so
+    /// a client that completes the H2 handshake and then opens no stream (or goes
+    /// idle between streams) pins the socket/TLS/H2 state/FD for the connection's
+    /// whole life — one silent source could exhaust the FD budget. A long-running
+    /// ACTIVE stream keeps the connection open; only a fully idle connection is
+    /// closed once this elapses. 0 = disabled (unbounded, stock behavior). Mirrors
+    /// the built-in 60s H1 keepalive idle default.
+    pub h2_idle_timeout_secs: u64,
+    /// Absolute timeout (seconds) for the downstream HTTP/2 connection-preface
+    /// handshake. Stock Pingora awaits the 24-byte client preface with NO deadline,
+    /// and `h2-idle-timeout-secs` only starts AFTER the handshake — so a client that
+    /// negotiates ALPN `h2` over TLS and then sends no (or a dripped partial) preface
+    /// pins the socket/TLS/H2 allocations/conn-limit guard/task indefinitely (one
+    /// direct source could exhaust the FD budget). This bounds the preface wait; it
+    /// stays FINITE even when the idle timeout is disabled. A prompt valid preface is
+    /// unaffected. Minimum 1s. Default 10s.
+    pub h2_handshake_timeout_secs: u64,
+    /// Total deadline (seconds) for resolving a hostname upstream to an address.
+    /// Upstream DNS is done asynchronously off the request path; a resolver
+    /// outage/NXDOMAIN/empty answer returns a bounded 502 (never a panic or an
+    /// unbounded blocking lookup that pins worker threads). IP-literal backends skip
+    /// DNS entirely. Minimum 1s. Default 5s.
+    pub upstream_dns_timeout_secs: u64,
+    /// Fresh TTL (seconds) for a cached upstream DNS answer: within this window the
+    /// resolver is NOT consulted (no `getaddrinfo` per request). On expiry the
+    /// last-known-good answer is served immediately while a single background
+    /// refresh runs (serve-stale-while-revalidate). Minimum 1s. Default 30s.
+    pub upstream_dns_ttl_secs: u64,
+    /// How long (seconds) a last-known-good DNS answer keeps being served AFTER its
+    /// TTL when the resolver is failing/slow, so healthy upstream pools survive a
+    /// transient DNS outage. 0 = never serve stale (fail with a 502 the moment the
+    /// TTL lapses and re-resolution fails). Default 300s.
+    pub upstream_dns_stale_secs: u64,
+    /// Global cap on concurrent (blocking) upstream DNS resolutions. Bounds how many
+    /// `getaddrinfo` calls run at once so a DNS flood/outage can't spawn unbounded
+    /// blocking work; combined with per-name singleflight coalescing. Minimum 1.
+    /// Default 8.
+    pub upstream_dns_max_concurrent: u32,
 }
 
 impl Default for ServerCfg {
@@ -116,6 +190,20 @@ impl Default for ServerCfg {
             graceful_shutdown_secs: 300,
             upstream_keepalive_pool: 256,
             upgrade_sock: None,
+            allow_root: false,
+            run_user: None,
+            run_group: None,
+            downstream_read_timeout_secs: 15,
+            request_timeout_secs: 30,
+            downstream_write_timeout_secs: 60,
+            min_send_rate_bytes: 0,
+            max_conn_per_ip: 0,
+            h2_idle_timeout_secs: 60,
+            h2_handshake_timeout_secs: 10,
+            upstream_dns_timeout_secs: 5,
+            upstream_dns_ttl_secs: 30,
+            upstream_dns_stale_secs: 300,
+            upstream_dns_max_concurrent: 8,
         }
     }
 }
@@ -602,9 +690,52 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     if !charset_ok || !labels_ok {
         return Err(format!("upstream {s:?}: invalid host {host:?}"));
     }
+    // RFC 1035 length limits: a DNS name is at most 253 bytes and each label at
+    // most 63. An over-long label/name can NEVER resolve, and previously slipped
+    // past `--check` only to reach the request-path resolver. Reject it here.
+    if !is_v6 {
+        if host.len() > 253 {
+            return Err(format!(
+                "upstream {s:?}: host is {} bytes, over the 253-byte DNS name limit",
+                host.len()
+            ));
+        }
+        if let Some(l) = host.split('.').find(|l| l.len() > 63) {
+            return Err(format!(
+                "upstream {s:?}: DNS label {l:?} is {} bytes, over the 63-byte limit",
+                l.len()
+            ));
+        }
+    }
+    // Host header authority for a URL-form upstream (`http(s)://…`): the origin
+    // sees THIS as `Host`, so it must be a syntactically valid authority — an IPv6
+    // literal stays BRACKETED (`[::1]`, not `::1`), and a non-default port is kept
+    // (RFC 9110 §7.2 omits the scheme's default port, e.g. `:443` for https). The
+    // bare `host:port` form has `host_header = None` and preserves the client's
+    // Host downstream. `host`/`sni` remain the bracketless host for DNS/dial/SNI.
+    let host_header = if url_form {
+        let bracketed = if is_v6 {
+            format!("[{host}]")
+        } else {
+            host.clone()
+        };
+        let authority = if port == default_port {
+            bracketed
+        } else {
+            format!("{bracketed}:{port}")
+        };
+        // Validate the constructed authority (defense in depth; also catches an
+        // exotic host the charset check let through but a Host parser rejects).
+        authority.parse::<http::uri::Authority>().map_err(|_| {
+            format!("upstream {s:?}: computed Host authority {authority:?} is invalid")
+        })?;
+        Some(authority)
+    } else {
+        None
+    };
     Ok(Upstream {
         sni: host.clone(),
-        host_header: if url_form { Some(host.clone()) } else { None },
+        host_header,
         tls,
         verify: tls,
         host,
@@ -716,6 +847,8 @@ static STREAK: Spec = int_leaf(1, 100_000); // health up/down thresholds
 static HTTP_STATUS: Spec = int_leaf(100, 599);
 static THREADS: Spec = int_leaf(0, 4096);
 static POOL0: Spec = int_leaf(0, 1_000_000); // upstream-keepalive-pool
+static RATE0: Spec = int_leaf(0, 1_000_000_000); // min-send-rate-bytes (0 = off)
+static CONC1: Spec = int_leaf(1, 4096); // concurrency limit, must be >= 1
 static FILES1: Spec = int_leaf(1, 1_000_000_000_000); // cache-store max-files
 
 static SERVER_SPEC: Spec = Spec {
@@ -730,6 +863,20 @@ static SERVER_SPEC: Spec = Spec {
         ("graceful-shutdown-secs", Rep::Once, &SECS0),
         ("upstream-keepalive-pool", Rep::Once, &POOL0),
         ("upgrade-sock", Rep::Once, &STR1),
+        ("allow-root", Rep::Once, &BOOL1),
+        ("user", Rep::Once, &STR1),
+        ("group", Rep::Once, &STR1),
+        ("downstream-read-timeout-secs", Rep::Once, &SECS1),
+        ("request-timeout-secs", Rep::Once, &SECS1),
+        ("downstream-write-timeout-secs", Rep::Once, &SECS0),
+        ("min-send-rate-bytes", Rep::Once, &RATE0),
+        ("max-conn-per-ip", Rep::Once, &POOL0),
+        ("h2-idle-timeout-secs", Rep::Once, &SECS0),
+        ("h2-handshake-timeout-secs", Rep::Once, &SECS1),
+        ("upstream-dns-timeout-secs", Rep::Once, &SECS1),
+        ("upstream-dns-ttl-secs", Rep::Once, &SECS1),
+        ("upstream-dns-stale-secs", Rep::Once, &SECS0),
+        ("upstream-dns-max-concurrent", Rep::Once, &CONC1),
     ]),
     extra: None,
 };
@@ -1198,6 +1345,48 @@ impl Config {
                     if let Some(v) = child_arg(node, "upgrade-sock") {
                         server.upgrade_sock = Some(v.to_string());
                     }
+                    if let Some(v) = child_bool(node, "allow-root") {
+                        server.allow_root = v;
+                    }
+                    if let Some(v) = child_arg(node, "user") {
+                        server.run_user = Some(v.to_string());
+                    }
+                    if let Some(v) = child_arg(node, "group") {
+                        server.run_group = Some(v.to_string());
+                    }
+                    if let Some(v) = child_int(node, "downstream-read-timeout-secs") {
+                        server.downstream_read_timeout_secs = v.max(1) as u64;
+                    }
+                    if let Some(v) = child_int(node, "request-timeout-secs") {
+                        server.request_timeout_secs = v.max(1) as u64;
+                    }
+                    if let Some(v) = child_int(node, "downstream-write-timeout-secs") {
+                        server.downstream_write_timeout_secs = v.max(0) as u64;
+                    }
+                    if let Some(v) = child_int(node, "min-send-rate-bytes") {
+                        server.min_send_rate_bytes = v.max(0) as usize;
+                    }
+                    if let Some(v) = child_int(node, "max-conn-per-ip") {
+                        server.max_conn_per_ip = v.max(0) as u32;
+                    }
+                    if let Some(v) = child_int(node, "h2-idle-timeout-secs") {
+                        server.h2_idle_timeout_secs = v.max(0) as u64;
+                    }
+                    if let Some(v) = child_int(node, "h2-handshake-timeout-secs") {
+                        server.h2_handshake_timeout_secs = v.max(1) as u64;
+                    }
+                    if let Some(v) = child_int(node, "upstream-dns-timeout-secs") {
+                        server.upstream_dns_timeout_secs = v.max(1) as u64;
+                    }
+                    if let Some(v) = child_int(node, "upstream-dns-ttl-secs") {
+                        server.upstream_dns_ttl_secs = v.max(1) as u64;
+                    }
+                    if let Some(v) = child_int(node, "upstream-dns-stale-secs") {
+                        server.upstream_dns_stale_secs = v.max(0) as u64;
+                    }
+                    if let Some(v) = child_int(node, "upstream-dns-max-concurrent") {
+                        server.upstream_dns_max_concurrent = v.max(1) as u32;
+                    }
                 }
                 "client-ip" => {
                     if let Some(v) = child_arg(node, "trusted-header") {
@@ -1455,6 +1644,29 @@ impl Config {
             } else {
                 trusted_proxies = CF_RANGES.clone();
             }
+        }
+
+        // Downstream write-DoS boundary. A directly-exposed (TLS) listener with the
+        // per-write timeout disabled AND no adaptive send-rate floor AND no per-IP
+        // connection cap has NO application-level bound on a slow-read / withheld-
+        // `WINDOW_UPDATE` client that pins connections/FDs with near-zero bandwidth.
+        // Warn (rather than fail) since a fronting edge (e.g. Cloudflare) may supply
+        // the boundary; the default `downstream-write-timeout-secs=60` avoids it.
+        let has_serving_listener = listeners
+            .iter()
+            .any(|l| !matches!(l.kind, ListenerKind::RedirectHttps));
+        if has_serving_listener
+            && server.downstream_write_timeout_secs == 0
+            && server.min_send_rate_bytes == 0
+            && server.max_conn_per_ip == 0
+        {
+            log::warn!(
+                "a TLS listener is exposed with downstream-write-timeout-secs=0, \
+                 min-send-rate-bytes=0, and max-conn-per-ip=0: a slow-read / \
+                 withheld-WINDOW_UPDATE client can pin connections with no bound. \
+                 Set downstream-write-timeout-secs (default 60) unless a fronting \
+                 edge (e.g. Cloudflare) already provides that boundary."
+            );
         }
 
         if errs.is_empty() {
@@ -1950,6 +2162,20 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         ));
     }
 
+    // A `sub-filter` transforms the body length, which is incompatible with the
+    // streaming cache-fill path (the carry-over can't be flushed without a real
+    // end-of-stream), so caching is DISABLED at runtime for such a location. Warn
+    // so the operator knows the `cache` block has no effect there.
+    for loc in &locations {
+        if loc.cache.is_some() && !loc.sub_filters.is_empty() {
+            log::warn!(
+                "site `{host}`: a location has both `cache` and `sub-filter`; caching is \
+                 disabled there (a length-changing body rewrite can't be cached correctly). \
+                 Remove one of them to silence this."
+            );
+        }
+    }
+
     let deny = parse_deny(node, &host)?;
     let waf = parse_waf(node, &host)?;
     let acme = child_bool(node, "acme").unwrap_or(false);
@@ -2084,12 +2310,196 @@ mod tests {
     }
 
     #[test]
+    fn h2_idle_timeout_secs_parses_with_default_and_zero_disabled() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        // Absent → default 60s.
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.h2_idle_timeout_secs, 60);
+        // Explicit value is honored.
+        let c = Config::parse(&format!("server {{\n h2-idle-timeout-secs 15\n}}{site}")).unwrap();
+        assert_eq!(c.server.h2_idle_timeout_secs, 15);
+        // 0 = disabled (accepted by the schema, unbounded at runtime).
+        let c = Config::parse(&format!("server {{\n h2-idle-timeout-secs 0\n}}{site}")).unwrap();
+        assert_eq!(c.server.h2_idle_timeout_secs, 0);
+    }
+
+    #[test]
+    fn downstream_write_timeout_secs_defaults_finite_and_parses() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        // Absent → production-safe finite default (60s), NOT disabled.
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.downstream_write_timeout_secs, 60);
+        // Explicit value honored.
+        let c = Config::parse(&format!(
+            "server {{\n downstream-write-timeout-secs 20\n}}{site}"
+        ))
+        .unwrap();
+        assert_eq!(c.server.downstream_write_timeout_secs, 20);
+        // 0 = explicit opt-out (accepted by the schema).
+        let c = Config::parse(&format!(
+            "server {{\n downstream-write-timeout-secs 0\n}}{site}"
+        ))
+        .unwrap();
+        assert_eq!(c.server.downstream_write_timeout_secs, 0);
+    }
+
+    #[test]
+    fn h2_handshake_timeout_secs_defaults_finite_and_clamps_to_one() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        // Absent → finite default of 10s.
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.h2_handshake_timeout_secs, 10);
+        // Explicit value honored.
+        let c = Config::parse(&format!(
+            "server {{\n h2-handshake-timeout-secs 3\n}}{site}"
+        ))
+        .unwrap();
+        assert_eq!(c.server.h2_handshake_timeout_secs, 3);
+        // The preface deadline must stay FINITE: unlike the idle timeout, 0 is NOT a
+        // valid "disabled" value — the schema requires >= 1s and rejects it.
+        let e = parse_err(&format!(
+            "server {{\n h2-handshake-timeout-secs 0\n}}{site}"
+        ));
+        assert!(
+            e.contains("out of range"),
+            "0 handshake timeout must be rejected, got: {e}"
+        );
+    }
+
+    #[test]
+    fn upstream_dns_timeout_secs_defaults_finite_and_rejects_zero() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.upstream_dns_timeout_secs, 5);
+        let c = Config::parse(&format!(
+            "server {{\n upstream-dns-timeout-secs 2\n}}{site}"
+        ))
+        .unwrap();
+        assert_eq!(c.server.upstream_dns_timeout_secs, 2);
+        // Must stay finite (>= 1s); 0 is rejected by the schema.
+        let e = parse_err(&format!(
+            "server {{\n upstream-dns-timeout-secs 0\n}}{site}"
+        ));
+        assert!(
+            e.contains("out of range"),
+            "0 dns timeout must be rejected: {e}"
+        );
+    }
+
+    #[test]
+    fn upstream_dns_cache_knobs_default_and_parse() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        // Defaults.
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.upstream_dns_ttl_secs, 30);
+        assert_eq!(c.server.upstream_dns_stale_secs, 300);
+        assert_eq!(c.server.upstream_dns_max_concurrent, 8);
+        // Explicit values.
+        let c = Config::parse(&format!(
+            "server {{\n upstream-dns-ttl-secs 10\n upstream-dns-stale-secs 0\n upstream-dns-max-concurrent 2\n}}{site}"
+        ))
+        .unwrap();
+        assert_eq!(c.server.upstream_dns_ttl_secs, 10);
+        assert_eq!(c.server.upstream_dns_stale_secs, 0); // 0 = never serve stale (allowed)
+        assert_eq!(c.server.upstream_dns_max_concurrent, 2);
+        // TTL must be >= 1s; max-concurrent must be >= 1 — both reject 0.
+        assert!(
+            parse_err(&format!("server {{\n upstream-dns-ttl-secs 0\n}}{site}"))
+                .contains("out of range")
+        );
+        assert!(parse_err(&format!(
+            "server {{\n upstream-dns-max-concurrent 0\n}}{site}"
+        ))
+        .contains("out of range"));
+    }
+
+    #[test]
+    fn upstream_rejects_over_long_dns_labels_and_names() {
+        // A single label over 63 bytes (total name still under 253) → rejected.
+        let long_label = "a".repeat(64);
+        let e = parse_upstream(&format!("{long_label}.example:80")).unwrap_err();
+        assert!(
+            e.contains("63-byte limit"),
+            "over-long label must be rejected: {e}"
+        );
+        // A whole name over 253 bytes (built from valid <=63-byte labels) → rejected.
+        let big_name = std::iter::repeat_n("abcdefghij", 30)
+            .collect::<Vec<_>>()
+            .join("."); // 30*10 + 29 dots = 329 bytes, each label 10 bytes
+        let e = parse_upstream(&format!("{big_name}:80")).unwrap_err();
+        assert!(
+            e.contains("253-byte DNS name limit"),
+            "over-long name must be rejected: {e}"
+        );
+        // Boundary: a label of exactly 63 bytes and a name of exactly 253 bytes are OK.
+        let label_63 = "a".repeat(63);
+        assert!(parse_upstream(&format!("{label_63}.io:80")).is_ok());
+        // Build a name of exactly 253 bytes: labels of 63,63,63,61 + 3 dots.
+        let name_253 = format!(
+            "{}.{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(63),
+            "d".repeat(61)
+        );
+        assert_eq!(name_253.len(), 253);
+        assert!(
+            parse_upstream(&format!("{name_253}:80")).is_ok(),
+            "a 253-byte name must be accepted"
+        );
+    }
+
+    #[test]
     fn size_parsing() {
         assert_eq!(parse_size("1024").unwrap(), 1024);
         assert_eq!(parse_size("32MiB").unwrap(), 32 * 1024 * 1024);
         assert_eq!(parse_size("10GB").unwrap(), 10_000_000_000);
         assert_eq!(parse_size("512KB").unwrap(), 512_000);
         assert!(parse_size("nope").is_err());
+    }
+
+    #[test]
+    fn upstream_host_header_authority_brackets_v6_and_keeps_nondefault_port() {
+        let up = |s: &str| parse_upstream(s).unwrap();
+        // IPv4 with a non-default port: the Host must carry the port (the bug
+        // dropped it, sending `Host: 127.0.0.1`).
+        let u = up("http://127.0.0.1:19002");
+        assert_eq!(u.host, "127.0.0.1");
+        assert_eq!(u.port, 19002);
+        assert_eq!(u.host_header.as_deref(), Some("127.0.0.1:19002"));
+        // IPv6 literal: Host must stay BRACKETED and keep the non-default port
+        // (the bug sent `Host: ::1`, an invalid unbracketed authority).
+        let u = up("http://[::1]:19003");
+        assert_eq!(u.host, "::1"); // dial/SNI use the bracketless host
+        assert_eq!(u.host_header.as_deref(), Some("[::1]:19003"));
+        // Default port is omitted per RFC 9110 §7.2.
+        assert_eq!(
+            up("https://api.example.com").host_header.as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            up("https://api.example.com:443").host_header.as_deref(),
+            Some("api.example.com")
+        );
+        assert_eq!(
+            up("http://api.example.com:80").host_header.as_deref(),
+            Some("api.example.com")
+        );
+        // Non-default port on a hostname is kept.
+        assert_eq!(
+            up("https://api.example.com:8443").host_header.as_deref(),
+            Some("api.example.com:8443")
+        );
+        // IPv6 with the default port stays bracketed, no port.
+        assert_eq!(up("http://[::1]").host_header.as_deref(), Some("[::1]"));
+        // Bare host:port preserves the client's Host (no override).
+        assert_eq!(up("127.0.0.1:9000").host_header, None);
+        assert_eq!(up("[::1]:9000").host_header, None);
     }
 
     #[test]

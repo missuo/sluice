@@ -10,7 +10,72 @@ server {
     grace-period-secs 30
     graceful-shutdown-secs 300
     upstream-keepalive-pool 256
+    // Zero-downtime upgrade (`-u`) socket. MUST live in a service-owned 0700
+    // directory (systemd `RuntimeDirectory=sluice` gives /run/sluice at 0700);
+    // sluice refuses `-u` with the world-writable /tmp default.
     upgrade-sock "/run/sluice/upgrade.sock"
+
+    // --- Privilege separation ---
+    // sluice REFUSES to run as root (uid 0) by default. Deploy it under the
+    // shipped systemd unit (examples/sluice.service) as a dedicated `sluice`
+    // user with AmbientCapabilities=CAP_NET_BIND_SERVICE. Only override if you
+    // truly cannot: allow-root true    (or export SLUICE_ALLOW_ROOT=1)
+    // When daemonizing, drop to this user/group after binding:
+    // user "sluice"
+    // group "sluice"
+
+    // --- Slowloris / DoS resilience ---
+    // Per-read downstream receive timeout (tightens Pingora's inherited 60s so a
+    // stalled body/keepalive read is cut sooner).
+    downstream-read-timeout-secs 15
+    // Absolute wall-clock deadline for receiving the full request body once
+    // headers are complete — a slow body can't reset the per-read timer forever.
+    request-timeout-secs 30
+    // Per-write downstream response timeout (seconds). Bounds a slow-read (H1) or
+    // withheld-WINDOW_UPDATE (H2) client that stalls the response write and would
+    // otherwise pin a connection/FD with near-zero bandwidth. Applied to BOTH
+    // protocols. Per-write (resets on each successful write), so a steadily-reading
+    // client is fine. 0 = disabled (a config warning fires for an unprotected TLS
+    // listener). Default 60.
+    downstream-write-timeout-secs 60
+    // Minimum response send rate (bytes/sec); 0 = off. The stricter ADAPTIVE H1
+    // policy (H2 no-op); takes priority over the flat write timeout on H1 when set.
+    // min-send-rate-bytes 1024
+    // Max IN-FLIGHT connections per client IP, on BOTH the TLS proxy and the :80
+    // listener. Enforced pre-handshake (dropped right after TCP accept, bounding a
+    // partial-ClientHello flood) AND post-handshake (an exact per-connection guard
+    // held for the connection's whole life, freed the instant it closes). 0 = off.
+    // LEAVE 0 when fronted by Cloudflare (all peers share CF edge IPs); set it for
+    // direct exposure.
+    // max-conn-per-ip 100
+    // Idle-connection timeout (seconds) for a downstream HTTP/2 connection with NO
+    // active streams. Stock Pingora waits for the next stream forever, so a client
+    // that completes the H2 handshake and then stays silent would pin the
+    // socket/FD indefinitely. A long-running active stream keeps the connection
+    // open; only a fully idle one is closed. 0 = disabled. Default 60.
+    h2-idle-timeout-secs 60
+    // Absolute timeout (seconds) for the downstream HTTP/2 connection-preface
+    // handshake. Stock Pingora awaits the client's 24-byte preface with no deadline
+    // and the idle timeout above only starts AFTER it — so a client that negotiates
+    // ALPN h2 over TLS then sends no/partial preface would pin the connection
+    // indefinitely. Stays finite even if h2-idle-timeout-secs is 0. Min 1. Default 10.
+    h2-handshake-timeout-secs 10
+    // Total deadline (seconds) for resolving a HOSTNAME upstream to an address.
+    // Upstream DNS runs off the request path (non-blocking); a resolver
+    // outage/NXDOMAIN/empty answer returns a bounded 502 instead of panicking the
+    // request task or pinning worker threads. IP-literal backends skip DNS. Min 1.
+    // Default 5.
+    upstream-dns-timeout-secs 5
+    // Upstream DNS cache. Within the TTL the resolver is not consulted (no
+    // getaddrinfo per request); on expiry the last-known-good answer is served
+    // while ONE background refresh runs. Concurrent lookups for the same name
+    // coalesce (singleflight), and a global concurrency bound + post-failure
+    // backoff keep a DNS flood/outage from spawning unbounded blocking work. A
+    // last-known-good answer keeps serving for `stale` seconds past its TTL so a
+    // transient resolver outage doesn't drop healthy upstream pools.
+    upstream-dns-ttl-secs 30          // fresh TTL; min 1, default 30
+    upstream-dns-stale-secs 300       // serve last-known-good this long on failure; 0 = off
+    upstream-dns-max-concurrent 8     // global concurrent-resolve cap; min 1
 }
 
 client-ip {
