@@ -10,5 +10,6 @@ pub mod certs;
 pub mod config;
 pub mod dirs;
 pub mod diskcache;
+pub mod dns;
 pub mod metrics;
 pub mod proxy;
