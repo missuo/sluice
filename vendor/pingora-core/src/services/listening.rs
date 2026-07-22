@@ -49,7 +49,20 @@ pub struct Service<A> {
     pub threads: Option<usize>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
+    // ---- sluice vendored patch (see vendor/pingora-core/PATCH.md) ----
+    /// Absolute timeout for the downstream (TLS) handshake in the accept loop.
+    /// Upstream hardcoded 60s here, so a partial ClientHello could retain a
+    /// socket/task for a full minute before any app code ran (pre-HTTP Slowloris on
+    /// direct exposure). Sluice sets this from `tls-handshake-timeout-secs`.
+    handshake_timeout: Duration,
+    // ---- end sluice vendored patch ----
 }
+
+// ---- sluice vendored patch (see vendor/pingora-core/PATCH.md) ----
+/// Default downstream handshake timeout, matching upstream's former hardcoded
+/// value so a `Service` built without an explicit override behaves as before.
+const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
+// ---- end sluice vendored patch ----
 
 impl<A> Service<A> {
     /// Create a new [`Service`] with the given application (see [`crate::apps`]).
@@ -61,6 +74,9 @@ impl<A> Service<A> {
             threads: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
+            // ---- sluice vendored patch ----
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            // ---- end sluice vendored patch ----
         }
     }
 
@@ -74,8 +90,20 @@ impl<A> Service<A> {
             threads: None,
             #[cfg(feature = "connection_filter")]
             connection_filter: Arc::new(AcceptAllFilter),
+            // ---- sluice vendored patch ----
+            handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            // ---- end sluice vendored patch ----
         }
     }
+
+    // ---- sluice vendored patch (see vendor/pingora-core/PATCH.md) ----
+    /// Set the absolute downstream (TLS) handshake timeout for this service's
+    /// accept loop, replacing the former hardcoded 60s. A finite, short value
+    /// bounds a partial-ClientHello Slowloris before any app code runs.
+    pub fn set_handshake_timeout(&mut self, timeout: Duration) {
+        self.handshake_timeout = timeout;
+    }
+    // ---- end sluice vendored patch ----
 
     /// Set a custom connection filter for this service.
     ///
@@ -185,6 +213,9 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
         app_logic: Arc<A>,
         mut stack: TransportStack,
         mut shutdown: ShutdownWatch,
+        // ---- sluice vendored patch ----
+        handshake_timeout: Duration,
+        // ---- end sluice vendored patch ----
     ) {
         // the accept loop, until the system is shutting down
         loop {
@@ -213,7 +244,9 @@ impl<A: ServerApp + Send + Sync + 'static> Service<A> {
                     let shutdown = shutdown.clone();
                     current_handle().spawn(async move {
                         let peer_addr = io.peer_addr();
-                        match timeout(Duration::from_secs(60), io.handshake()).await {
+                        // ---- sluice vendored patch: configurable (was hardcoded 60s) ----
+                        match timeout(handshake_timeout, io.handshake()).await {
+                        // ---- end sluice vendored patch ----
                             Ok(handshake) => {
                                 match handshake {
                                     Ok(io) => Self::handle_event(io, app, shutdown).await,
@@ -279,6 +312,9 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
             .take()
             .expect("can only start_service() once");
         let app_logic = Arc::new(app_logic);
+        // ---- sluice vendored patch ----
+        let handshake_timeout = self.handshake_timeout;
+        // ---- end sluice vendored patch ----
 
         let mut handlers = Vec::new();
 
@@ -289,7 +325,9 @@ impl<A: ServerApp + Send + Sync + 'static> ServiceTrait for Service<A> {
                 let endpoint = endpoint.clone();
 
                 let jh = runtime.spawn(async move {
-                    Self::run_endpoint(my_app_logic, endpoint, shutdown).await;
+                    // ---- sluice vendored patch: pass the configurable handshake timeout ----
+                    Self::run_endpoint(my_app_logic, endpoint, shutdown, handshake_timeout).await;
+                    // ---- end sluice vendored patch ----
                 });
 
                 handlers.push(jh);

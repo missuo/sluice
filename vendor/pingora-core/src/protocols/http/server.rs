@@ -341,6 +341,7 @@ impl Session {
             Self::Custom(s) => s.get_read_timeout(),
         }
     }
+    // ---- end sluice vendored patch (Patch 4: H2 read-timeout routing) ----
 
     /// Sets the downstream write timeout. This will trigger if we're unable
     /// to write to the stream after `timeout`. If a `min_send_rate` is

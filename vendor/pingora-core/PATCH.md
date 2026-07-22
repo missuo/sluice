@@ -82,7 +82,9 @@ patch enforces the read timeout **around the DATA-read future**; on expiry it
 resets the stream with `CANCEL` and returns a read timeout. Sluice sets this via
 the existing `set_read_timeout` (now honored for H2) and pairs it with the
 absolute deadline it already checks per body callback and a per-write timeout for
-the H2 slow-reader path.
+the H2 slow-reader path. (The dispatcher change in `http/server.rs` opens its patch
+marker inside the `set_read_timeout` doc comment and is closed after
+`get_read_timeout`, so all patch markers are balanced.)
 
 ## Patch 5 — relax the upstream read timeout only after a confirmed `101`
 
@@ -184,6 +186,30 @@ no preface, and one that byte-drips a partial preface, are both dropped at the
 single non-resettable handshake deadline, while a prompt valid preface still
 succeeds. The existing per-stream body/read/write deadlines (Patch 4 and Sluice's
 own timeouts) are unchanged.
+
+## Patch 7 — configurable downstream (TLS) handshake timeout
+
+`src/services/listening.rs` (`Service::handshake_timeout` field +
+`set_handshake_timeout` setter; the `run_endpoint` accept loop).
+
+Upstream **hardcoded 60 s** for the downstream handshake in the accept loop
+(`timeout(Duration::from_secs(60), io.handshake())`), which runs BEFORE any app
+code. On a directly-reachable listener a silent or byte-dripped partial ClientHello
+could therefore retain a socket + spawned task for a full minute (a pre-HTTP
+Slowloris), and the value was not adjustable by a `Service` consumer. The patch adds
+a private `handshake_timeout: Duration` field (defaulting to `DEFAULT_HANDSHAKE_TIMEOUT`
+= the former 60 s, so an unconfigured `Service` is unchanged), a public
+`set_handshake_timeout` setter, threads the value from `start_service` into
+`run_endpoint`, and replaces the literal `60`. Sluice sets this on BOTH its proxy and
+`:80` redirect services from the strictly-validated `tls-handshake-timeout-secs`
+server directive (finite, min 1 s, default 10 s), and derives its per-IP
+`ConnLimiter` pending-slot TTL from that value — the handshake timeout PLUS a fixed
+30 s scheduling grace (`ConnLimiter::for_handshake_timeout`), NOT the bare timeout —
+because a pending slot is timestamped at ACCEPT while the spawned handshake task only
+starts its own `timeout(handshake_timeout, …)` once scheduled, so a bare-timeout TTL
+could expire before the handshake it covers is still live. Regression tests: `tests/tls_handshake_timeout.rs`
+— a silent ClientHello and a byte-dripped partial ClientHello are both dropped at the
+single finite deadline, while a prompt valid handshake still succeeds.
 
 ## Updated upstream tests
 

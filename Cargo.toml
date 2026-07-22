@@ -26,6 +26,12 @@ pingora-cache = "0.8"
 pingora-error = "0.8"
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "fs", "io-util", "net"] }
+# Pure-Rust X.509 parser: reads the leaf certificate's `notAfter` to schedule
+# ACME renewal from real expiry (not file mtime). Backend-neutral — it does no
+# TLS and links neither OpenSSL nor BoringSSL, so it behaves identically under
+# both `--features openssl` and `--features boringssl` (Pingora's TLS facade
+# doesn't re-export the ASN.1 date APIs).
+x509-parser = "0.18"
 
 [lib]
 name = "sluice"
@@ -38,6 +44,13 @@ path = "src/main.rs"
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
 tokio-test = "0.4"
+# Self-signed cert generation for the TLS-handshake-timeout and cert-dir hot-reload
+# regression tests (uses `ring` to avoid an aws-lc C toolchain build).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+# Set explicit notAfter/notBefore on generated test certs so the ACME
+# notAfter-based renewal schedule can be exercised (>30d keep, <=30d/expired
+# renew). Pinned to the version rcgen already resolves.
+time = "0.3"
 # H2 client for the downstream-H2 idle-timeout regression test (drives the real
 # vendored accept loop over an in-memory duplex).
 h2 = "0.4"
