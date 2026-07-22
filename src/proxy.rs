@@ -30,7 +30,8 @@ use pingora_cache::{
 };
 
 use crate::config::{
-    Balance, Config, Handler, RateLimit, SubFilter, Upstream, UpstreamGroup, WafField, CF_RANGES,
+    AccessLogFormat, Balance, Config, Handler, RateLimit, SubFilter, Upstream, UpstreamGroup,
+    WafField, CF_RANGES,
 };
 use crate::metrics::*;
 
@@ -643,19 +644,29 @@ async fn send_status(session: &mut Session, status: u16, hsts: Option<&str>) -> 
 }
 
 /// Serve a static file from the docroot pinned by `root_fd` (opened once at
-/// config load, symlink-free). The file is opened via `openat` FROM that fd —
-/// never by re-resolving a path string — so a low-priv user swapping the docroot
-/// path afterwards can't re-route reads, and no symlink UNDER the root is
-/// followed. Streamed in chunks off the async runtime; the Content-Length comes
-/// from `fstat` on the SAME fd streamed, so length and bytes can't disagree.
+/// config load, symlink-free), fronted by the per-docroot [`StaticFileCache`].
+///
+/// Security is unchanged from a per-request secure open: every cache fill and
+/// revalidation opens via `openat` FROM the pinned docroot fd, descending one
+/// component at a time with `O_NOFOLLOW` — never by re-resolving a path string —
+/// so the docroot can't be re-routed and no symlink under it is followed. A
+/// cached snapshot is immutable content bytes (never a shared fd), obtained
+/// through that same secure walk, and is served for at most the cache TTL before
+/// a fresh secure re-open re-validates it (see [`crate::staticfiles`]).
+///
+/// The hot path (a small cached file) serves the snapshot with zero syscalls; a
+/// cold small/medium file is opened + `fstat`'d + read in ONE blocking job
+/// (`Content-Length` from the same fd that is read, so length and body agree); a
+/// large file streams the exact `fstat` length, terminating on the final chunk.
 async fn serve_file(
     session: &mut Session,
     root_fd: std::sync::Arc<crate::dirs::SecureDir>,
+    cache: std::sync::Arc<crate::staticfiles::StaticFileCache>,
     index: &str,
     req_path: &str,
     hsts: Option<&str>,
 ) -> Result<()> {
-    use tokio::io::AsyncReadExt;
+    use crate::staticfiles::{Served, StaticError};
 
     // A file server only answers GET/HEAD; anything else (POST/PUT/…) gets 405.
     let method = session.req_header().method.as_str();
@@ -690,22 +701,72 @@ async fn serve_file(
     let ctype = content_type(std::path::Path::new(
         comps.last().map(String::as_str).unwrap_or(""),
     ));
+    let key = comps.join("/");
 
-    // Open the file via `openat` FROM the pinned docroot fd, descending one
-    // component at a time with `O_NOFOLLOW` — no path re-resolution, so the
-    // docroot can't be re-routed and no symlink under it is followed. Blocking
-    // openat syscalls run on the blocking pool.
-    let open_res = tokio::task::spawn_blocking(move || root_fd.open_file_under(&comps)).await;
-    let file = match open_res {
-        Ok(Ok(f)) => tokio::fs::File::from_std(f),
-        // ELOOP (a symlink under root), ENOENT, ENOTDIR, or "not a regular file".
+    match cache.get(&root_fd, comps.clone(), key).await {
+        Ok(Served::Inline(bytes)) => serve_inline(session, bytes, ctype, is_head, hsts).await,
+        Ok(Served::Large) => stream_large(session, root_fd, comps, ctype, is_head, hsts).await,
+        Err(StaticError::NotFound) => send_status(session, 404, hsts).await,
+        // A read fault after a successful open (before any header was sent) — 404
+        // is the safe pre-header response (the file isn't servable right now).
+        Err(StaticError::Io) => send_status(session, 404, hsts).await,
+    }
+}
+
+/// Send a whole in-memory body (cache hit or fused small/medium read) with the
+/// last chunk marked end-of-stream — no extra empty finish, no EOF probe.
+async fn serve_inline(
+    session: &mut Session,
+    bytes: bytes::Bytes,
+    ctype: &'static str,
+    is_head: bool,
+    hsts: Option<&str>,
+) -> Result<()> {
+    let mut resp = ResponseHeader::build(200, Some(4))?;
+    resp.insert_header("Content-Type", ctype)?;
+    resp.insert_header("Content-Length", bytes.len().to_string())?;
+    if let Some(h) = hsts {
+        resp.insert_header("Strict-Transport-Security", h)?;
+    }
+    // HEAD, or an empty body: everything is in the header frame.
+    if is_head || bytes.is_empty() {
+        session.write_response_header(Box::new(resp), true).await?;
+        return Ok(());
+    }
+    session.write_response_header(Box::new(resp), false).await?;
+    session.write_response_body(Some(bytes), true).await?;
+    Ok(())
+}
+
+/// Stream a large (uncached) file. Performs the ONE authoritative secure open
+/// (`open_file_under_with_meta`) and derives `Content-Length` from THAT fd's
+/// `fstat`, then streams that SAME owned fd — so the advertised length and the
+/// body always come from the same open file description. An atomic replacement
+/// (a redeploy) between the cache's classify-open and this open therefore cannot
+/// pair an old length with new content: whatever this fd resolves to is served
+/// consistently. The fd is per-request and owned (never shared, no shared file
+/// offset). The body is streamed with a fixed [`crate::staticfiles::STREAM_BUF`]
+/// buffer — an uncached body is never materialized whole. The final data chunk
+/// is marked end-of-stream (no extra EOF read); a truncation before the advertised
+/// length drops the connection.
+async fn stream_large(
+    session: &mut Session,
+    root_fd: std::sync::Arc<crate::dirs::SecureDir>,
+    comps: Vec<String>,
+    ctype: &'static str,
+    is_head: bool,
+    hsts: Option<&str>,
+) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    // ONE secure open — the fstat length AND the streamed bytes come from this fd.
+    let open = tokio::task::spawn_blocking(move || root_fd.open_file_under_with_meta(&comps)).await;
+    let (file, meta) = match open {
+        Ok(Ok(pair)) => pair,
+        // ELOOP (symlink), ENOENT, ENOTDIR, or "not a regular file" → 404.
         _ => return send_status(session, 404, hsts).await,
     };
-    let len = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(_) => return send_status(session, 404, hsts).await,
-    };
-    let mut file = file;
+    let len = meta.len();
 
     let mut resp = ResponseHeader::build(200, Some(4))?;
     resp.insert_header("Content-Type", ctype)?;
@@ -713,29 +774,31 @@ async fn serve_file(
     if let Some(h) = hsts {
         resp.insert_header("Strict-Transport-Security", h)?;
     }
-    // HEAD: send headers (incl. the GET Content-Length) but no body.
-    session
-        .write_response_header(Box::new(resp), is_head)
-        .await?;
-    if is_head {
+    // HEAD, or a file that raced down to zero bytes: everything is in the header.
+    if is_head || len == 0 {
+        session.write_response_header(Box::new(resp), true).await?;
         return Ok(());
     }
+    session.write_response_header(Box::new(resp), false).await?;
 
-    // Stream the body in 64 KiB chunks.
-    let mut buf = vec![0u8; 64 * 1024];
-    loop {
-        let n = match file.read(&mut buf).await {
-            Ok(0) => break,
+    let mut file = tokio::fs::File::from_std(file);
+    let mut remaining = len;
+    let mut buf = vec![0u8; crate::staticfiles::STREAM_BUF];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = match file.read(&mut buf[..want]).await {
+            // Truncated before the advertised length — the Content-Length can no
+            // longer be honored, so drop the connection.
+            Ok(0) => return Err(Error::new_str("static file truncated during stream")),
             Ok(n) => n,
-            // Header (with Content-Length) is already sent; a mid-file read error
-            // can only be surfaced by dropping the connection.
             Err(_) => return Err(Error::new_str("static file read error")),
         };
+        remaining -= n as u64;
+        let eos = remaining == 0;
         session
-            .write_response_body(Some(bytes::Bytes::copy_from_slice(&buf[..n])), false)
+            .write_response_body(Some(bytes::Bytes::copy_from_slice(&buf[..n])), eos)
             .await?;
     }
-    session.write_response_body(None, true).await?;
     Ok(())
 }
 
@@ -2490,8 +2553,13 @@ impl ProxyHttp for SluiceProxy {
 
         match &loc.handler {
             // static file server → serve here and short-circuit
-            Handler::File { root_fd, index, .. } => {
-                serve_file(session, root_fd.clone(), index, &path, hsts).await?;
+            Handler::File {
+                root_fd,
+                index,
+                cache,
+                ..
+            } => {
+                serve_file(session, root_fd.clone(), cache.clone(), index, &path, hsts).await?;
                 return Ok(true);
             }
             // proxy → choose the pool member now (round-robin cursor advances once)
@@ -2570,7 +2638,22 @@ impl ProxyHttp for SluiceProxy {
             BodyDecision::DeadlineExceeded => {
                 Err(Error::new_str("request exceeded absolute receive deadline"))
             }
-            BodyDecision::MaxBodyExceeded => Err(Error::new_str("request body exceeds max-body")),
+            BodyDecision::MaxBodyExceeded => {
+                // A chunked / no-Content-Length body that crosses `max-body`
+                // mid-stream (the declared-Content-Length case is rejected up
+                // front in `request_filter`). Return a TYPED `HTTPStatus(413)` so
+                // the fatal proxy path emits a downstream 413 — an untyped internal
+                // error would be mapped to 500 by Pingora's default
+                // `fail_to_proxy`. The erroring request also means the
+                // partially-written upstream connection is dropped rather than
+                // returned to the pool, so a truncated body can't desync a reused
+                // connection. Bytes are already capped by the decision above, so
+                // the limit still can't be evaded regardless of the status.
+                Err(Error::explain(
+                    HTTPStatus(413),
+                    "request body exceeds max-body",
+                ))
+            }
         }
     }
 
@@ -3154,52 +3237,161 @@ impl ProxyHttp for SluiceProxy {
                 .inc();
         }
 
-        // geo fields for the access log, per configured log-fields
-        let geo = ctx
-            .cfg
-            .geoip
-            .as_ref()
-            .map(|g| {
-                let parts: Vec<&str> = g
-                    .log_fields
-                    .iter()
-                    .filter_map(|f| match f.as_str() {
-                        "country" => Some(ctx.country.as_str()),
-                        "asn" => Some(ctx.asn.as_str()),
-                        "asn-org" => Some(ctx.asn_org.as_str()),
-                        "city" => Some(ctx.city.as_str()),
-                        _ => None,
-                    })
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if parts.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{}]", parts.join(" "))
-                }
-            })
-            .unwrap_or_default();
-
         let client = if ctx.client_ip.is_empty() {
             "-"
         } else {
             ctx.client_ip.as_str()
         };
-        let method = session.req_header().method.as_str().to_owned();
-        let path = session.req_header().uri.path().to_owned();
-        let err = e.map(|e| format!(" err={e}")).unwrap_or_default();
+        let method = session.req_header().method.as_str();
+        // PRIVACY: the path only — never the query string or userinfo, which can
+        // carry credentials/tokens. (Shared by both log formats.)
+        let path = session.req_header().uri.path();
         let up = if ctx.up_addr.is_empty() {
             "-"
         } else {
             ctx.up_addr.as_str()
         };
+        // Downstream protocol for the log (h1 covers HTTP/1.0 and 1.1).
+        let proto = match session.req_header().version {
+            http::Version::HTTP_2 => "h2",
+            _ => "h1",
+        };
         // Sub-millisecond precision: static/short-circuit responses are < 1ms,
-        // which as_millis() truncates to a misleading "0ms".
-        log::info!(
-            "{client}{geo} {method} {host}{path} -> {status} {:.3}ms up={up}{err}",
-            elapsed.as_secs_f64() * 1000.0,
-        );
+        // which as_millis() would truncate to a misleading "0ms".
+        let latency_ms = elapsed.as_secs_f64() * 1000.0;
+
+        match ctx.cfg.server.access_log_format {
+            AccessLogFormat::Text => {
+                // geo fields for the text log, per configured log-fields.
+                let geo = ctx
+                    .cfg
+                    .geoip
+                    .as_ref()
+                    .map(|g| {
+                        let parts: Vec<&str> = g
+                            .log_fields
+                            .iter()
+                            .filter_map(|f| match f.as_str() {
+                                "country" => Some(ctx.country.as_str()),
+                                "asn" => Some(ctx.asn.as_str()),
+                                "asn-org" => Some(ctx.asn_org.as_str()),
+                                "city" => Some(ctx.city.as_str()),
+                                _ => None,
+                            })
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                        if parts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", parts.join(" "))
+                        }
+                    })
+                    .unwrap_or_default();
+                let err = e.map(|e| format!(" err={e}")).unwrap_or_default();
+                log::info!(
+                    "{client}{geo} {method} {host}{path} -> {status} {latency_ms:.3}ms up={up}{err}"
+                );
+            }
+            AccessLogFormat::Json => {
+                // Configured, non-empty geo fields as (key, value) pairs.
+                let mut geo_pairs: Vec<(&str, &str)> = Vec::new();
+                if let Some(g) = ctx.cfg.geoip.as_ref() {
+                    for f in &g.log_fields {
+                        let (k, val) = match f.as_str() {
+                            "country" => ("country", ctx.country.as_str()),
+                            "asn" => ("asn", ctx.asn.as_str()),
+                            "asn-org" => ("asn_org", ctx.asn_org.as_str()),
+                            "city" => ("city", ctx.city.as_str()),
+                            _ => continue,
+                        };
+                        if !val.is_empty() {
+                            geo_pairs.push((k, val));
+                        }
+                    }
+                }
+                let err = e.map(|e| bounded_err(&e.to_string()));
+                let v = json_access_log(
+                    client,
+                    method,
+                    host,
+                    path,
+                    status,
+                    latency_ms,
+                    session.body_bytes_read() as u64,
+                    session.body_bytes_sent() as u64,
+                    up,
+                    proto,
+                    &geo_pairs,
+                    err.as_deref(),
+                );
+                log::info!("{v}");
+            }
+        }
     }
+}
+
+/// Build the structured JSON access-log object. Kept as a pure function so the
+/// escaping guarantees can be unit-tested with hostile inputs: `serde_json`
+/// escapes EVERY string value (quotes, backslashes, control chars, newlines), so
+/// no header-derived field can inject a fake log line or break the JSON. `host`
+/// is already collapsed to "-" for an unmatched Host by the caller, so the log
+/// never emits unbounded distinct host values.
+#[allow(clippy::too_many_arguments)]
+fn json_access_log(
+    client: &str,
+    method: &str,
+    host: &str,
+    path: &str,
+    status: u16,
+    latency_ms: f64,
+    req_bytes: u64,
+    resp_bytes: u64,
+    upstream: &str,
+    proto: &str,
+    geo: &[(&str, &str)],
+    error: Option<&str>,
+) -> serde_json::Value {
+    let mut v = serde_json::json!({
+        "client": client,
+        "method": method,
+        "host": host,
+        "path": path,
+        "status": status,
+        // Round to the same 3-decimal ms precision as the text line.
+        "latency_ms": (latency_ms * 1000.0).round() / 1000.0,
+        "req_bytes": req_bytes,
+        "resp_bytes": resp_bytes,
+        "upstream": upstream,
+        "proto": proto,
+    });
+    if !geo.is_empty() {
+        let mut m = serde_json::Map::new();
+        for (k, val) in geo {
+            m.insert(
+                (*k).to_string(),
+                serde_json::Value::String((*val).to_string()),
+            );
+        }
+        v["geo"] = serde_json::Value::Object(m);
+    }
+    if let Some(err) = error {
+        v["error"] = serde_json::Value::String(err.to_string());
+    }
+    v
+}
+
+/// Cap an error string for the access log so a long chained/quoted Pingora error
+/// can't bloat a log line. Truncates on a UTF-8 char boundary and marks it.
+fn bounded_err(s: &str) -> String {
+    const MAX: usize = 256;
+    if s.len() <= MAX {
+        return s.to_string();
+    }
+    let mut end = MAX;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
 }
 
 // ---- redirect-only proxy (:80 → https) ----
@@ -3263,6 +3455,82 @@ impl ProxyHttp for RedirectProxy {
 mod tests {
     use super::*;
     use crate::config::SubFilter;
+
+    #[test]
+    fn json_access_log_is_valid_and_escapes_hostile_input() {
+        // Hostile, header-derived values: quotes, backslashes, a newline, a CR, a
+        // NUL, and a would-be JSON/log-injection payload. serde_json must escape
+        // ALL of them so the line stays exactly one valid JSON object and the
+        // payload can't forge a sibling field or a second log line.
+        let nasty_path = "/a\"b\\c\nd\re\0f\t}{\"status\":999,\"x\":\"";
+        let nasty_ua_host = "evil\"\n{\"host\":\"spoof";
+        let v = json_access_log(
+            "1.2.3.4",
+            "GET",
+            nasty_ua_host,
+            nasty_path,
+            200,
+            1.2345,
+            10,
+            20,
+            "10.0.0.1:8080",
+            "h2",
+            &[("country", "US"), ("asn", "AS\"13335")],
+            Some("boom \"quoted\"\nline2"),
+        );
+        // 1) It serializes to a single valid JSON object with no raw control chars.
+        let line = v.to_string();
+        assert!(
+            !line.contains('\n'),
+            "no raw newline may leak into the line"
+        );
+        assert!(!line.contains('\r'), "no raw CR may leak into the line");
+        assert!(!line.contains('\0'), "no raw NUL may leak into the line");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&line).expect("access-log line must be valid JSON");
+
+        // 2) Values round-trip EXACTLY (escaping is lossless, not lossy sanitizing).
+        assert_eq!(parsed["path"], nasty_path);
+        assert_eq!(parsed["host"], nasty_ua_host);
+        assert_eq!(parsed["status"], 200);
+        assert_eq!(parsed["client"], "1.2.3.4");
+        assert_eq!(parsed["method"], "GET");
+        assert_eq!(parsed["proto"], "h2");
+        assert_eq!(parsed["req_bytes"], 10);
+        assert_eq!(parsed["resp_bytes"], 20);
+        assert_eq!(parsed["latency_ms"], 1.235); // rounded to 3 decimals
+        assert_eq!(parsed["upstream"], "10.0.0.1:8080");
+        assert_eq!(parsed["geo"]["country"], "US");
+        assert_eq!(parsed["geo"]["asn"], "AS\"13335");
+        assert_eq!(parsed["error"], "boom \"quoted\"\nline2");
+
+        // 3) The injected `"status":999` payload did NOT overwrite the real status.
+        assert_eq!(parsed["status"], 200);
+    }
+
+    #[test]
+    fn json_access_log_omits_absent_geo_and_error() {
+        let v = json_access_log("-", "POST", "-", "/", 413, 0.0, 0, 0, "-", "h1", &[], None);
+        assert!(
+            v.get("geo").is_none(),
+            "geo omitted when there are no fields"
+        );
+        assert!(v.get("error").is_none(), "error omitted when there is none");
+        let line = v.to_string();
+        serde_json::from_str::<serde_json::Value>(&line).expect("valid JSON without geo/error");
+    }
+
+    #[test]
+    fn bounded_err_caps_length_on_a_char_boundary() {
+        let short = "just an error";
+        assert_eq!(bounded_err(short), short);
+        let long = "é".repeat(500); // 1000 bytes, multi-byte chars
+        let capped = bounded_err(&long);
+        assert!(capped.len() <= 256 + 4, "must be bounded near the cap");
+        assert!(capped.ends_with('…'), "truncation must be marked");
+        // Must still be valid UTF-8 (no split multi-byte char).
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
 
     #[test]
     fn normalize_defeats_encoding_and_traversal() {

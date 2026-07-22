@@ -304,6 +304,20 @@ mod unix {
         /// ever re-resolving a path string. Errors on a symlink/missing/dir/
         /// special-file component.
         pub fn open_file_under(&self, comps: &[String]) -> io::Result<File> {
+            self.open_file_under_with_meta(comps).map(|(f, _)| f)
+        }
+
+        /// Like [`SecureDir::open_file_under`] but ALSO returns the file's
+        /// `fstat` metadata from the SAME fd that was opened — so a caller gets
+        /// the length (and dev/ino/mtime) without a second `fstat`/blocking hop,
+        /// and the length can never disagree with the bytes read from that fd.
+        /// Identical security walk: pinned-root anchor, one `openat(O_NOFOLLOW,
+        /// O_CLOEXEC)` per component, no symlink followed at any level, and a
+        /// regular-file check.
+        pub fn open_file_under_with_meta(
+            &self,
+            comps: &[String],
+        ) -> io::Result<(File, std::fs::Metadata)> {
             if comps.is_empty() {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty path"));
             }
@@ -338,13 +352,14 @@ mod unix {
                 return Err(errno());
             }
             let f = unsafe { File::from_raw_fd(fd) };
-            if !f.metadata()?.is_file() {
+            let meta = f.metadata()?;
+            if !meta.is_file() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "not a regular file",
                 ));
             }
-            Ok(f)
+            Ok((f, meta))
         }
 
         /// Open an existing file for reading (O_NOFOLLOW) by a single component.

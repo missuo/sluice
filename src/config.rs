@@ -97,10 +97,21 @@ pub struct Config {
     pub index: HashMap<String, usize>,
 }
 
+/// Access-log line format. `Text` (default) is the compact human-readable line;
+/// `Json` emits one `serde_json` object per request for structured ingestion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccessLogFormat {
+    #[default]
+    Text,
+    Json,
+}
+
 #[derive(Debug)]
 pub struct ServerCfg {
     pub threads: usize,
     pub metrics_addr: Option<String>,
+    /// Format of the per-request access log line (`text` default, or `json`).
+    pub access_log_format: AccessLogFormat,
     pub grace_period_secs: u64,
     pub graceful_shutdown_secs: u64,
     pub upstream_keepalive_pool: usize,
@@ -193,6 +204,7 @@ impl Default for ServerCfg {
         ServerCfg {
             threads: 0, // 0 = all cores (resolved in main)
             metrics_addr: None,
+            access_log_format: AccessLogFormat::Text,
             grace_period_secs: 30,
             graceful_shutdown_secs: 300,
             upstream_keepalive_pool: 256,
@@ -373,6 +385,10 @@ pub enum Handler {
         /// Kept for the access log and the cache-epoch fingerprint.
         root: String,
         index: String,
+        /// Bounded hot-file cache scoped to THIS docroot (`root_fd`). Built once
+        /// at config load, so a reload creates a new root + a fresh cache and can
+        /// never serve stale content from an old root.
+        cache: std::sync::Arc<crate::staticfiles::StaticFileCache>,
     },
 }
 
@@ -867,6 +883,7 @@ static SERVER_SPEC: Spec = Spec {
     children: Some(&[
         ("threads", Rep::Once, &THREADS),
         ("metrics-addr", Rep::Once, &STR1),
+        ("access-log-format", Rep::Once, &STR1),
         ("grace-period-secs", Rep::Once, &SECS0),
         ("graceful-shutdown-secs", Rep::Once, &SECS0),
         ("upstream-keepalive-pool", Rep::Once, &POOL0),
@@ -1042,7 +1059,11 @@ static FILE_SERVER_SPEC: Spec = Spec {
     arg_ty: Ty::Str,
     int_range: None,
     props: &[],
-    children: Some(&[("root", Rep::Once, &STR1), ("index", Rep::Once, &STR1)]),
+    children: Some(&[
+        ("root", Rep::Once, &STR1),
+        ("index", Rep::Once, &STR1),
+        ("cache-ttl-secs", Rep::Once, &SECS0),
+    ]),
     extra: None,
 };
 
@@ -1341,6 +1362,15 @@ impl Config {
                     }
                     if let Some(v) = child_arg(node, "metrics-addr") {
                         server.metrics_addr = Some(v.to_string());
+                    }
+                    if let Some(v) = child_arg(node, "access-log-format") {
+                        match v {
+                            "text" => server.access_log_format = AccessLogFormat::Text,
+                            "json" => server.access_log_format = AccessLogFormat::Json,
+                            other => errs.push(format!(
+                                "server access-log-format: unknown value {other:?} (text|json)"
+                            )),
+                        }
                     }
                     if let Some(v) = child_int(node, "grace-period-secs") {
                         server.grace_period_secs = v.max(0) as u64;
@@ -1992,10 +2022,19 @@ fn parse_handler(node: &KdlNode, host: &str) -> Result<Handler, String> {
                     "site `{host}`: file-server index must be a plain filename, not {index:?}"
                 ));
             }
+            // Hot-file cache TTL: how long a cached small-file snapshot is served
+            // before a fresh secure re-open re-validates it. Default 1s; `0`
+            // disables the content cache (the fused single-hop read still applies).
+            let cache_ttl = child_int(f, "cache-ttl-secs")
+                .map(|v| v.max(0) as u64)
+                .unwrap_or(1);
+            let cache =
+                crate::staticfiles::StaticFileCache::new(std::time::Duration::from_secs(cache_ttl));
             Ok(Handler::File {
                 root_fd,
                 root,
                 index,
+                cache,
             })
         }
         (None, None) => Err(format!("site `{host}`: needs an upstream or a file-server")),
@@ -2422,6 +2461,28 @@ mod tests {
         assert!(
             e.contains("out of range"),
             "0 tls handshake timeout must be rejected: {e}"
+        );
+    }
+
+    #[test]
+    fn access_log_format_defaults_text_and_validates() {
+        let site =
+            "\nlistener \"0.0.0.0:80\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9001\"\n}\n";
+        // Absent → text (backward-compatible default).
+        let c = Config::parse(&format!("server {{\n threads 1\n}}{site}")).unwrap();
+        assert_eq!(c.server.access_log_format, AccessLogFormat::Text);
+        // Explicit values honored.
+        let c =
+            Config::parse(&format!("server {{\n access-log-format \"json\"\n}}{site}")).unwrap();
+        assert_eq!(c.server.access_log_format, AccessLogFormat::Json);
+        let c =
+            Config::parse(&format!("server {{\n access-log-format \"text\"\n}}{site}")).unwrap();
+        assert_eq!(c.server.access_log_format, AccessLogFormat::Text);
+        // An unknown value is a strict, actionable error.
+        let e = parse_err(&format!("server {{\n access-log-format \"yaml\"\n}}{site}"));
+        assert!(
+            e.contains("access-log-format") && e.contains("text|json"),
+            "unknown access-log-format must be rejected: {e}"
         );
     }
 

@@ -13,3 +13,4 @@ pub mod diskcache;
 pub mod dns;
 pub mod metrics;
 pub mod proxy;
+pub mod staticfiles;
