@@ -1,0 +1,125 @@
+name: Release
+
+# Runs ONLY when a GitHub Release is published (e.g. the v0.0.1 release). It
+# cross-builds the sluice binary natively per architecture and uploads the RAW
+# executables (no archives) to that Release as assets.
+on:
+  release:
+    types: [published]
+
+# All actions are pinned to full commit SHAs (a moved/compromised tag can't
+# inject code); the human-readable version is in the trailing comment. The SHAs
+# are the SAME reviewed ones used in .github/workflows/ci.yml. Every action is a
+# current Node-24 major (checkout v5, rust-toolchain stable, rust-cache v2).
+
+jobs:
+  release-binaries:
+    name: build ${{ matrix.asset }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    # Needed to upload assets to the Release via the gh CLI.
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native x86_64 build.
+          - runner: ubuntu-latest
+            arch: x86_64
+            asset: sluice-x86_64-linux
+          # Native aarch64 build on the public GitHub-hosted arm64 runner —
+          # avoids a cross toolchain and cross-compiling BoringSSL.
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            asset: sluice-aarch64-linux
+    steps:
+      # checkout@v5 runs on Node 24 (v4 targeted the now-deprecated Node 20).
+      # persist-credentials: false removes the write-scoped token after fetch, so
+      # it is NOT available to arbitrary crate build.rs / toolchain subprocesses
+      # during `cargo build`; the release upload uses its own scoped GH_TOKEN.
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.arch }}
+
+      # BoringSSL (boring-sys) builds from source with cmake; it needs a C/C++
+      # toolchain, Go, and (on x86_64) nasm. These are the same deps the CI
+      # BoringSSL job uses, plus build-essential/perl for robustness.
+      - name: Install BoringSSL build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang golang-go nasm ninja-build perl
+
+      # Build with the BoringSSL backend, which STATICALLY links BoringSSL — so
+      # the artifact does not depend on the runner's system libssl/libcrypto and
+      # is portable across distros (glibc stays dynamically linked; see the
+      # sanity check for the minimum glibc). The default `openssl` feature would
+      # dynamically link the runner's libssl and is NOT self-contained.
+      - name: Build release binary (BoringSSL, static TLS)
+        run: cargo build --release --locked --no-default-features --features boringssl --verbose
+
+      # Run the built binary and confirm it is self-contained: `--version` exits
+      # 0, ldd shows NO dynamic libssl/libcrypto (BoringSSL is static), AND the
+      # binary's version matches the release tag (so a v0.0.1 asset can't report
+      # a different Cargo.toml version — catches tag/manifest drift before upload).
+      # RELEASE_TAG is passed via env (never interpolated into shell source) and
+      # regex-validated, so a hostile tag like `v1$(id)` cannot inject commands.
+      - name: Sanity-check the binary
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag '$RELEASE_TAG' is not vMAJOR.MINOR.PATCH"
+            exit 1
+          fi
+          BIN=target/release/sluice
+          echo "--- version ---"
+          "$BIN" --version
+          BIN_VER="$("$BIN" --version | awk '{print $2}')"
+          if [ "v$BIN_VER" != "$RELEASE_TAG" ]; then
+            echo "::error::binary version v$BIN_VER != release tag $RELEASE_TAG (bump Cargo.toml)"
+            exit 1
+          fi
+          echo "--- ldd ---"
+          ldd "$BIN" || true
+          if ldd "$BIN" | grep -qiE 'libssl|libcrypto'; then
+            echo "::error::binary dynamically links libssl/libcrypto — not self-contained"
+            exit 1
+          fi
+          echo "OK: no dynamic libssl/libcrypto (BoringSSL statically linked)"
+          echo "--- glibc (minimum for this asset) ---"
+          ldd --version | head -1
+
+      # Name the asset distinctly per target and make it executable. The raw
+      # executable is uploaded — no .tar.gz / .zip.
+      - name: Stage asset
+        run: |
+          set -euo pipefail
+          cp target/release/sluice "${{ matrix.asset }}"
+          strip "${{ matrix.asset }}"
+          chmod +x "${{ matrix.asset }}"
+          ls -la "${{ matrix.asset }}"
+
+      # Upload the raw binary to the published Release. The gh CLI is preinstalled
+      # on GitHub runners; `--clobber` makes a re-run idempotent. RELEASE_TAG is
+      # taken from env (not interpolated into the shell) to avoid tag-name command
+      # injection; it was regex-validated in the sanity step above.
+      - name: Upload binary to the Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          gh release upload "$RELEASE_TAG" "$ASSET" \
+            --clobber \
+            --repo "$GITHUB_REPOSITORY"

@@ -9,11 +9,16 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# All actions are current majors running on Node 24 (checkout@v5,
-# Swatinem/rust-cache@v2, dtolnay/rust-toolchain@stable, taiki-e/install-action@v2)
-# — no Node 20 actions remain. NOTE: they are pinned to major-version tags, not
-# full commit SHAs; SHA-pinning is stricter (a moved tag can't inject code) and
-# is tracked in KNOWN_ISSUES.md rather than applied here with unverified SHAs.
+# Every action is pinned to a full commit SHA (a moved/compromised tag can't
+# inject code into CI); the human-readable version is kept in the trailing
+# comment. All are CURRENT majors running on Node 24 — checkout v5,
+# Swatinem/rust-cache v2, taiki-e/install-action v2, dtolnay/rust-toolchain
+# stable — no Node 20 actions remain. Dependabot (.github/dependabot.yml)
+# proposes reviewed SHA bumps weekly.
+#
+# The Rust toolchain is intentionally kept at `stable` (not a pinned version):
+# clippy/rustfmt lints evolve and CI should track them, while the ACTION that
+# installs the toolchain is SHA-pinned, which is where the supply-chain risk is.
 
 jobs:
   test:
@@ -21,16 +26,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       # checkout@v5 runs on Node 24 (v4 targeted the now-deprecated Node 20).
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
 
       - name: Install stable toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       # Swatinem/rust-cache (Node 24) instead of actions/cache@v4 (Node 20).
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -84,9 +90,11 @@ jobs:
     name: build / test (BoringSSL)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           key: boringssl
       # BoringSSL (boring-sys) needs these beyond the C toolchain on Ubuntu.
@@ -101,14 +109,12 @@ jobs:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: taiki-e/install-action@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: taiki-e/install-action@c44f6b046f1c29ae5918b1e0bfdbb2f1813836fd # v2.84.1
         with:
           tool: cargo-audit
-      # RUSTSEC-2024-0437 (protobuf 2.28, transitive via `prometheus` which both
-      # sluice and pingora-core depend on) is ACCEPTED: the fix (protobuf >=3.7)
-      # requires a prometheus/pingora upgrade upstream, and Sluice never parses
-      # attacker-controlled protobuf on the request path. Documented in
-      # KNOWN_ISSUES.md — re-evaluate on every pingora bump. Any OTHER advisory
-      # fails this job.
-      - run: cargo audit --ignore RUSTSEC-2024-0437
+      # Audits with ZERO ignores. RUSTSEC-2024-0437 (protobuf 2.28, transitive
+      # via `prometheus`) is RESOLVED — both the direct and vendored
+      # `pingora-core` prometheus deps are on 0.14, which pulls protobuf >= 3.7.
+      # Any advisory now fails this job.
+      - run: cargo audit

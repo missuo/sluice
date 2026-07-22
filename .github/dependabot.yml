@@ -1,0 +1,14 @@
+version: 2
+updates:
+  # Propose reviewed SHA bumps for the SHA-pinned GitHub Actions in
+  # .github/workflows/*. Weekly, so a moved/patched action tag surfaces as a
+  # reviewable PR (with the new commit SHA) rather than being silently tracked.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
