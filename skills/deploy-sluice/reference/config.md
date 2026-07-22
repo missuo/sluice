@@ -37,8 +37,8 @@ Sluice **cannot serve plaintext HTTP** — every `listener` must have a `tls` bl
 | `acme { … }` | once | Automatic TLS via Let's Encrypt (HTTP-01). |
 | `cache-store { … }` | once | Disk-backed response cache (default is in-memory). |
 | `defaults { … }` | once | Default HSTS header + unmatched-Host status. |
-| `listener "addr" { … }` | many | A bound socket (`:443` TLS, `:80` redirect, metrics). |
-| `site "host" { … }` | many | One vhost, matched by exact `Host`/SNI. |
+| `listener "addr" { … }` | many | A bound socket (`:443` TLS or `:80` redirect). (The Prometheus endpoint binds via `server { metrics-addr … }`, not a listener node.) |
+| `site "host" { … }` | many | One vhost. Routing selects the site by the **exact HTTP `Host`/authority**; `cert-dir` certificate selection is a *separate* decision by **case-insensitive TLS SNI** (Host need not equal SNI). |
 
 ---
 
@@ -56,7 +56,7 @@ All children appear at most once. Defaults shown.
 | `upstream-keepalive-pool` | int ≥0 | `256` | Upstream keepalive connection pool size. |
 | `upgrade-sock` | string | (off) | Unix socket for zero-downtime binary upgrade (`-u`). Parent dir must be service-owned `0700`. |
 | `allow-root` | bool | `false` | Allow running as uid 0 (discouraged). Same as `SLUICE_ALLOW_ROOT=1`. |
-| `user` / `group` | string | (none) | Drop to this user/group when daemonizing (systemd `User=` is preferred). |
+| `user` / `group` | string | (none) | **Reserved / ineffective in the current binary.** They are only applied when Pingora daemonizes, and the sluice CLI never daemonizes (systemd runs it in the foreground), so they do **not** drop privileges. Use the systemd unit's `User=`/`Group=` for privilege separation. |
 | `downstream-read-timeout-secs` | int ≥1 | `15` | Per-read receive timeout (Slowloris). |
 | `request-timeout-secs` | int ≥1 | `30` | Absolute wall-clock deadline to receive a full request body. |
 | `downstream-write-timeout-secs` | int ≥0 | `60` | Per-write response timeout (slow-read client). `0` disables. |
@@ -185,7 +185,7 @@ disk (survive restarts, hold far more than RAM).
 |-----------|------|---------|---------|
 | `dir` | string | (required) | Cache directory. **Real path, no symlinks** (fd-pinned). |
 | `max-size` | size | `10GiB` | Soft cap on total on-disk size (reaper evicts oldest). |
-| `max-files` | int | (large) | Cap on cache file count (inode-exhaustion guard). |
+| `max-files` | int | `1000000` | Cap on cache file count (inode-exhaustion guard). |
 | `min-free` | size | `1GiB` | Keep at least this much filesystem free. |
 
 ```kdl
@@ -246,8 +246,10 @@ listener "0.0.0.0:443" {
 
 ## `site "host" { … }`
 
-The argument is the exact `Host`/SNI this vhost answers. One `site` per hostname;
-use `cert-dir` for many hostnames' certificates. Children:
+The argument is the exact HTTP `Host`/authority this vhost answers (routing is by
+Host, not TLS SNI — with `cert-dir`, certificate selection is a separate,
+case-insensitive SNI decision). One `site` per hostname; use `cert-dir` for many
+hostnames' certificates. Children:
 
 | Directive | Type | Meaning |
 |-----------|------|---------|
@@ -340,8 +342,12 @@ file-server {
 }
 ```
 
-Symlinks under the docroot are **refused** (never followed); traversal (`..`) is
-403. Large files stream; small files are cached in memory.
+Symlinks under the docroot are **refused** (never followed). `..`/dot segments
+are **canonicalized before routing** (`/a/../secret` → `/secret`) and **cannot
+escape** the fd-pinned docroot — so there is no traversal escape, though the
+resulting canonical path may serve an in-docroot file, 404, or be denied by a
+`deny`/WAF rule (it is not categorically a 403). Large files stream; small files
+are cached in memory.
 
 ---
 
@@ -349,8 +355,8 @@ Symlinks under the docroot are **refused** (never followed); traversal (`..`) is
 
 | Directive | Type | Default | Meaning |
 |-----------|------|---------|---------|
-| `ttl-secs` | int ≥0 | — | Cache successful responses this long. `0` = no caching. |
-| `max-object` | size | — | Don't cache responses larger than this. |
+| `ttl-secs` | int ≥0 | `60` | Cache successful responses this long. `0` = no caching. **A bare `cache {}` still caches for 60 s** — set `ttl-secs 0` if you don't want an implicit lifetime. |
+| `max-object` | size | `8MiB` | Don't cache responses larger than this. |
 
 ```kdl
 cache {
@@ -359,8 +365,10 @@ cache {
 }
 ```
 
-Honors the origin's `Cache-Control` (never caches `no-store`/`private`/`Set-Cookie`).
-Uses the in-memory LRU unless a top-level `cache-store { }` selects the disk backend.
+Both fields have defaults: a `cache {}` with no children (or a partial one)
+caches for **60 s** with an **8 MiB** object ceiling. Honors the origin's
+`Cache-Control` (never caches `no-store`/`private`/`Set-Cookie`). Uses the
+in-memory LRU unless a top-level `cache-store { }` selects the disk backend.
 
 ---
 
@@ -400,6 +408,18 @@ backslashes.
 ---
 
 ## Recipes
+
+**Recipes (a)–(d) are COMPLETE, standalone configs** — copy one into
+`/etc/sluice/sluice.kdl` and it passes `sluice --check` (create any referenced
+docroot/cert/cache dirs first).
+
+**Recipes (e)–(m) are FRAGMENTS**, not standalone configs. Each shows just the
+`site {}` (or `server {}`/`cache-store {}`) block being illustrated; a `site`
+alone has no listener, and `site … { acme true }` additionally needs the
+`acme {}` block plus the `:80` redirect and `:443 tls acme=true` listeners. To
+use a fragment, drop it into the scaffold from recipe (a)/(b) — i.e. keep that
+recipe's `acme {}` + two `listener` blocks and replace/extend its `site` with the
+fragment's `site`. Always finish with `sluice --check` before deploying.
 
 ### (a) Static site over auto-HTTPS (ACME) with HTTP→HTTPS redirect
 

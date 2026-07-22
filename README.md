@@ -117,8 +117,10 @@ against live Let's Encrypt (staging + production).
     **in-flight**-connection cap (`max-conn-per-ip`) enforced both pre-handshake
     (at TCP accept, bounding a partial-ClientHello flood) and post-handshake (an
     exact per-connection guard), on both the TLS and the :80 listener.
-    (First-header Slowloris and the fixed TLS-handshake timeout are bounded by
-    Pingora — see KNOWN_ISSUES.md §1.4.)
+    The downstream **TLS-handshake timeout is configurable**
+    (`tls-handshake-timeout-secs`, default 10s) via a vendored `pingora-core`
+    patch, and first-header Slowloris is bounded by a capped, deadline-limited
+    header buffer — see KNOWN_ISSUES.md §1.4.
   - **Privilege separation:** refuses to run as **root** unless explicitly allowed;
     ships a hardened **systemd unit** (`examples/sluice.service`) — dedicated user,
     `CAP_NET_BIND_SERVICE` only, `NoNewPrivileges`, `ProtectSystem=strict`, seccomp.
@@ -130,8 +132,8 @@ against live Let's Encrypt (staging + production).
 
 Roadmap (see DESIGN.md): config file-watch, least-conn EWMA, a constrained
 request-routing expression language (not full scripting). Items that are blocked
-upstream or deliberately deferred — HTTP/3, Rustls, `notAfter`-based ACME renewal,
-weighted `ip-hash`, full scripting — and the reason for each are documented in
+upstream or deliberately deferred — HTTP/3, Rustls, weighted `ip-hash`, full
+scripting — and the reason for each are documented in
 **[KNOWN_ISSUES.md](KNOWN_ISSUES.md)**.
 
 ## Comparison with nginx and Caddy
@@ -239,7 +241,8 @@ step-by-step, agent-actionable skill:
   privilege separation + systemd + validate/run/reload + nginx/caddy migration +
   troubleshooting.
 - **[`skills/deploy-sluice/reference/config.md`](skills/deploy-sluice/reference/config.md)**
-  — the complete KDL directive reference and copy-paste recipes (auto-HTTPS static
-  site, reverse proxy, cert files, multi-SNI cert-dir, load balancing + health
+  — the complete KDL directive reference and recipes: complete copy-paste configs
+  for the common cases (auto-HTTPS static site, reverse proxy, cert files,
+  multi-SNI cert-dir) plus labeled `site`-block fragments (load balancing + health
   checks, response/disk cache, WAF + rate limiting, sub-filter, WebSockets, DoS
-  knobs, JSON logging).
+  knobs, JSON logging) that drop into one of the complete configs.

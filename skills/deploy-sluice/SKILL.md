@@ -7,8 +7,11 @@ description: Install, configure, and run sluice as an nginx/caddy replacement �
 
 You are deploying **sluice**, a config-driven edge proxy on Pingora, to replace
 nginx/caddy. This skill takes you from a bare Linux host to a running, hardened,
-auto-HTTPS reverse proxy / static server. Every command and config below is
-copy-pasteable. The complete KDL directive reference and all recipes are in
+auto-HTTPS reverse proxy / static server. The install/systemd commands and the
+**complete** configs (section 4 and reference recipes (a)–(d)) are ready to
+copy-paste; reference recipes (e)–(m) are **fragments** to drop into a complete
+config (they are labeled as such). Always finish with `sluice --check` before
+deploying. The complete KDL directive reference and all recipes are in
 [`reference/config.md`](reference/config.md) — consult it for anything not shown
 here; do **not** invent directives that aren't in it.
 
@@ -23,25 +26,30 @@ recompile per change). Choose it when you want:
 - **A security-hardened edge** (privilege separation, fd-pinned symlink-free
   dirs, Slowloris/DoS timeouts, a declarative WAF, strict request parsing).
 
-**Performance posture (be honest with the user):**
-
-- As a **reverse proxy** sluice is in caddy's ballpark (slightly faster, better
-  P99 tail latency, ~half the RAM) but roughly **2.6× slower than nginx** on
-  throughput and more CPU per request.
-- As a **static file server** it is faster than before (fused I/O + a hot-file
-  cache) but **still behind nginx** on raw static throughput.
+**Performance posture (be honest with the user).** High-level, from the project's
+own benchmarking: as a **reverse proxy** sluice is roughly in caddy's ballpark
+(comparable throughput, better P99 tail latency, ~half the RAM) but meaningfully
+**slower than nginx** on throughput and CPU per request; it is the **lightest on
+memory** of the three. As a **static file server** the last committed measurement
+was behind both nginx and caddy; the hot-file I/O optimization has landed but has
+**not yet been macro-rebenchmarked**, so do not claim a static improvement until a
+fresh number exists. **Treat [`benchmarks/production-baseline.md`](../../benchmarks/production-baseline.md)
+in the repo as the source of truth for the sluice-vs-nginx-vs-caddy numbers**
+(consult it for current figures rather than quoting stale ones here).
 
 **Recommend sluice for:** TLS-terminating reverse proxies, API gateways, and
 edges behind a CDN (Cloudflare). **Prefer nginx for:** static-file-heavy sites or
 a maximum-throughput direct edge with no CDN.
 
-**Honest limitations (from `KNOWN_ISSUES.md`):**
+**Honest limitations** (see [`KNOWN_ISSUES.md`](../../KNOWN_ISSUES.md) for the
+current, maintained list):
 
 - **No HTTP/3 (QUIC).** Fine behind Cloudflare (which serves H3 to clients and
   uses H1/H2 to origin). Direct clients fall back to HTTP/2.
 - **OpenSSL / BoringSSL only — no Rustls.** Release binaries statically link
   BoringSSL (self-contained, no system libssl needed).
-- **Static serving is slower than nginx** (improved, not on par).
+- **Static serving is slower than nginx** (and, at last measurement, caddy) — see
+  the benchmark baseline above.
 - **No plaintext HTTP serving:** every listener must be TLS or a
   `redirect-to-https`. There is no `listen 80` plain-HTTP mode.
 
@@ -88,14 +96,21 @@ sudo install -o sluice -g sluice -m 0700 -d /var/cache/sluice
 sudo install -o root   -g root   -m 0755 -d /etc/sluice
 ```
 
-Install the hardened unit from the repo (`examples/sluice.service`). If you're
-not in the repo, fetch it from the same tag, e.g.
-`https://raw.githubusercontent.com/missuo/sluice/main/examples/sluice.service`.
+Install the hardened unit from the repo (`examples/sluice.service`). If you're not
+in the repo, fetch it from the **same release tag as the binary you installed**
+(not the mutable `main` branch, which may have drifted from your binary) — for the
+first release, `v0.0.1`:
 
 ```bash
-sudo install -o root -g root -m 0644 examples/sluice.service /etc/systemd/system/sluice.service
+TAG=v0.0.1   # must match the release your binary came from
+curl -fsSL -o /tmp/sluice.service \
+  "https://raw.githubusercontent.com/missuo/sluice/${TAG}/examples/sluice.service"
+sudo install -o root -g root -m 0644 /tmp/sluice.service /etc/systemd/system/sluice.service
 sudo systemctl daemon-reload
 ```
+
+(If you *are* in a checkout of the matching tag, install it directly instead:
+`sudo install -o root -g root -m 0644 examples/sluice.service /etc/systemd/system/sluice.service && sudo systemctl daemon-reload`.)
 
 What the unit gives you (verify by reading `examples/sluice.service`):
 
@@ -210,37 +225,76 @@ journalctl -u sluice -f          # logs (access log + errors)
 sudo -u sluice sluice --check -c /etc/sluice/sluice.kdl && sudo systemctl reload sluice
 ```
 
-- SIGHUP **picks up**: sites, routing, upstreams, WAF, rate limits, per-request
-  timeouts, and **`cert-dir` certificate rotation** (re-read + atomically
+- **Reloaded by SIGHUP** (take effect immediately): sites, routing, upstreams,
+  WAF, rate limits, `deny`/redirects, per-request timeouts
+  (`request-timeout-secs`, `downstream-read/write-timeout-secs`,
+  `min-send-rate-bytes`, per-site `read-timeout-secs`), the upstream DNS
+  **timeout/ttl/stale** knobs (`upstream-dns-timeout-secs`,
+  `upstream-dns-ttl-secs`, `upstream-dns-stale-secs`), **`access-log-format`**,
+  `hsts`/`defaults`, and **`cert-dir` certificate rotation** (re-read + atomically
   swapped; a malformed/half-rotated/empty dir is rejected, old certs kept).
-- SIGHUP does **not** pick up (needs a **restart**): the single `cert`/`key`
-  files, listener topology, `cache-store`, the `acme` block/host set, and
-  startup-only `server` settings (`threads`, `max-conn-per-ip`,
-  `tls-handshake-timeout-secs`, `h2-*`, `metrics-addr`, `access-log-format`, …).
-  A reload that changes any of these is **rejected** and the old config is kept.
+- **Restart-only** (a SIGHUP that changes them is **rejected** and the old config
+  is kept): the single `cert`/`key` files, listener topology, `cache-store`, the
+  `acme` block, the set of `acme`-enabled hosts, and these startup-bound `server`
+  settings — `threads`, `max-conn-per-ip`, `tls-handshake-timeout-secs`,
+  `h2-idle-timeout-secs`, `h2-handshake-timeout-secs`,
+  **`upstream-dns-max-concurrent`** (it sizes the startup DNS-resolver semaphore),
+  `metrics-addr`, `upgrade-sock`, `grace-period-secs`, `graceful-shutdown-secs`,
+  `upstream-keepalive-pool`, `allow-root`, `user`/`group`. For these, `systemctl
+  restart sluice` instead.
 - A bad edit is rejected and the running config stays live (never a downtime).
+- **`systemctl reload` only confirms the signal was delivered, not that the
+  reload was accepted.** After reloading, check the journal for the explicit
+  outcome line: `sudo journalctl -u sluice -n 20 --no-pager` — look for
+  `SIGHUP: reloaded …` (accepted) vs a `SIGHUP: reload rejected …` /
+  `startup-only … setting(s) changed …` line (kept the old config; you changed a
+  restart-only setting — restart instead).
 
-**Zero-downtime binary upgrade** (hand off listening sockets to a new process):
-add an upgrade socket in a service-owned `0700` dir, then start the new binary
-with `-u`:
+### Deploying a new binary
 
-```kdl
-server {
-    upgrade-sock "/run/sluice/upgrade.sock"   // /run/sluice is 0700 via RuntimeDirectory
-}
-```
+**Production (recommended): `systemctl restart sluice`.** Install the new binary,
+then let systemd restart the supervised service:
+
 ```bash
-sudo install -o root -g root -m 0755 /tmp/sluice /usr/local/bin/sluice   # drop in the new binary
-sudo -u sluice /usr/local/bin/sluice -u -c /etc/sluice/sluice.kdl        # acquires FDs, drains the old
+sudo install -o root -g root -m 0755 /tmp/sluice /usr/local/bin/sluice   # new binary
+sudo -u sluice sluice --check -c /etc/sluice/sluice.kdl                  # validate first
+sudo systemctl restart sluice
 ```
-sluice refuses `-u` unless the socket's parent is exactly a service-owned `0700`
-directory (squatting hardening).
+This drops in-flight connections briefly (a fast restart), is fully supervised by
+systemd (sandbox + `Restart=on-failure` intact), and is the simplest safe path.
+
+**Advanced / experimental — true zero-downtime `-u` fd handoff.** Pingora can hand
+the listening sockets to a replacement process so no connections drop, but this is
+**not a simple one-liner and is not yet wired for systemd supervision** — treat it
+as experimental:
+
+- It requires an `upgrade-sock` in a service-owned `0700` dir (sluice refuses `-u`
+  otherwise — squatting hardening):
+  ```kdl
+  server {
+      upgrade-sock "/run/sluice/upgrade.sock"   // /run/sluice is 0700 (RuntimeDirectory)
+  }
+  ```
+- The `-u` process **blocks in bootstrap** until it receives the listening FDs; the
+  OLD process only transfers them **after it is sent `SIGQUIT`** (graceful-drain
+  quit). So the two must overlap: start the new `-u` process, wait for it to bind
+  the upgrade socket, then `SIGQUIT` the old `MAINPID` — e.g.
+  `sudo kill -QUIT "$(systemctl show -p MainPID --value sluice)"` — so it drains
+  and exits while the new process takes over.
+- **Caveat:** launching `-u` manually escapes the systemd unit — after the old
+  `MAINPID` exits, systemd does **not** adopt the manually started process, so the
+  live proxy loses the unit's sandbox and `Restart=` supervision. There is no
+  tested systemd-integrated handoff yet. Have a rollback ready (re-`systemctl
+  start sluice` on the old/known-good binary) and bound the wait with a timeout.
+
+Unless you have validated a supervised handoff, use `systemctl restart` in
+production.
 
 ## 6. Migrating from nginx / caddy
 
 | nginx / caddy | sluice |
 |---------------|--------|
-| `server { server_name x; }` / caddy site block | `site "x" { … }` (exact `Host`/SNI) |
+| `server { server_name x; }` / caddy site block | `site "x" { … }` (routes by exact HTTP `Host`; `cert-dir` cert selection is separately by TLS SNI) |
 | `location /p { … }` | `location "/p" { … }` (prefix) or `location "~regex" { … }` |
 | `proxy_pass http://127.0.0.1:8080;` | `upstream "127.0.0.1:8080"` |
 | `proxy_pass https://api.example.com;` | `upstream "https://api.example.com"` (TLS+SNI+verify) |

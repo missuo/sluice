@@ -38,34 +38,28 @@ Two categories:
 - **Mitigation:** OpenSSL (the default) and BoringSSL both work and are what we
   ship. Do **not** try to "enable" the Rustls feature — it will not select certs.
 
-### 1.3 ACME renewal is mtime-based, not `notAfter`-based
-- **Why:** the renewal loop decides "is this cert old enough to re-issue?" from
-  the certificate **file's mtime** (older than 60 days → renew), not by parsing
-  the X.509 `notAfter` field. Reading `notAfter` needs ASN.1 access, and Pingora's
-  TLS facade does **not re-export** the `asn1` types from the underlying
-  OpenSSL/BoringSSL crate, so the cert's real expiry can't be read through the
-  dependency surface we have.
-- **Impact:** low. Let's Encrypt certs are valid 90 days; renewing at file-age 60
-  days leaves a 30-day margin. The only gap is a cert **replaced out-of-band**
-  (its mtime resets) — harmless, it just renews on our schedule instead of the
-  cert's.
-- **What it would take:** Pingora re-exporting `asn1`/`X509` accessors, or adding a
-  direct dependency on `openssl`/`x509-parser` purely to read `notAfter`. Deferred
-  as not worth a second X.509 stack for a 30-day-margin refinement.
+### 1.3 ACME renewal from X.509 `notAfter` — **RESOLVED**
+- **Status:** the renewal loop now schedules from the certificate's real X.509
+  **`notAfter`** (renew when within 30 days of expiry, or on any parse/expiry
+  error — fail-safe toward renewing), parsed with the pure-Rust, backend-neutral
+  `x509-parser` crate (works identically under OpenSSL and BoringSSL). File mtime
+  is no longer the scheduling signal, so a cert **replaced out-of-band** (which
+  resets mtime) can no longer defer renewal past `notAfter`. (Previously renewal
+  keyed on file mtime because Pingora's TLS facade doesn't re-export the ASN.1
+  date accessors; `x509-parser` sidesteps that without a second TLS stack.)
 
-### 1.4 TLS handshake timeout not tunable (pre-handshake ClientHello Slowloris)
-- **Why:** The TLS handshake is driven by Pingora's own accept loop with a
-  **hardcoded 60s** timeout. The accept loop and its transport types
-  (`TransportStack`, `UninitializedStream`, `Listeners::build`) are all
-  `pub(crate)`, so we can neither shorten the handshake timeout nor wrap the
-  accepted stream from outside the crate. A client can thus keep a **partial
-  ClientHello** open for up to ~60s per socket before any of our code runs.
-  (The HTTP-layer header/upload Slowloris that this section previously described
-  is now closed by vendored `pingora-core` patches — see below.)
-- **What it would take:** an upstream Pingora capability — a settable handshake
-  timeout or a public accept/stream hook. (We already vendor `pingora-core`, but
-  the accept/TLS path is a larger surface than the targeted patches we carry.)
-- **Now fixed at the framework layer (vendored `pingora-core` patches, see
+### 1.4 TLS handshake timeout is configurable — **RESOLVED**
+- **Status:** the downstream TLS-handshake timeout is now a settable
+  `Service` field (vendored `pingora-core` **Patch 7**), driven by the
+  `tls-handshake-timeout-secs` server directive (**default 10s**, min 1s) on both
+  the proxy and the `:80` redirect service — replacing Pingora's former hardcoded
+  60s. A **partial ClientHello** is dropped at that deadline before any app code
+  runs, and the same value derives the per-IP `ConnLimiter` pending-slot TTL so
+  pre-handshake connection accounting stays aligned. Silent/dripped-ClientHello
+  integration tests cover it. (Previously this was blocked because Pingora's
+  accept loop and its transport types were `pub(crate)`; we vendor and patch that
+  loop directly now.)
+- **Also fixed at the framework layer (vendored `pingora-core` patches, see
   `vendor/pingora-core/PATCH.md`):**
   - the H1 **first-header buffer is capped at 16 KiB** (was ~1 MiB) and its
     assembly is bounded by a **non-resettable 15s deadline** from the first byte,
@@ -212,17 +206,19 @@ Two categories:
 These are correct-and-intentional behaviours worth writing down (a reviewer or
 operator could reasonably expect otherwise), plus small gaps not yet closed.
 
-- **Over-limit chunked body → abort, not a clean 413.** A request whose declared
-  `Content-Length` exceeds `max-body` gets a proper `413`. A **chunked / no-
-  Content-Length** body that crosses the limit mid-stream is terminated with a
-  proxy error (connection reset / 5xx-class) once the cap is passed — the bytes
-  are capped either way (no evasion), but a streaming over-limit upload does not
-  receive a tidy `413` response.
-- **HTTPS upstreams get connect-level health only.** An active `health-check`
-  with a `path` performs an HTTP `GET` for **plaintext** backends; for a **TLS**
-  (`https://…`) upstream it falls back to a **TCP-connect** check (no TLS
-  handshake, no HTTP status assertion). A TLS backend that accepts connections
-  but returns errors won't be marked down by the path check.
+- **Over-limit body → clean `413` (streamed too) — RESOLVED.** Both a declared
+  over-`Content-Length` body (rejected up front) **and** a chunked / no-
+  Content-Length body that crosses `max-body` mid-stream now return a downstream
+  **`413`** (the streamed case returns a typed `HTTPStatus(413)` so the fatal
+  proxy path emits 413 and drops the partially-used upstream connection rather
+  than reusing/desyncing it). Bytes stay capped either way (no evasion).
+- **HTTPS upstream health is a verified TLS + HTTP check — RESOLVED.** An active
+  `health-check` with a `path` on a **TLS** (`https://…`) upstream now performs a
+  bounded, **verified TLS handshake** (using the original SNI and the same
+  `verify` policy as the request path) followed by the sanitized HTTP `GET` and an
+  expected-status check — so a backend with an expired/wrong cert, a broken TLS
+  stack, or a bad health status is taken **out of rotation**. Plaintext backends
+  keep the plain HTTP `GET` check; omit `path` for a TCP-connect check.
 - **Static-file serving: docroot pinned by fd, no symlink followed.** The
   docroot is opened once at config load (`SecureDir::open_ro`, refusing symlink
   components) and its fd held in the config snapshot; each request `openat`s the
@@ -307,9 +303,12 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   is still not a general high-cardinality DDoS limiter (no global request
   ceiling / eviction of the 256k live buckets); a determined flood degrades
   legitimate new clients to the shared bucket's rate.
-- **Access log is a fixed line format (no JSON).** The access log emits a fixed
-  field layout; there is no `json` access-log mode yet. Tracked as a "still
-  later" item in DESIGN.
+- **Structured JSON access logging — RESOLVED.** `server { access-log-format
+  "json" }` emits one JSON object per request (status, latency, request/response
+  bytes, client, host, upstream, protocol, method, geo, bounded error), every
+  field JSON-escaped, path only (no query/credentials). The default stays `text`
+  for compatibility. `access-log-format` is read per request, so it takes effect
+  on SIGHUP reload.
 - **`alias` (migration host aliasing) was removed.** It canonicalized
   `<prefix>-<sub>` to `<sub>` for routing/cache-keying while the bare upstream
   still received the client's original Host — a cross-Host cache-mixing bug. The
