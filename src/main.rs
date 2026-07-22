@@ -37,7 +37,11 @@ fn main() {
             // upgrade socket, then SIGQUIT the old process to drain and exit.
             "-u" | "--upgrade" => upgrade = true,
             "-h" | "--help" => {
-                println!("sluice [-c <config.kdl>] [--check] [-u|--upgrade]");
+                println!("sluice [-c <config.kdl>] [--check] [-u|--upgrade] [-V|--version]");
+                return;
+            }
+            "-V" | "--version" => {
+                println!("sluice {}", env!("CARGO_PKG_VERSION"));
                 return;
             }
             other => fatal(&format!("unknown argument: {other}")),
