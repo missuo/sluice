@@ -6,8 +6,9 @@ description = "A config-driven edge proxy on Pingora. Routes and regulates HTTP 
 license = "MIT"
 
 [dependencies]
-pingora = { version = "0.8", default-features = false, features = ["proxy"] }
+pingora = { version = "0.8", default-features = false, features = ["proxy", "connection_filter"] }
 async-trait = "0.1"
+http = "1"
 arc-swap = "1"
 kdl = { version = "6", features = ["v1"] }
 regex = "1"
@@ -36,6 +37,10 @@ path = "src/main.rs"
 
 [dev-dependencies]
 criterion = { version = "0.5", default-features = false }
+tokio-test = "0.4"
+# H2 client for the downstream-H2 idle-timeout regression test (drives the real
+# vendored accept loop over an in-memory duplex).
+h2 = "0.4"
 
 [[bench]]
 name = "hot"
@@ -56,3 +61,11 @@ rustls = ["pingora/rustls"]
 [profile.release]
 lto = true
 codegen-units = 1
+
+# Vendored, minimally-patched `pingora-core` (see vendor/pingora-core/PATCH.md).
+# 0.8.1 is the latest published release (`cargo search pingora` → 0.8.1), so there
+# is no version bump available; the one-function fix (a HEAD request receiving an
+# interim 1xx must NOT end the response before the final header) can only be
+# carried as a local fork applied here. Remove this once the fix lands upstream.
+[patch.crates-io]
+pingora-core = { path = "vendor/pingora-core" }
