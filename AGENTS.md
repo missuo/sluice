@@ -134,6 +134,11 @@ These were fixed after review; a change that reverts any of them is a bug:
   with `Set-Cookie` or a non-`Accept-Encoding` `Vary` are never cached.
 - **Client-IP is anti-spoofed**: the trusted header (e.g. `CF-Connecting-IP`) is
   honored only when the TCP peer is in `trusted_proxies`; no leftmost-XFF fallback.
+  Every peer address is canonicalized at the boundary (`canonical_ip`): an
+  IPv4-mapped IPv6 (`::ffff:a.b.c.d`, how a dual-stack `[::]` listener reports IPv4
+  peers) is unmapped to real IPv4 so conn-limit, rate-limit, trusted-proxy,
+  Cloudflare, geo, and logs share ONE representation — then real IPv6 is `/64`
+  aggregated. Never key a limiter/CIDR check off the raw mapped form.
 - **Forwarding headers are stripped** upstream (`X-Forwarded-Host`, `X-Original-URL`,
   …) so a client can't poison origin URL generation / the cache.
 - **Metric label cardinality** is bounded: unmatched Host → `-`, country is
@@ -163,8 +168,12 @@ These were fixed after review; a change that reverts any of them is a bug:
   Never reintroduce a per-request path open of the docroot.
 - **Cache entries and ACME certs are single-file + one atomic rename** — never
   split state across two files whose renames can be separated by a crash. The
-  cache key is namespaced by a per-site config epoch (a reload can't serve a
-  retired upstream's entries); the reaper only touches cache-owned filenames.
+  cache key is namespaced by the FULL canonical authority (`ctx.authority`, incl.
+  any explicit port — the same value sent upstream as `Host`, so `test.local:1111`
+  and `:2222` can't cross-hit) plus a per-site config epoch (a reload can't serve a
+  retired upstream's entries); the reaper only touches cache-owned filenames. The
+  portless `ctx.host` is only for the bounded-cardinality metric label, never the
+  cache key.
 - **The config schema is strict at every level** (`Spec` tree + `walk` in
   `config.rs`): args (count/type/int-range), props (names/types/dups), children
   (names/multiplicity/block-allowed). Never add a directive without its full
@@ -195,3 +204,12 @@ These were fixed after review; a change that reverts any of them is a bug:
 - **Zero-downtime upgrade**: `-u` makes bootstrap acquire the listening sockets
   from the running process over `upgrade-sock`; then `SIGQUIT` the old process to
   drain and exit. Needs `upgrade-sock` configured.
+- **Vendored `pingora-core` patch** (`vendor/pingora-core`, wired via
+  `[patch.crates-io]`): an exact copy of `pingora-core` 0.8.1 (the latest release —
+  no newer version exists to bump to) with ONE fix in
+  `src/protocols/http/v1/client.rs::init_body_reader` — informational (1xx)
+  handling must precede the HEAD-zero-body rule, or a `HEAD` request that receives
+  an interim `103 Early Hints` ends the response before the final header (the
+  proxy hangs / delivers only the 103). See `vendor/pingora-core/PATCH.md`; the
+  regression test is `tests/head_early_hints.rs`. When bumping Pingora, check
+  whether upstream fixed this and drop the vendored copy + patch stanza if so.

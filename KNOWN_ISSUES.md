@@ -53,6 +53,90 @@ Two categories:
   direct dependency on `openssl`/`x509-parser` purely to read `notAfter`. Deferred
   as not worth a second X.509 stack for a 30-day-margin refinement.
 
+### 1.4 TLS handshake timeout not tunable (pre-handshake ClientHello Slowloris)
+- **Why:** The TLS handshake is driven by Pingora's own accept loop with a
+  **hardcoded 60s** timeout. The accept loop and its transport types
+  (`TransportStack`, `UninitializedStream`, `Listeners::build`) are all
+  `pub(crate)`, so we can neither shorten the handshake timeout nor wrap the
+  accepted stream from outside the crate. A client can thus keep a **partial
+  ClientHello** open for up to ~60s per socket before any of our code runs.
+  (The HTTP-layer header/upload Slowloris that this section previously described
+  is now closed by vendored `pingora-core` patches — see below.)
+- **What it would take:** an upstream Pingora capability — a settable handshake
+  timeout or a public accept/stream hook. (We already vendor `pingora-core`, but
+  the accept/TLS path is a larger surface than the targeted patches we carry.)
+- **Now fixed at the framework layer (vendored `pingora-core` patches, see
+  `vendor/pingora-core/PATCH.md`):**
+  - the H1 **first-header buffer is capped at 16 KiB** (was ~1 MiB) and its
+    assembly is bounded by a **non-resettable 15s deadline** from the first byte,
+    so an incomplete/oversized header can neither pressure memory nor be held
+    indefinitely by dripping one byte per interval;
+  - **strict `Transfer-Encoding` validation** rejects `chunked, chunked` and other
+    illegal codings, closing the request-smuggling differential;
+  - **strict `Content-Length` validation** (`request_filter`, every downstream
+    protocol) rejects any request with 2+ `Content-Length` fields — H2 lets a
+    client send several and the H2→H1 downgrade would forward them all — or a
+    non-canonical single value, and re-emits exactly one normalized field, closing
+    the duplicate-CL H2→H1 smuggling/desync vector;
+  - **credential-bearing requests bypass the cache entirely** (`request_cache_filter`):
+    a request with `Authorization` or any `Cookie` never looks up or stores a cache
+    entry, so it can never be served an anonymous fallback-TTL response without
+    reaching the origin (the cache key carries no credential dimension, so a shared
+    lookup would cross the auth/session boundary);
+  - the **H2 request-body reader honors a read timeout** and resets the stream on
+    a silent/idle upload, so a single H2 connection can no longer pin its streams
+    forever (`set_read_timeout` is no longer a no-op for H2);
+  - a **downstream H2 idle-connection timeout** (`h2-idle-timeout-secs`, default
+    60s) closes a connection that completes the H2 handshake and then keeps NO
+    active stream — stock Pingora waited on the next stream forever, so a silent
+    post-handshake connection otherwise pinned a socket/FD for life. It is
+    active-stream-aware (a long-running stream is preserved), so it never tears
+    down an in-flight request.
+- **Mitigation (shipped) for the residual TLS-handshake window and everything
+  reachable from our layer:**
+  - an **absolute request deadline** (`request-timeout-secs`, default 30s) checked
+    on every body callback including the last — a slow body can no longer reset the
+    per-read timer forever (verified aborted at the deadline);
+  - a **tightened per-read downstream timeout** (`downstream-read-timeout-secs`,
+    default 15s) applied to the body, to keepalive follow-up header reads, and (via
+    the vendored patch) to H2 request-body DATA reads;
+  - a **default per-write downstream response timeout** (`downstream-write-timeout-secs`,
+    default 60s) applied to EVERY request on BOTH H1 and H2, so a slow-read /
+    withheld-`WINDOW_UPDATE` client can't pin a connection/FD draining the response
+    (0 = explicit opt-out, which warns for an unprotected TLS listener);
+  - a **minimum response send rate** (`min-send-rate-bytes`) as the stricter
+    adaptive H1 policy on top of the write timeout;
+  - a **per-IP in-flight connection cap** (`max-conn-per-ip`) enforced at BOTH
+    stages Pingora exposes, against one shared counter, on BOTH the TLS proxy and
+    the :80 listener:
+    - **pre-handshake** — an `AcceptFilter` (`ConnectionFilter`) rejects an
+      over-cap source right after TCP accept, before the TLS handshake, so a
+      partial-ClientHello flood is bounded (verified: at cap 1, a 2nd stalled
+      ClientHello from the same IP is dropped while the 1st is still handshaking).
+      The source key aggregates IPv6 by `/64` (the same normalization the request
+      rate limiter uses), so a subscriber cannot mint fresh budgets by rotating
+      the low bits of its allocation;
+    - **post-handshake** — `ConnCapApp` holds an exact drop-guard across the
+      connection's whole `process_new` life (H1 keepalive loop / H2 connection),
+      released the instant it closes.
+  - **Accepted tradeoff — a short false-denial window.** Pingora gives no
+    pre-handshake close callback, so a connection that is admitted and then
+    *abandoned* during the handshake (or fails it) keeps its pending slot until a
+    TTL equal to the handshake timeout (60s) expires. During that window an IP (or
+    a NAT of users behind one address) that just burned its budget on failed
+    handshakes is temporarily denied even though the sockets are already gone. We
+    keep the conservative TTL because under-counting a genuinely-live pre-handshake
+    socket would defeat the cap; with a realistic `max-conn-per-ip` the window is
+    negligible. A background sweeper prunes expired pending slots and removes empty
+    entries every 10s even when that IP never returns — so the map cannot grow
+    without bound under a distributed scan or address rotation — and a global
+    entry ceiling refuses brand-new sources once the table is full.
+  - the shipped **systemd unit** sets `LimitNOFILE`/`TasksMax` as a hard ceiling —
+    the backstop for a *distributed* flood, which a per-IP cap cannot bound.
+  Behind Cloudflare — the real deployment — the CDN edge absorbs header-Slowloris
+  before it reaches the origin. For direct exposure, set `max-conn-per-ip` and/or
+  a firewall `connlimit`.
+
 ---
 
 ## 2. Deliberately not built (cost not justified yet)

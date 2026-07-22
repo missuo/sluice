@@ -74,6 +74,33 @@ against live Let's Encrypt (staging + production).
   ASN/city** (`maxminddb`); enriches the access log per `log-fields`; country as a
   Prometheus label.
 - **Prometheus** metrics + a per-request **access log** (text; JSON is on the roadmap).
+- **Request hardening to an nginx/Caddy security bar:**
+  - **Strict Host/authority:** exactly one syntactically valid authority per
+    request — duplicate `Host` lines, an absolute-form / HTTP/2 `:authority` that
+    disagrees with `Host`, and non-numeric/over-range ports are all `400`. Routing,
+    the upstream `Host`, and the cache key share one canonical value, so no later
+    hop can route on a different host (authz bypass / cross-vhost cache poisoning).
+  - **Canonical upstream target:** the request is forwarded in **origin-form** with
+    the fully-normalized path (percent-decoded, `.`/`..` resolved, `//` collapsed,
+    matrix `;params` dropped, backslashes rejected) — the proxy and origin never
+    disagree on the path, and the raw client target is never passed through.
+  - **Hop-by-hop stripping:** every `Connection`-nominated header plus the standard
+    hop-by-hop set (`Connection`, `Proxy-Connection`, `Keep-Alive`, `TE`, `Trailer`,
+    `Transfer-Encoding`, `Upgrade`) is removed **both** upstream and on the response
+    before caching — a WebSocket upgrade is preserved only for a `websocket`
+    location.
+  - **Slowloris / DoS controls:** absolute request-receive deadline
+    (`request-timeout-secs`, checked on every body chunk including the last),
+    tightened per-read downstream timeout (`downstream-read-timeout-secs`),
+    minimum response send rate (`min-send-rate-bytes`), and a per-IP
+    **in-flight**-connection cap (`max-conn-per-ip`) enforced both pre-handshake
+    (at TCP accept, bounding a partial-ClientHello flood) and post-handshake (an
+    exact per-connection guard), on both the TLS and the :80 listener.
+    (First-header Slowloris and the fixed TLS-handshake timeout are bounded by
+    Pingora — see KNOWN_ISSUES.md §1.4.)
+  - **Privilege separation:** refuses to run as **root** unless explicitly allowed;
+    ships a hardened **systemd unit** (`examples/sluice.service`) — dedicated user,
+    `CAP_NET_BIND_SERVICE` only, `NoNewPrivileges`, `ProtectSystem=strict`, seccomp.
 - Multi-core, graceful drain on SIGTERM, upstream keepalive pool.
 - **Zero-downtime binary upgrade** (Pingora fd handoff): with an `upgrade-sock`
   set, start the new binary with `-u` (it takes over the listening sockets from
@@ -121,6 +148,9 @@ Legend: ✅ built-in · 🔌 plugin/module · 💰 paid tier only · ❌ not ava
 | Prometheus metrics | ✅ built-in | ⚠️ basic `stub_status` / 🔌 exporter | ✅ built-in |
 | Trusted client-IP + anti-spoofing | ✅ | ⚠️ manual (`realip`) | ⚠️ manual |
 | Request-body size cap (streaming) | ✅ | ✅ | ✅ |
+| Strict Host/authority + hop-by-hop stripping | ✅ | ⚠️ partial | ✅ |
+| Slowloris / connection caps | ✅ (deadline + per-IP cap) | ✅ (`*_timeout`, `limit_conn`) | ✅ |
+| Runs unprivileged by default + systemd sandbox | ✅ (refuses root) | ⚠️ master as root | ⚠️ manual |
 | Response-body rewrite | ✅ (`sub-filter`) | ✅ (`sub_filter`) | 🔌 |
 | Scripting | ❌ (Rust plugins) | ✅ njs / 🔌 Lua | ❌ (Go plugins) |
 | TLS backends | OpenSSL / BoringSSL | OpenSSL | Go crypto / BoringSSL |
@@ -157,3 +187,23 @@ sluice -c /etc/sluice/sluice.kdl          # run
 ```
 
 See [`examples/sluice.kdl`](examples/sluice.kdl) for a full annotated config.
+
+### Deploy (privilege separation)
+
+sluice **refuses to run as root** (uid 0). It terminates TLS and parses
+attacker-controlled input, so it must run as a dedicated, sandboxed account — not
+as root where any flaw is a host compromise. Deploy it under the shipped hardened
+systemd unit, which runs it as a `sluice` user with only `CAP_NET_BIND_SERVICE`
+(so it can still bind `:80`/`:443`), `NoNewPrivileges`, `ProtectSystem=strict`,
+private state directories, and a seccomp filter:
+
+```bash
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin sluice
+sudo install -o sluice -g sluice -m 0700 -d /var/lib/sluice/acme /var/cache/sluice
+sudo install -m0644 examples/sluice.service /etc/systemd/system/sluice.service
+sudo systemctl daemon-reload && sudo systemctl enable --now sluice
+```
+
+See [`examples/sluice.service`](examples/sluice.service) for the full unit and
+setup notes. If you genuinely cannot use it, `server { allow-root true }` (or
+`SLUICE_ALLOW_ROOT=1`) overrides the refusal — discouraged.
