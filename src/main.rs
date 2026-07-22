@@ -503,6 +503,11 @@ fn check_dir_meta(
 fn validate_socket_dir(dir: &str) -> Result<(), String> {
     use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
+    // `st.st_mode` is `u16` on macOS (mode_t) but `u32` on Linux, so `as u32`
+    // is a real widening on macOS yet a same-type (redundant) cast on Linux,
+    // where clippy's `unnecessary_cast` fires under `-D warnings`. Allow it here
+    // rather than diverge the code per platform.
+    #[allow(clippy::unnecessary_cast)]
     fn fstat_dir(fd: RawFd) -> Result<(u32, u32), String> {
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
