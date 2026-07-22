@@ -1,0 +1,93 @@
+# Hardened systemd unit for sluice.
+#
+# sluice is an edge proxy that terminates TLS and handles attacker-controlled
+# input. It must NOT run as root: a memory-safety or file-handling flaw anywhere
+# in the TLS/proxy/cache/ACME path would otherwise be a full host compromise
+# rather than compromise of one dedicated, sandboxed service account. This unit
+# runs it as a dedicated `sluice` user with only CAP_NET_BIND_SERVICE (so it can
+# still bind :80/:443), no new privileges, a tight capability bounding set, and a
+# read-only filesystem with explicit private writable state directories.
+#
+# One-time setup:
+#   sudo useradd --system --no-create-home --shell /usr/sbin/nologin sluice
+#   sudo install -o sluice -g sluice -m 0700 -d /var/lib/sluice/acme
+#   sudo install -o sluice -g sluice -m 0700 -d /var/cache/sluice
+#   # The binary must be executable (0755); the unit file stays 0644.
+#   sudo install -o root   -g root   -m 0755 target/release/sluice /usr/local/bin/sluice
+#   sudo install -o root   -g root   -m 0644 examples/sluice.service /etc/systemd/system/sluice.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now sluice
+#
+# sluice REFUSES to run as uid 0 unless `server { allow-root true }` or
+# SLUICE_ALLOW_ROOT=1 is set; this unit relies on that refusal as a backstop.
+
+[Unit]
+Description=sluice edge proxy
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sluice -c /etc/sluice/sluice.kdl
+# SIGHUP triggers sluice's fail-safe hot reload (a bad edit keeps the old config).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+
+# --- Privilege separation -------------------------------------------------
+# Run as a dedicated unprivileged account, never root.
+User=sluice
+Group=sluice
+# Bind :80/:443 without being root: grant only the port-bind capability, both as
+# the permitted/effective set (AmbientCapabilities) and the ceiling
+# (CapabilityBoundingSet). Everything else is dropped.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+# No setuid/setgid binary or file capability can ever regrant privileges.
+NoNewPrivileges=true
+
+# --- Filesystem sandbox ---------------------------------------------------
+ProtectSystem=strict
+ProtectHome=true
+# Only these paths are writable; everything else (including /usr, /etc) is RO.
+# ACME account/keys and the disk cache; match your sluice.kdl `acme cache-dir`
+# and `cache-store dir`.
+StateDirectory=sluice
+CacheDirectory=sluice
+ReadWritePaths=/var/lib/sluice /var/cache/sluice
+# The zero-downtime upgrade socket (`-u`) must live in a service-owned 0700 dir.
+# RuntimeDirectory gives us /run/sluice at 0700, owned by the service user; point
+# `server { upgrade-sock "/run/sluice/upgrade.sock" }` here. sluice refuses `-u`
+# unless the socket's parent is exactly such a directory.
+RuntimeDirectory=sluice
+RuntimeDirectoryMode=0700
+ConfigurationDirectory=sluice
+
+# --- Kernel / syscall / namespace hardening -------------------------------
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+PrivateTmp=true
+PrivateDevices=true
+UMask=0077
+
+# --- Resource limits (Slowloris / fd-exhaustion backstop) -----------------
+# Cap total file descriptors so a connection-exhaustion attack can't take the
+# whole host with it; pair with `server { max-conn-per-ip }` in sluice.kdl.
+LimitNOFILE=65535
+TasksMax=4096
+
+[Install]
+WantedBy=multi-user.target
