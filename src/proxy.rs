@@ -182,6 +182,15 @@ pub fn normalize_path(raw: &str) -> Option<String> {
     let mut cur = raw.as_bytes().to_vec();
     let mut stable = false;
     for _ in 0..16 {
+        // Fail CLOSED on any malformed `%` (a `%` not followed by two hex
+        // digits) at EVERY round. This catches a raw dangling `%` (`/admin%`,
+        // `/admin%zz`) AND the `%25`→literal-`%` case (`/admin%25` decodes to
+        // `/admin%`, which a lenient origin might read as `/admin` — the exact
+        // WAF bypass). decode_percent_once used to leave a bad `%` as-is and call
+        // it "stable", so the path slipped through unnormalized.
+        if has_malformed_percent(&cur) {
+            return None;
+        }
         let next = decode_percent_once(&cur);
         if next == cur {
             stable = true;
@@ -215,6 +224,23 @@ pub fn normalize_path(raw: &str) -> Option<String> {
         out.push('/');
     }
     Some(out)
+}
+
+/// True if `b` contains a `%` that is NOT followed by two hex digits — a
+/// malformed percent-escape. Used to fail closed rather than pass it through.
+fn has_malformed_percent(b: &[u8]) -> bool {
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() || hex_val(b[i + 1]).is_none() || hex_val(b[i + 2]).is_none() {
+                return true;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    false
 }
 
 /// One percent-decode pass over raw path bytes (leaves a `%` that isn't a valid
@@ -1824,6 +1850,17 @@ mod tests {
         assert_eq!(normalize_path("/a%2f..%2fadmin").as_deref(), Some("/admin"));
         // Pathologically over-encoded / over-long → fail closed (400).
         assert!(normalize_path(&("%25".repeat(9000))).is_none());
+        // MALFORMED percent-encoding must fail closed (was passed through as
+        // "stable", letting a lenient origin re-read `/admin%` as `/admin`).
+        assert!(normalize_path("/admin%").is_none());
+        assert!(normalize_path("/admin%2").is_none());
+        assert!(normalize_path("/admin%zz").is_none());
+        assert!(normalize_path("/admin%2z").is_none());
+        // `%25` (encoded percent) → literal `%`, which is ALSO ambiguous to a
+        // lenient origin → fail closed.
+        assert!(normalize_path("/admin%25").is_none());
+        // A well-formed multi-encoding still decodes cleanly (no literal % left).
+        assert_eq!(normalize_path("/foo%2541").as_deref(), Some("/fooA"));
     }
 
     #[test]

@@ -533,11 +533,17 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
         ));
     }
     let hostport = rest.split('/').next().unwrap_or(rest);
-    // A path is not allowed in EITHER form (`127.0.0.1:9/path` used to drop it).
+    // No path/trailing-slash. A URL form may end in a bare `/` (`https://h/`);
+    // the bare `host:port` form may NOT (`127.0.0.1:9/` used to silently drop it).
     let after_authority = &rest[hostport.len()..];
-    if !after_authority.is_empty() && after_authority != "/" {
+    let allowed_suffix = if url_form {
+        after_authority == "/"
+    } else {
+        false
+    };
+    if !after_authority.is_empty() && !allowed_suffix {
         return Err(format!(
-            "upstream {s:?}: a path is not allowed — give just the origin host[:port]"
+            "upstream {s:?}: a path/trailing-slash is not allowed — give just host[:port]"
         ));
     }
     let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
@@ -581,12 +587,19 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     if port == 0 {
         return Err(format!("upstream {s:?}: port 0 is not valid"));
     }
-    // Strict authority: reject whitespace/control/userinfo in the host, which
-    // would corrupt the connection target or SNI.
-    if host
-        .bytes()
-        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control() || b == b'@')
-    {
+    // Strict authority. An IPv6 literal (already bracket-stripped) may contain
+    // `:` and hex; a hostname/IPv4 is alphanumeric + `.-_`. Reject anything else
+    // (whitespace, control, `@` userinfo, `%`-encoding like `api%2etest`), and a
+    // hostname label that starts or ends with `-` (`-bad.test`).
+    let is_v6 = host.contains(':');
+    let charset_ok = host.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || b == b'.' || b == b'-' || b == b'_' || (is_v6 && b == b':')
+    });
+    let labels_ok = is_v6
+        || host
+            .split('.')
+            .all(|l| !l.is_empty() && !l.starts_with('-') && !l.ends_with('-'));
+    if !charset_ok || !labels_ok {
         return Err(format!("upstream {s:?}: invalid host {host:?}"));
     }
     Ok(Upstream {
@@ -1357,14 +1370,15 @@ impl Config {
         // Two acceptors on one address both try to bind → the second fails at
         // startup, after --check said ok. Compare PARSED addresses so `:19550`
         // and `:019550` (same socket, different string) are caught too — AND
-        // treat a wildcard (unspecified, `0.0.0.0`/`[::]`) as conflicting with
-        // ANY same-family address on the same port, since `0.0.0.0:80` already
-        // binds `127.0.0.1:80` (a plain-equality check let that pair through).
+        // treat a wildcard (unspecified `0.0.0.0`/`[::]`) as conflicting with ANY
+        // same-port address, IGNORING family: `0.0.0.0:80` binds `127.0.0.1:80`,
+        // and `[::]:80` binds IPv4 too on a default dual-stack Linux, so a plain
+        // or same-family check let those pairs through. Conservatively flagging a
+        // wildcard-vs-anything overlap is safer than a startup bind fight.
         use std::net::SocketAddr;
         let paddr = |s: &str| s.parse::<SocketAddr>().ok();
         let conflict = |a: &SocketAddr, b: &SocketAddr| -> bool {
             a.port() == b.port()
-                && a.is_ipv4() == b.is_ipv4()
                 && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified())
         };
         for (i, l) in listeners.iter().enumerate() {
@@ -2385,6 +2399,25 @@ mod tests {
         );
         assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:9/path\"")).contains("path"));
         assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:0\"")).contains("port 0"));
+    }
+
+    #[test]
+    fn strict_schema_rejects_round11_values() {
+        // upstream: bare trailing slash, %-encoded host, leading-dash host.
+        assert!(parse_err(&cfg_with(" upstream \"127.0.0.1:9/\"")).contains("trailing-slash"));
+        assert!(parse_err(&cfg_with(" upstream \"https://api%2etest\"")).contains("invalid host"));
+        assert!(parse_err(&cfg_with(" upstream \"https://-bad.test\"")).contains("invalid host"));
+        // …but a real IPv6 upstream and a normal https origin still parse.
+        assert!(Config::parse(&cfg_with(" upstream \"[2001:db8::1]:443\"")).is_ok());
+        assert!(Config::parse(&cfg_with(" upstream \"https://api.test/\"")).is_ok());
+        // IPv6 wildcard `[::]:P` conflicts with an IPv4 same-port listener (dual
+        // stack binds v4 too) — SocketAddr equality / same-family missed it.
+        let v6 = "listener \"[::]:29580\" {\n redirect-to-https true\n}\nlistener \"0.0.0.0:29580\" {\n redirect-to-https true\n}\nsite \"x\" {\n upstream \"127.0.0.1:9\"\n}\n";
+        assert!(
+            parse_err(v6).contains("conflicting listener"),
+            "{}",
+            parse_err(v6)
+        );
     }
 
     #[test]

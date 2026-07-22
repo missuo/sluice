@@ -200,11 +200,14 @@ operator could reasonably expect otherwise), plus small gaps not yet closed.
   re-open could). The docroot path itself must be real (no symlink components),
   same as the private dirs; a reload with a now-symlinked docroot is refused and
   keeps the old config.
-- **An in-progress cache write is never reaped.** The reaper's stale-temp sweep
-  skips any temp a live miss-writer still holds (tracked in a process-local set),
-  so a slow stream whose write outlives the 300 s stale threshold can't have its
-  temp deleted out from under it (which would fail the publish `rename`). Genuine
-  leaks from a dead process (absent from the set after restart) are still reaped.
+- **An in-progress cache write is never reaped — even across processes.** A
+  miss-writer holds an exclusive `flock` on its temp for the whole write; the
+  reaper deletes a stale temp only if a non-blocking `flock` shows NO holder. So
+  a slow stream that outlives the 300 s stale threshold is safe, INCLUDING when
+  the writer is the PEER process during a `-u` zero-downtime upgrade (both
+  processes share the cache dir; advisory locks are visible across processes). A
+  hard-killed writer's lock is released by the kernel, so a genuinely-leaked temp
+  is still reaped.
 - **Rate-limit table is hard-capped with a per-host overflow bucket.** Buckets
   are keyed by (host, client) with IPv6 collapsed to its /64; the per-client
   table is capped at 256k. When full, a NEW client is throttled against a single

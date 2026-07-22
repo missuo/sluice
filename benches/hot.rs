@@ -57,11 +57,13 @@ fn bench_hot(c: &mut Criterion) {
     });
 
     // Config parse (SIGHUP reload cost). A representative multi-site config.
+    // (No `file-server` here — its docroot must exist and be symlink-free at
+    // parse time, which isn't guaranteed in a bench harness.)
     let cfg = "\
 server {\n threads 4\n}\n\
 listener \"0.0.0.0:80\" {\n redirect-to-https true\n}\n\
 site \"a.example\" {\n upstream {\n server \"10.0.0.1:8080\" weight=3\n server \"10.0.0.2:8080\"\n balance \"ketama\"\n }\n cache {\n ttl-secs 60\n }\n}\n\
-site \"b.example\" {\n file-server {\n root \".\"\n }\n}\n";
+site \"b.example\" {\n upstream \"10.0.0.3:9000\"\n rate-limit rps=100 burst=200\n waf {\n block field=\"path\" match=r\"(?i)union\\s+select\"\n }\n}\n";
     c.bench_function("config_parse/2-sites", |b| {
         b.iter(|| Config::parse(black_box(cfg)).unwrap())
     });

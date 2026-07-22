@@ -40,12 +40,19 @@ mod unix {
         io::Error::last_os_error()
     }
 
+    /// Longest single path component (`NAME_MAX` on Linux/macOS). A longer
+    /// component `ENAMETOOLONG`s at the syscall; rejecting it up front makes
+    /// `--check` and startup agree instead of "checks ok, startup fails".
+    const NAME_MAX: usize = 255;
+
     /// Validate a single path component used with `*at` calls: no separator, no
-    /// NUL, and never `.`/`..` (which would escape the pinned dir).
+    /// NUL, never `.`/`..` (which would escape the pinned dir), and not longer
+    /// than `NAME_MAX`.
     fn component(name: &str) -> io::Result<CString> {
         if name.is_empty()
             || name == "."
             || name == ".."
+            || name.len() > NAME_MAX
             || name.contains('/')
             || name.contains('\0')
         {
@@ -454,6 +461,17 @@ mod unix {
         if comps.contains(&"..") {
             return Err(format!("{path}: must not contain `..`"));
         }
+        // Apply the SAME static per-component constraints provision's `component`
+        // enforces (NUL, NAME_MAX) to EVERY component — not just the existing
+        // prefix — so a too-long / NUL component in the not-yet-created tail
+        // fails `--check` too, instead of "checks ok, startup ENAMETOOLONG".
+        for comp in &comps {
+            if comp.len() > NAME_MAX || comp.contains('\0') {
+                return Err(format!(
+                    "{path}: component {comp:?} is invalid (too long or NUL)"
+                ));
+            }
+        }
         let euid = unsafe { libc::geteuid() };
         let mut cur = if path.starts_with('/') {
             PathBuf::from("/")
@@ -657,6 +675,24 @@ mod unix {
             );
             // And provision agrees (fails), so --check and startup are consistent.
             assert!(SecureDir::provision(via_link_parent.to_str().unwrap()).is_err());
+
+            // NAME_MAX consistency: a >255-char component in the NOT-yet-created
+            // tail must fail validate (it would ENAMETOOLONG at provision), so
+            // --check and startup agree instead of "check ok, startup fails".
+            let long = "x".repeat(300);
+            let toolong = base.join("missing").join(&long);
+            assert!(validate(toolong.to_str().unwrap()).is_err());
+            assert!(SecureDir::provision(toolong.to_str().unwrap()).is_err());
+            // provision must NOT have created the intermediate `missing` dir when
+            // the tail is invalid... it may create `missing` before failing on
+            // the long tail; that's acceptable (startup abort), but validate is
+            // read-only and creates nothing:
+            assert!(
+                !base.join("missing2").exists(),
+                "validate must not create dirs"
+            );
+            let _ = validate(base.join("missing2").join(&long).to_str().unwrap());
+            assert!(!base.join("missing2").exists());
             let _ = std::fs::remove_dir_all(&base);
         }
     }

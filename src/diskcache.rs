@@ -23,9 +23,8 @@
 //! only ever touches files matching the cache's exact naming.
 
 use std::any::Any;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
@@ -43,30 +42,18 @@ use crate::dirs::SecureDir;
 
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-/// Temp files currently held open by a live miss-writer. The reaper's stale-temp
-/// sweep skips these, so a long write (e.g. a slow SSE/stream whose read-timeout
-/// exceeds the 300 s stale threshold) can't have its temp deleted out from under
-/// it — which would fail the final publish `renameat`. Names are process-unique
-/// (`.tmp.<pid>.<seq>.<nanos>`), so the name alone identifies the writer. After a
-/// restart the set is empty, so genuinely-leaked temps from a prior run are
-/// still reaped.
-static ACTIVE_TMPS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
-
-fn tmp_active_insert(name: &str) {
-    if let Ok(mut s) = ACTIVE_TMPS.lock() {
-        s.insert(name.to_string());
-    }
-}
-fn tmp_active_remove(name: &str) {
-    if let Ok(mut s) = ACTIVE_TMPS.lock() {
-        s.remove(name);
-    }
-}
-fn tmp_is_active(name: &str) -> bool {
-    ACTIVE_TMPS
-        .lock()
-        .map(|s| s.contains(name))
-        .unwrap_or(false)
+/// A live miss-writer holds an exclusive `flock` on its temp file for the whole
+/// write. The reaper, before deleting a stale temp, tries a NON-BLOCKING
+/// exclusive `flock`: it succeeds only if NO writer (in THIS process or another)
+/// holds the temp — so during a zero-downtime upgrade (`-u`, two processes
+/// sharing the cache dir) one process can't delete a temp the other is still
+/// writing (which would fail the publish `rename`). Advisory locks are per open
+/// file description and visible across processes on the same inode; a
+/// hard-killed writer's lock is released by the kernel, so a genuinely-leaked
+/// temp is still reapable.
+#[cfg(unix)]
+fn flock_ex_nb(fd: std::os::unix::io::RawFd) -> bool {
+    unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 /// Sanity cap on the serialized meta (internal + header) length read back from
@@ -215,11 +202,14 @@ impl HandleMiss for DiskMiss {
             .await
             .map_err(err("disk cache stamp size"))?;
         f.sync_all().await.map_err(err("disk cache fsync"))?;
-        drop(f);
-        // ONE atomic publish via renameat within the pinned shard dir.
+        // ONE atomic publish via renameat — done while `f` (and its flock) is
+        // STILL held, so a concurrent reaper can't delete the temp in the window
+        // between releasing the lock and the rename. Drop the fd (releasing the
+        // lock) only after the temp name is gone.
         self.shard
             .rename(&self.tmp, &self.entry)
             .map_err(err("disk cache publish"))?;
+        drop(f);
         let _ = self.shard.sync();
         self.done = true;
         Ok(MissFinishType::Created(self.written))
@@ -228,8 +218,8 @@ impl HandleMiss for DiskMiss {
 
 impl Drop for DiskMiss {
     fn drop(&mut self) {
-        // Runs after finish() (which consumes self) too, so it always fires.
-        tmp_active_remove(&self.tmp);
+        // The flock is released when `self.file` (the held fd) drops. An
+        // abandoned write (client disconnected) still has the temp file present.
         if !self.done {
             let _ = self.shard.remove(&self.tmp);
         }
@@ -289,10 +279,15 @@ impl Storage for DiskCache {
         let shard = self.shard_create(&hash).map_err(err("disk cache mkdir"))?;
         let (internal, header) = meta.serialize()?;
         let tmp = tmp_name();
-        let mut file =
-            tokio::fs::File::from_std(shard.create_new(&tmp).map_err(err("disk cache create"))?);
-        // Protect this temp from the reaper's stale sweep while we hold it open.
-        tmp_active_insert(&tmp);
+        let std_file = shard.create_new(&tmp).map_err(err("disk cache create"))?;
+        // Hold an exclusive advisory lock for the whole write so no reaper (in
+        // any process) deletes this temp while we're still filling it.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let _ = flock_ex_nb(std_file.as_raw_fd());
+        }
+        let mut file = tokio::fs::File::from_std(std_file);
         // Body size stamped at finish; 0 for now.
         file.write_all(&encode_prefix(0, internal.len(), header.len()))
             .await
@@ -345,7 +340,13 @@ impl Storage for DiskCache {
         let (internal, header) = meta.serialize()?;
         let tmp = tmp_name();
         let res: std::result::Result<(), std::io::Error> = async {
-            let mut f = tokio::fs::File::from_std(shard.create_new(&tmp)?);
+            let std_file = shard.create_new(&tmp)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::io::AsRawFd;
+                let _ = flock_ex_nb(std_file.as_raw_fd());
+            }
+            let mut f = tokio::fs::File::from_std(std_file);
             f.write_all(&encode_prefix(0, internal.len(), header.len()))
                 .await?;
             f.write_all(&internal).await?;
@@ -486,6 +487,37 @@ fn remove_entry(root: &SecureDir, e: &Entry) -> bool {
     ok
 }
 
+/// Delete a stale TEMP only if no writer (any process) holds it: open it and try
+/// a non-blocking exclusive `flock`. On success (unlocked) delete; on
+/// `EWOULDBLOCK` (a live writer, possibly the peer process during a `-u`
+/// upgrade) leave it. Returns whether it was removed.
+#[cfg(unix)]
+fn remove_temp_if_unlocked(root: &SecureDir, e: &Entry) -> bool {
+    use std::os::unix::io::AsRawFd;
+    let Ok(d1) = root.sub_open(&e.0) else {
+        return false;
+    };
+    let Ok(d2) = d1.sub_open(&e.1) else {
+        return false;
+    };
+    let Ok(f) = d2.open_read(&e.2) else {
+        return false;
+    };
+    if !flock_ex_nb(f.as_raw_fd()) {
+        return false; // held by a live writer — do not delete
+    }
+    let ok = d2.remove(&e.2).is_ok();
+    drop(f); // release our lock
+    if ok {
+        let _ = d2.sync();
+    }
+    ok
+}
+#[cfg(not(unix))]
+fn remove_temp_if_unlocked(root: &SecureDir, e: &Entry) -> bool {
+    remove_entry(root, e)
+}
+
 fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
     let now = SystemTime::now();
     let mut entries: Vec<Entry> = Vec::new();
@@ -493,24 +525,27 @@ fn reap(root: &SecureDir, max_size: u64, max_files: u64, min_free: u64) {
     collect(root, &mut entries, &mut total_size);
 
     // 1) Delete stale temps (a hard kill left them) and legacy files on sight.
-    //    A temp still HELD by a live writer (in ACTIVE_TMPS) is never deleted,
-    //    however old — a slow stream can legitimately hold one past 300 s, and
-    //    deleting it would fail the writer's publish `renameat`.
+    //    A stale temp is deleted only if `flock` shows NO writer holds it —
+    //    including a writer in the PEER process during a `-u` zero-downtime
+    //    upgrade (a process-local flag couldn't see that), whose slow stream can
+    //    legitimately hold a temp past 300 s; deleting it would fail its publish.
     entries.retain(|e| {
         let stale_tmp = e.5 == Kind::Tmp
-            && !tmp_is_active(&e.2)
             && now
                 .duration_since(e.4)
                 .map(|d| d > Duration::from_secs(300))
                 .unwrap_or(false);
-        if stale_tmp || e.5 == Kind::Legacy {
-            if remove_entry(root, e) {
-                total_size = total_size.saturating_sub(e.3);
-            }
-            false
+        let removed = if stale_tmp {
+            remove_temp_if_unlocked(root, e)
+        } else if e.5 == Kind::Legacy {
+            remove_entry(root, e)
         } else {
-            true
+            return true; // keep
+        };
+        if removed {
+            total_size = total_size.saturating_sub(e.3);
         }
+        false // temp/legacy handled — drop from the eviction set either way
     });
 
     // 2) Evict oldest until under every bound. Only sort (O(n log n)) when we
@@ -675,31 +710,34 @@ mod tests {
     }
 
     #[test]
-    fn reaper_spares_active_temp_however_stale() {
+    fn reaper_spares_flock_held_temp_however_stale() {
+        use std::os::unix::io::AsRawFd;
         let dir0 = std::env::temp_dir().join(format!("sluice-active-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir0);
         std::fs::create_dir_all(dir0.join("ab").join("cd")).unwrap();
         let dir = std::fs::canonicalize(&dir0).unwrap();
-        // An OLD temp (year-2020 mtime) that a live writer still holds.
-        let held = ".tmp.999999.0.0";
-        let held_path = dir.join("ab").join("cd").join(held);
-        std::fs::write(&held_path, b"partial").unwrap();
+        // An OLD temp a live writer still holds (exclusive flock, as a real
+        // writer would — including a peer process during a -u upgrade).
+        let held_path = dir.join("ab").join("cd").join(".tmp.999999.0.0");
+        let held = std::fs::File::create(&held_path).unwrap();
+        assert!(flock_ex_nb(held.as_raw_fd()), "hold the write lock");
         set_old_mtime(&held_path);
-        // A leaked temp from a dead process (not in the active set).
-        let leaked = ".tmp.111111.0.0";
-        let leaked_path = dir.join("ab").join("cd").join(leaked);
+        // A leaked temp from a dead process — NOT locked by anyone.
+        let leaked_path = dir.join("ab").join("cd").join(".tmp.111111.0.0");
         std::fs::write(&leaked_path, b"leaked").unwrap();
         set_old_mtime(&leaked_path);
 
-        tmp_active_insert(held); // writer registers its temp
         let root = SecureDir::provision(dir.to_str().unwrap()).unwrap();
         reap(&root, u64::MAX, u64::MAX, 0);
         assert!(
             held_path.exists(),
-            "an active writer's temp must NOT be reaped"
+            "a flock-held temp must NOT be reaped, however stale"
         );
-        assert!(!leaked_path.exists(), "a stale leaked temp MUST be reaped");
-        tmp_active_remove(held);
+        assert!(
+            !leaked_path.exists(),
+            "an unlocked stale temp MUST be reaped"
+        );
+        drop(held); // release lock
         let _ = std::fs::remove_dir_all(&dir);
     }
 

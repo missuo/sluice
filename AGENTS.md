@@ -125,8 +125,10 @@ These were fixed after review; a change that reverts any of them is a bug:
   until stable, THEN collapses `//`/`.`/`..`, producing ONE canonical view that
   WAF, `deny`, redirects, and location routing all match — so multi-encoding
   (`%252e%252e`, `/adm%2569n`) can't bypass a check a deeper origin decode would
-  reach. It fails closed (400) on non-stabilizing / over-long paths. Always match
-  on this canonical path, never a single-decode or the raw path alone.
+  reach. It fails closed (400) on non-stabilizing / over-long paths AND on any
+  MALFORMED `%` (a `%` not followed by two hex digits, incl. the `%25`→literal-%
+  case) — a lenient origin must not re-read `/admin%` as `/admin`. Always match on
+  this canonical path, never a single-decode or the raw path alone.
 - **Cache never crosses auth boundaries**: a request with `Authorization` or a
   `Cookie` is only cacheable if the origin says `Cache-Control: public`; responses
   with `Set-Cookie` or a non-`Accept-Encoding` `Vary` are never cached.
