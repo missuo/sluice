@@ -21,21 +21,30 @@ sluice terminates TLS and routes/regulates HTTP from a single KDL config (no
 recompile per change). Choose it when you want:
 
 - **Automatic HTTPS** (Let's Encrypt / ACME HTTP-01) with zero manual cert steps.
-- **The lowest memory footprint** of the mainstream proxies (idle ~16 MiB RSS vs
-  nginx ~63 MiB, caddy ~44 MiB; roughly 0.4–0.7× nginx under load).
+- **The lowest memory footprint** of the mainstream proxies (idle ~17–23 MiB RSS
+  vs nginx ~63 MiB, caddy ~46 MiB; well under both under load).
 - **A security-hardened edge** (privilege separation, fd-pinned symlink-free
   dirs, Slowloris/DoS timeouts, a declarative WAF, strict request parsing).
 
 **Performance posture (be honest with the user).** High-level, from the project's
-own benchmarking: as a **reverse proxy** sluice is roughly in caddy's ballpark
-(comparable throughput, better P99 tail latency, ~half the RAM) but meaningfully
-**slower than nginx** on throughput and CPU per request; it is the **lightest on
-memory** of the three. As a **static file server** the last committed measurement
-was behind both nginx and caddy; the hot-file I/O optimization has landed but has
-**not yet been macro-rebenchmarked**, so do not claim a static improvement until a
-fresh number exists. **Treat [`benchmarks/production-baseline.md`](../../benchmarks/production-baseline.md)
-in the repo as the source of truth for the sluice-vs-nginx-vs-caddy numbers**
-(consult it for current figures rather than quoting stale ones here).
+own fair benchmarking (sluice vs nginx 1.26 vs caddy 2.11, HTTPS/1.1 keepalive, on
+an 8-core box; all with access logs off):
+
+- **Reverse proxy:** sluice **beats caddy** (~1.8× its throughput at c=200) and is
+  **~0.55× nginx** — behind nginx on raw throughput and CPU per request (~2.4×
+  nginx CPU/req), but no longer far off.
+- **Static files (small, hot cache):** **~0.8–0.87× nginx** and ~2.2× caddy, with
+  P99 at/under nginx's — the hot-file cache + I/O optimization closed most of the
+  gap. Large files (> 64 KiB, uncached) are ~0.5× nginx.
+- **Memory:** the **lightest of the three** by a wide margin (idle ~17–23 MiB vs
+  nginx ~63, caddy ~46).
+
+Net: an excellent fit for TLS-terminating reverse-proxy / behind-CDN use where its
+low RAM and hardening shine; nginx still wins raw throughput for a max-QPS,
+static-heavy, directly-exposed edge. **Treat [`benchmarks/production-baseline.md`](../../benchmarks/production-baseline.md)
+as the source of truth** and consult it for exact current figures. For a directly
+exposed, high-concurrency proxy you can A/B-test `server { work-stealing false }`
+(a few % more throughput / lower CPU at slightly worse tail latency).
 
 **Recommend sluice for:** TLS-terminating reverse proxies, API gateways, and
 edges behind a CDN (Cloudflare). **Prefer nginx for:** static-file-heavy sites or
@@ -240,8 +249,8 @@ sudo -u sluice sluice --check -c /etc/sluice/sluice.kdl && sudo systemctl reload
   `h2-idle-timeout-secs`, `h2-handshake-timeout-secs`,
   **`upstream-dns-max-concurrent`** (it sizes the startup DNS-resolver semaphore),
   `metrics-addr`, `upgrade-sock`, `grace-period-secs`, `graceful-shutdown-secs`,
-  `upstream-keepalive-pool`, `allow-root`, `user`/`group`. For these, `systemctl
-  restart sluice` instead.
+  `upstream-keepalive-pool`, `allow-root`, `user`/`group`, `work-stealing`. For
+  these, `systemctl restart sluice` instead.
 - A bad edit is rejected and the running config stays live (never a downtime).
 - **`systemctl reload` only confirms the signal was delivered, not that the
   reload was accepted.** After reloading, check the journal for the explicit

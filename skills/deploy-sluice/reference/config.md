@@ -50,7 +50,7 @@ All children appear at most once. Defaults shown.
 |-----------|------|---------|---------|
 | `threads` | int ≥0 | `0` | Worker threads; `0` = all cores. |
 | `metrics-addr` | string | (off) | Bind a Prometheus `/metrics` endpoint, e.g. `"127.0.0.1:9090"`. |
-| `access-log-format` | `"text"`\|`"json"` | `"text"` | Access-log line format. `json` = one structured object per request. |
+| `access-log-format` | `"off"`\|`"text"`\|`"json"` | `"text"` | Access-log line format. `json` = one structured object per request. `off` skips per-request log assembly entirely (lowest overhead; use it when a separate access log isn't needed). |
 | `grace-period-secs` | int ≥0 | `30` | Graceful-shutdown grace period. |
 | `graceful-shutdown-secs` | int ≥0 | `300` | Max drain time on shutdown/upgrade. |
 | `upstream-keepalive-pool` | int ≥0 | `256` | Upstream keepalive connection pool size. |
@@ -69,13 +69,23 @@ All children appear at most once. Defaults shown.
 | `upstream-dns-ttl-secs` | int ≥1 | `30` | Fresh TTL for a cached upstream DNS answer. |
 | `upstream-dns-stale-secs` | int ≥0 | `300` | Serve a stale DNS answer this long while the resolver is failing; `0` = never. |
 | `upstream-dns-max-concurrent` | int ≥1 | `8` | Cap on concurrent blocking resolutions. |
+| `work-stealing` | bool | `true` | **Experimental.** Tokio work-stealing across worker threads. `false` pins each connection to its starting worker; on a directly-exposed, high-concurrency proxy this can trade a few % more throughput and lower CPU/request for slightly worse tail latency. Leave `true` unless you A/B-measure a win. |
 
-> Per-request timeouts (`request-timeout-secs`, `downstream-*-timeout-secs`,
-> `min-send-rate-bytes`, `upstream-dns-*`) take effect on **SIGHUP reload**.
-> Startup-bound settings (`threads`, `max-conn-per-ip`, `tls-handshake-timeout-secs`,
-> `h2-*`, `metrics-addr`, `upgrade-sock`, grace/shutdown, `access-log-format`,
-> the disk cache, and the `acme` block) require a **restart**; a reload that
-> changes them is **rejected** and the old config is kept.
+> **Reloadable on SIGHUP** (read from the per-request config snapshot):
+> `request-timeout-secs`, `downstream-read-timeout-secs`,
+> `downstream-write-timeout-secs`, `min-send-rate-bytes`,
+> `upstream-dns-timeout-secs`, `upstream-dns-ttl-secs`,
+> `upstream-dns-stale-secs`, `access-log-format`, plus all site/location
+> routing, WAF, cache policy, and `cert-dir` certificate rotation.
+>
+> **Startup-bound — require a restart:** `threads`, `metrics-addr`,
+> `grace-period-secs`, `graceful-shutdown-secs`, `upstream-keepalive-pool`,
+> `upgrade-sock`, `allow-root`, `user`/`group`, `max-conn-per-ip`,
+> `tls-handshake-timeout-secs`, `h2-idle-timeout-secs`,
+> `h2-handshake-timeout-secs`, `upstream-dns-max-concurrent`,
+> `work-stealing`, the disk cache, and the `acme` block. A SIGHUP that
+> changes any of them is **rejected** and the old config is kept (check the
+> journal for the reject line).
 
 ### DoS-hardening knob presets
 
