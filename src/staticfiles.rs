@@ -139,25 +139,30 @@ impl StaticFileCache {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Resolve `comps` (an already-validated relative path — no `.`/`..`/empty,
-    /// no `/`) under the pinned `root`, serving from cache when fresh and filling
-    /// securely (with singleflight) otherwise. `key` is the canonical cache key
-    /// (`comps.join("/")`), passed in so the caller controls it.
+    /// Resolve the canonical relative `key` (already normalized — no `.`/`..`/empty
+    /// segments, `/`-joined) under the pinned `root`, serving from cache when fresh
+    /// and filling securely (with singleflight) otherwise.
+    ///
+    /// The hot cache HIT needs only the BORROWED key — no component `Vec` and no
+    /// key clone are built. The validated components (for the secure open) and the
+    /// owned key are materialized ONLY on a miss: because `key` has no empty
+    /// segments, `key.split('/')` reproduces exactly the components the caller
+    /// validated, which the fd-pinned `openat`/`O_NOFOLLOW` walk re-validates.
     pub async fn get(
         self: &Arc<Self>,
         root: &Arc<SecureDir>,
-        comps: Vec<String>,
-        key: String,
+        key: &str,
     ) -> Result<Served, StaticError> {
-        // Fast path: a fresh cached snapshot, zero syscalls.
+        // Fast path: a fresh cached snapshot, zero syscalls, zero allocation.
         if self.ttl > Duration::ZERO {
-            if let Some(bytes) = self.lookup_fresh(&key) {
+            if let Some(bytes) = self.lookup_fresh(key) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Ok(Served::Inline(bytes));
             }
         }
         self.misses.fetch_add(1, Ordering::Relaxed);
-        Ok(match self.fill(root, comps, key).await? {
+        let comps: Vec<String> = key.split('/').map(String::from).collect();
+        Ok(match self.fill(root, comps, key.to_string()).await? {
             Fill::Inline(e) => Served::Inline(e.bytes.clone()),
             Fill::Large => Served::Large,
         })
@@ -167,7 +172,10 @@ impl StaticFileCache {
         let inner = self.inner.read().unwrap();
         let e = inner.map.get(key)?;
         if e.inserted.elapsed() < self.ttl {
-            e.last_used.store(self.tick(), Ordering::Relaxed);
+            // No per-hit LRU write: `last_used` is stamped at insert and refreshed
+            // by the per-TTL re-fill, so eviction stays approximately-LRU WITHOUT
+            // the hot path bouncing the shared clock atomic + the entry's cache
+            // line across cores (8 cores serving one hot file otherwise contend).
             Some(e.bytes.clone())
         } else {
             None
@@ -364,9 +372,8 @@ mod tests {
         root: &Arc<SecureDir>,
         rel: &str,
     ) -> Result<Served, StaticError> {
-        let comps: Vec<String> = rel.split('/').map(String::from).collect();
-        let key = comps.join("/");
-        rt().block_on(cache.get(root, comps, key))
+        // `rel` is already a normalized key here (no empty/dot segments).
+        rt().block_on(cache.get(root, rel))
     }
 
     fn inline_bytes(s: Served) -> Bytes {
@@ -447,20 +454,18 @@ mod tests {
         // same NotFound to every waiter — not one walk per request.
         let (base, root) = tmp_root("errflight");
         let cache = cache_new();
-        let comps: Vec<String> = vec!["gone.txt".into()];
-        let key = "gone.txt".to_string();
         rt().block_on(async {
             // `join!` polls all eight concurrently on ONE task, so they all attach
             // to the same in-flight cell before the first fill completes.
             let (a, b, c, d, e, f, g, h) = tokio::join!(
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
-                cache.get(&root, comps.clone(), key.clone()),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
+                cache.get(&root, "gone.txt"),
             );
             for r in [a, b, c, d, e, f, g, h] {
                 assert_eq!(r.unwrap_err(), StaticError::NotFound);

@@ -98,12 +98,16 @@ pub struct Config {
 }
 
 /// Access-log line format. `Text` (default) is the compact human-readable line;
-/// `Json` emits one `serde_json` object per request for structured ingestion.
+/// `Json` emits one `serde_json` object per request for structured ingestion;
+/// `Off` disables the per-request access log entirely (no line assembled, no
+/// allocation) independent of the global log level — for max throughput or when
+/// an upstream L7 already logs. Error/warn logs are unaffected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AccessLogFormat {
     #[default]
     Text,
     Json,
+    Off,
 }
 
 #[derive(Debug)]
@@ -197,6 +201,13 @@ pub struct ServerCfg {
     /// blocking work; combined with per-name singleflight coalescing. Minimum 1.
     /// Default 8.
     pub upstream_dns_max_concurrent: u32,
+    /// **Experimental.** Tokio work-stealing across worker threads. Default `true`
+    /// (unchanged behavior). Profiling showed cross-thread task migration
+    /// (~3.6 futex/req + heavy cpu-migrations) is a large part of the proxy's cost
+    /// vs a shared-nothing per-core model; setting this `false` pins tasks to their
+    /// starting worker (Pingora `ServerConf.work_stealing = false`) so the effect
+    /// can be A/B benchmarked. Startup-only (sizes the runtime).
+    pub work_stealing: bool,
 }
 
 impl Default for ServerCfg {
@@ -224,6 +235,7 @@ impl Default for ServerCfg {
             upstream_dns_ttl_secs: 30,
             upstream_dns_stale_secs: 300,
             upstream_dns_max_concurrent: 8,
+            work_stealing: true,
         }
     }
 }
@@ -291,6 +303,10 @@ pub struct AcmeCfg {
 pub struct Upstream {
     pub host: String,
     pub port: u16,
+    /// Preformatted `"host:port"` (built once at load) used as the passive/active
+    /// health map key, least-conn tally key, and access-log upstream field — so the
+    /// hot path never re-formats it. NOT used for dialing (that resolves host+port).
+    pub addr: String,
     pub tls: bool,
     pub sni: String,
     /// Host header to send upstream. None = preserve the client's Host.
@@ -466,6 +482,10 @@ pub struct Site {
     /// responses. Identical config → identical epoch → the persistent disk
     /// cache still survives restarts.
     pub cache_epoch: u64,
+    /// Pre-resolved Prometheus child handles for this site's host, bound lazily on
+    /// the first request (contention-free `OnceLock`) so the hot logging path never
+    /// re-hashes label strings. Rebuilt fresh on reload (a new `Site`).
+    pub metrics: std::sync::OnceLock<crate::metrics::HostMetrics>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -757,6 +777,11 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
     } else {
         None
     };
+    // Preformat the "host:port" key ONCE at load (matches the previous
+    // per-request `format!("{host}:{port}")` exactly, IPv6 quirk included — it's a
+    // DashMap key / log string, never used for dialing, which resolves host+port
+    // separately). Cuts two per-request allocations on the hot proxy path.
+    let addr = format!("{host}:{port}");
     Ok(Upstream {
         sni: host.clone(),
         host_header,
@@ -764,6 +789,7 @@ fn parse_upstream(s: &str) -> Result<Upstream, String> {
         verify: tls,
         host,
         port,
+        addr,
         weight: 1,
     })
 }
@@ -903,6 +929,7 @@ static SERVER_SPEC: Spec = Spec {
         ("upstream-dns-ttl-secs", Rep::Once, &SECS1),
         ("upstream-dns-stale-secs", Rep::Once, &SECS0),
         ("upstream-dns-max-concurrent", Rep::Once, &CONC1),
+        ("work-stealing", Rep::Once, &BOOL1),
     ]),
     extra: None,
 };
@@ -1367,8 +1394,9 @@ impl Config {
                         match v {
                             "text" => server.access_log_format = AccessLogFormat::Text,
                             "json" => server.access_log_format = AccessLogFormat::Json,
+                            "off" => server.access_log_format = AccessLogFormat::Off,
                             other => errs.push(format!(
-                                "server access-log-format: unknown value {other:?} (text|json)"
+                                "server access-log-format: unknown value {other:?} (text|json|off)"
                             )),
                         }
                     }
@@ -1428,6 +1456,9 @@ impl Config {
                     }
                     if let Some(v) = child_int(node, "upstream-dns-max-concurrent") {
                         server.upstream_dns_max_concurrent = v.max(1) as u32;
+                    }
+                    if let Some(v) = child_bool(node, "work-stealing") {
+                        server.work_stealing = v;
                     }
                 }
                 "client-ip" => {
@@ -2345,6 +2376,7 @@ fn parse_site(node: &KdlNode) -> Result<Site, String> {
         redirects,
         acme,
         cache_epoch,
+        metrics: std::sync::OnceLock::new(),
     })
 }
 
@@ -2614,6 +2646,7 @@ mod tests {
         let mk = |host: &str, w: u32| Upstream {
             host: host.into(),
             port: 80,
+            addr: format!("{host}:80"),
             tls: false,
             sni: host.into(),
             host_header: None,

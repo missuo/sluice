@@ -205,21 +205,24 @@ fn header_val<'a>(session: &'a Session, name: &str) -> Option<&'a str> {
 /// case — is left untouched). Values come from already-parsed header values joined
 /// with a valid separator, so the reconstructed value is always a valid header.
 fn join_split_cookies(req: &mut RequestHeader) -> Result<()> {
+    // Only 2+ `cookie` fields need joining. The common 0/1-cookie case does NO
+    // allocation — count up to 2 without building any buffer.
+    if req.headers.get_all("cookie").iter().take(2).count() < 2 {
+        return Ok(());
+    }
     let mut joined: Vec<u8> = Vec::new();
-    let mut count = 0usize;
+    let mut first = true;
     for v in req.headers.get_all("cookie") {
-        if count > 0 {
+        if !first {
             joined.extend_from_slice(b"; ");
         }
         joined.extend_from_slice(v.as_bytes());
-        count += 1;
+        first = false;
     }
-    if count > 1 {
-        req.remove_header("cookie"); // removes ALL `cookie` lines at once
-        let value = http::HeaderValue::from_bytes(&joined)
-            .map_err(|_| Error::new_str("invalid joined Cookie value"))?;
-        req.insert_header("Cookie", value)?;
-    }
+    req.remove_header("cookie"); // removes ALL `cookie` lines at once
+    let value = http::HeaderValue::from_bytes(&joined)
+        .map_err(|_| Error::new_str("invalid joined Cookie value"))?;
+    req.insert_header("Cookie", value)?;
     Ok(())
 }
 
@@ -683,9 +686,13 @@ async fn serve_file(
     let is_head = method == "HEAD";
     let rel = req_path.trim_start_matches('/');
 
-    // Build the path segments to walk under the root. Reject `.`/`..`/empty so
-    // traversal can't escape even before the race-free open below.
-    let mut comps: Vec<String> = Vec::new();
+    // Build the canonical relative cache key DIRECTLY (skip empty/`.` segments,
+    // reject `..` → 403, append the index for a directory request) — NO per-hit
+    // component `Vec`. Because the key has no empty segments, `key.split('/')`
+    // reproduces exactly these components on a miss, and the fd-pinned
+    // `openat`/`O_NOFOLLOW` walk re-validates each one, so the security invariant
+    // (no traversal, no symlink) is unchanged.
+    let mut key = String::with_capacity(rel.len() + index.len() + 1);
     for seg in rel.split('/') {
         if seg.is_empty() || seg == "." {
             continue;
@@ -693,19 +700,22 @@ async fn serve_file(
         if seg == ".." {
             return send_status(session, 403, hsts).await;
         }
-        comps.push(seg.to_string());
+        if !key.is_empty() {
+            key.push('/');
+        }
+        key.push_str(seg);
     }
-    if req_path.ends_with('/') || comps.is_empty() {
-        comps.push(index.to_string());
+    if req_path.ends_with('/') || key.is_empty() {
+        if !key.is_empty() {
+            key.push('/');
+        }
+        key.push_str(index);
     }
-    let ctype = content_type(std::path::Path::new(
-        comps.last().map(String::as_str).unwrap_or(""),
-    ));
-    let key = comps.join("/");
+    let ctype = content_type(std::path::Path::new(key.rsplit('/').next().unwrap_or("")));
 
-    match cache.get(&root_fd, comps.clone(), key).await {
+    match cache.get(&root_fd, &key).await {
         Ok(Served::Inline(bytes)) => serve_inline(session, bytes, ctype, is_head, hsts).await,
-        Ok(Served::Large) => stream_large(session, root_fd, comps, ctype, is_head, hsts).await,
+        Ok(Served::Large) => stream_large(session, root_fd, &key, ctype, is_head, hsts).await,
         Err(StaticError::NotFound) => send_status(session, 404, hsts).await,
         // A read fault after a successful open (before any header was sent) — 404
         // is the safe pre-header response (the file isn't servable right now).
@@ -752,13 +762,16 @@ async fn serve_inline(
 async fn stream_large(
     session: &mut Session,
     root_fd: std::sync::Arc<crate::dirs::SecureDir>,
-    comps: Vec<String>,
+    key: &str,
     ctype: &'static str,
     is_head: bool,
     hsts: Option<&str>,
 ) -> Result<()> {
     use tokio::io::AsyncReadExt;
 
+    // Rebuild the validated components from the normalized key (large files are the
+    // uncommon path, so this allocation is off the hot small-file route).
+    let comps: Vec<String> = key.split('/').map(String::from).collect();
     // ONE secure open — the fstat length AND the streamed bytes come from this fd.
     let open = tokio::task::spawn_blocking(move || root_fd.open_file_under_with_meta(&comps)).await;
     let (file, meta) = match open {
@@ -1891,17 +1904,26 @@ impl SluiceProxy {
     /// addr, so keyed by addr) or actively (this pool's configured health check
     /// marked it down; keyed by the pool's probe identity so two vhosts sharing a
     /// backend don't share a DOWN verdict).
-    fn is_down(&self, host: &str, loc_idx: usize, addr: &str) -> bool {
-        if self
-            .health
-            .get(addr)
-            .is_some_and(|until| Instant::now() < *until)
+    fn is_down(&self, host: &str, loc_idx: usize, addr: &str, has_active_health: bool) -> bool {
+        // Passive: recent connect-failure cooldown (keyed by addr). Skip the hash +
+        // lookup entirely when nothing has failed (the map is empty on the hot
+        // path); `DashMap::is_empty` doesn't hash the key.
+        if !self.health.is_empty()
+            && self
+                .health
+                .get(addr)
+                .is_some_and(|until| Instant::now() < *until)
         {
             return true;
         }
-        self.health_active
-            .get(&active_health_key(host, loc_idx, addr))
-            .is_some_and(|h| !h.healthy)
+        // Active: only when THIS pool configured a health check. Otherwise the map
+        // holds no entry for it, so skip both the `active_health_key` String
+        // allocation and the DashMap lookup.
+        has_active_health
+            && self
+                .health_active
+                .get(&active_health_key(host, loc_idx, addr))
+                .is_some_and(|h| !h.healthy)
     }
 
     /// Mark a backend down for the cooldown after a connect failure.
@@ -1922,23 +1944,30 @@ impl SluiceProxy {
             Balance::Random => weighted_random(&group.servers),
             Balance::IpHash => (str_hash(client_ip) % n as u64) as usize,
             Balance::Ketama => ketama_pick(&group.ring, client_ip),
-            Balance::LeastConn => self.least_conn(host, loc_idx, &group.servers),
+            Balance::LeastConn => {
+                self.least_conn(host, loc_idx, &group.servers, group.health_check.is_some())
+            }
         }
     }
 
     /// Weighted least-connections: the up backend with the smallest
     /// active-requests / weight ratio. Ties break toward the earlier server.
-    fn least_conn(&self, host: &str, loc_idx: usize, servers: &[Upstream]) -> usize {
+    fn least_conn(
+        &self,
+        host: &str,
+        loc_idx: usize,
+        servers: &[Upstream],
+        has_health: bool,
+    ) -> usize {
         let mut best = 0usize;
         let mut best_score = f64::MAX;
         let mut any_up = false;
         for (i, s) in servers.iter().enumerate() {
-            let addr = format!("{}:{}", s.host, s.port);
-            if self.is_down(host, loc_idx, &addr) {
+            if self.is_down(host, loc_idx, &s.addr, has_health) {
                 continue;
             }
             any_up = true;
-            let active = self.conns.get(&addr).map(|v| *v).unwrap_or(0).max(0) as f64;
+            let active = self.conns.get(&s.addr).map(|v| *v).unwrap_or(0).max(0) as f64;
             let score = active / s.weight.max(1) as f64;
             if score < best_score {
                 best_score = score;
@@ -2350,7 +2379,12 @@ impl ProxyHttp for SluiceProxy {
     }
 
     async fn request_filter(&self, session: &mut Session, ctx: &mut Ctx) -> Result<bool> {
-        INFLIGHT.inc();
+        // Only track the in-flight gauge when a scraper is bound (paired with the
+        // `INFLIGHT.dec()` gate in `logging`); `metrics-addr` is startup-fixed so
+        // the snapshot's value is stable for this request.
+        if ctx.cfg.server.metrics_addr.is_some() {
+            INFLIGHT.inc();
+        }
         let cfg = ctx.cfg.clone();
         ctx.client_ip = real_client_ip(session, &cfg.client_ip_header, &cfg.trusted_proxies);
 
@@ -2375,12 +2409,11 @@ impl ProxyHttp for SluiceProxy {
         // this, re-insert the one canonical value as the SOLE field so exactly one
         // normalized `Content-Length` is forwarded.
         match validate_content_length(session.req_header()) {
-            ContentLength::Absent => {}
-            ContentLength::One(n) => {
-                session
-                    .req_header_mut()
-                    .insert_header("Content-Length", n.to_string())?;
-            }
+            // `One` means EXACTLY one already-canonical field (2+ fields or a
+            // non-canonical value would be `Invalid`), so it is already the sole
+            // normalized Content-Length — no reformat/reinsert needed (saves a
+            // per-body `to_string()` + header rewrite).
+            ContentLength::Absent | ContentLength::One(_) => {}
             ContentLength::Invalid => {
                 send_status(session, 400, None).await?;
                 return Ok(true);
@@ -2683,6 +2716,10 @@ impl ProxyHttp for SluiceProxy {
         // `MAX_CONNECT_ATTEMPTS` budget, and try the next member. The resolved address
         // set is retained and `ctx.addr_try` selects which to dial so
         // `fail_to_connect` can exhaust one backend's addresses before advancing.
+        // Only the passive/active health lookups and the least-conn tally that are
+        // actually relevant to THIS pool run per request (precomputed once here).
+        let has_health = group.health_check.is_some();
+        let is_least_conn = matches!(group.balance, Balance::LeastConn);
         let (up, resolved) = loop {
             // Start at (lb_base picked once in request_filter) + tries (failover
             // offset), then skip past any backend currently marked down. If every
@@ -2691,19 +2728,20 @@ impl ProxyHttp for SluiceProxy {
             let mut chosen = start;
             for k in 0..n {
                 let cand = (start + k) % n;
-                let s = &group.servers[cand];
-                if !self.is_down(host, li, &format!("{}:{}", s.host, s.port)) {
+                // Use the backend's preformatted "host:port" — no per-request alloc.
+                if !self.is_down(host, li, &group.servers[cand].addr, has_health) {
                     chosen = cand;
                     break;
                 }
             }
             let up = &group.servers[chosen];
-            let addr = format!("{}:{}", up.host, up.port);
-            // Account this request against the chosen backend for least-conn (moves
-            // the tally if a failover changed the target).
-            self.count_conn(ctx, &addr);
+            // Account this request against the chosen backend ONLY for least-conn
+            // (the tally is unused by every other policy — skip the DashMap writes).
+            if is_least_conn {
+                self.count_conn(ctx, &up.addr);
+            }
             ctx.up_host_header = up.host_header.clone();
-            ctx.up_addr = addr;
+            ctx.up_addr = up.addr.clone();
 
             // Resolve off the request path (TTL cache, singleflight, bounded
             // concurrency, serve-stale). An IP literal skips DNS entirely; a resolver
@@ -2899,9 +2937,15 @@ impl ProxyHttp for SluiceProxy {
         ] {
             upstream_request.remove_header(h);
         }
-        upstream_request.insert_header("X-Real-IP", &ctx.client_ip)?;
-        upstream_request.insert_header("X-Forwarded-For", &ctx.client_ip)?;
-        upstream_request.insert_header("X-Forwarded-Proto", "https")?;
+        // Build the client-IP header value ONCE (one validation of the IP string)
+        // and clone the handle for both fields — `HeaderValue::clone` is a cheap
+        // refcount bump, vs. re-parsing/formatting the string twice.
+        let client_ip_hv = http::HeaderValue::from_str(&ctx.client_ip)
+            .map_err(|_| Error::new_str("invalid client IP header value"))?;
+        upstream_request.insert_header("X-Real-IP", client_ip_hv.clone())?;
+        upstream_request.insert_header("X-Forwarded-For", client_ip_hv)?;
+        upstream_request
+            .insert_header("X-Forwarded-Proto", http::HeaderValue::from_static("https"))?;
 
         // Reinstate a single normalized WebSocket upgrade pair for ws locations.
         if let Some(up) = ws_upgrade {
@@ -3193,48 +3237,72 @@ impl ProxyHttp for SluiceProxy {
     }
 
     async fn logging(&self, session: &mut Session, e: Option<&Error>, ctx: &mut Ctx) {
-        INFLIGHT.dec();
         self.release_conn(ctx); // release the least-conn tally for this request
-        let status = session
-            .response_written()
-            .map(|r| r.status.as_u16())
-            .unwrap_or(0);
-        // Only a matched site becomes a metric label; an unmatched (attacker-
-        // controlled) Host is collapsed to "-" so it can't inflate cardinality.
+
+        // Metrics only matter when a scraper is bound (`metrics-addr`). Otherwise
+        // every counter bump / gauge / label hash is wasted work — skip the whole
+        // metrics block (matched by the `INFLIGHT.inc()` gate in `request_filter`).
+        let metrics_on = ctx.cfg.server.metrics_addr.is_some();
+        let is_err = e.is_some();
+        // `host` for the exact-code responses metric (and it labels the log line):
+        // an unmatched (attacker-controlled) Host collapses to "-" so it can't
+        // inflate cardinality.
         let host = if ctx.site.is_some() {
             ctx.host.as_str()
         } else {
             "-"
         };
+        let status = session
+            .response_written()
+            .map(|r| r.status.as_u16())
+            .unwrap_or(0);
         let elapsed = ctx.start.elapsed();
 
-        REQUESTS
-            .with_label_values(&[host, &format!("{}xx", status / 100)])
-            .inc();
-        RESPONSES
-            .with_label_values(&[host, &status.to_string()])
-            .inc();
-        LATENCY
-            .with_label_values(&[host])
-            .observe(elapsed.as_secs_f64());
-        RESP_BYTES
-            .with_label_values(&[host])
-            .inc_by(session.body_bytes_sent() as u64);
-        REQ_BYTES
-            .with_label_values(&[host])
-            .inc_by(session.body_bytes_read() as u64);
-        if e.is_some() || matches!(status, 502..=504) {
-            UPSTREAM_ERRORS.with_label_values(&[host]).inc();
-        }
-        let country_metric = ctx
-            .cfg
-            .geoip
-            .as_ref()
-            .is_some_and(|g| g.metric_labels.iter().any(|l| l == "country"));
-        if country_metric && !ctx.country.is_empty() {
-            REQUESTS_BY_COUNTRY
-                .with_label_values(&[ctx.country.as_str()])
+        if metrics_on {
+            INFLIGHT.dec();
+            // Pre-bound per-host handles (bound once, lazily): no per-request label
+            // hashing/allocation for the host-keyed + status-class series.
+            let hm = match ctx.site {
+                Some(si) => ctx.cfg.sites[si]
+                    .metrics
+                    .get_or_init(|| crate::metrics::HostMetrics::new(&ctx.cfg.sites[si].host)),
+                None => crate::metrics::unmatched(),
+            };
+            hm.record(
+                status,
+                elapsed.as_secs_f64(),
+                session.body_bytes_read() as u64,
+                session.body_bytes_sent() as u64,
+            );
+            // Exact-code series: the code label varies (100..599), so bind it per
+            // call — but format into a stack buffer, no heap allocation.
+            let mut code_buf = [0u8; 3];
+            RESPONSES
+                .with_label_values(&[host, status_str(status, &mut code_buf)])
                 .inc();
+            if is_err || matches!(status, 502..=504) {
+                hm.record_upstream_error();
+            }
+            let country_metric = ctx
+                .cfg
+                .geoip
+                .as_ref()
+                .is_some_and(|g| g.metric_labels.iter().any(|l| l == "country"));
+            if country_metric && !ctx.country.is_empty() {
+                REQUESTS_BY_COUNTRY
+                    .with_label_values(&[ctx.country.as_str()])
+                    .inc();
+            }
+        }
+
+        // Access log: skip ALL field assembly/allocation when it will not be
+        // emitted — either format `off`, or the `info` level is disabled (e.g.
+        // `RUST_LOG=warn`). This is the log-off fast path (and fixes the previous
+        // behavior where the whole line was built even when logs were suppressed).
+        if matches!(ctx.cfg.server.access_log_format, AccessLogFormat::Off)
+            || !log::log_enabled!(log::Level::Info)
+        {
+            return;
         }
 
         let client = if ctx.client_ip.is_empty() {
@@ -3261,6 +3329,8 @@ impl ProxyHttp for SluiceProxy {
         let latency_ms = elapsed.as_secs_f64() * 1000.0;
 
         match ctx.cfg.server.access_log_format {
+            // Unreachable: `Off` returned early above. Present for exhaustiveness.
+            AccessLogFormat::Off => {}
             AccessLogFormat::Text => {
                 // geo fields for the text log, per configured log-fields.
                 let geo = ctx
@@ -3392,6 +3462,24 @@ fn bounded_err(s: &str) -> String {
         end -= 1;
     }
     format!("{}…", &s[..end])
+}
+
+/// Format a 0..=999 status code into `buf` (no heap allocation) and return the
+/// significant `&str` — used as a Prometheus label without a per-request
+/// `to_string()`. Values above 999 are clamped (statuses are 0..=599 in practice).
+fn status_str(code: u16, buf: &mut [u8; 3]) -> &str {
+    let mut n = code.min(999);
+    if n == 0 {
+        buf[0] = b'0';
+        return std::str::from_utf8(&buf[..1]).unwrap();
+    }
+    let mut i = 3;
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    std::str::from_utf8(&buf[i..]).unwrap()
 }
 
 // ---- redirect-only proxy (:80 → https) ----
@@ -4802,6 +4890,7 @@ mod tests {
         Upstream {
             host: host.into(),
             port: 80,
+            addr: format!("{host}:80"),
             tls: false,
             sni: host.into(),
             host_header: None,

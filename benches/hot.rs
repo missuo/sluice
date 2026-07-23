@@ -15,6 +15,7 @@ fn mk_upstream(host: &str, weight: u32) -> Upstream {
     Upstream {
         host: host.into(),
         port: 8080,
+        addr: format!("{host}:8080"),
         tls: false,
         sni: host.into(),
         host_header: None,
@@ -66,6 +67,38 @@ site \"a.example\" {\n upstream {\n server \"10.0.0.1:8080\" weight=3\n server \
 site \"b.example\" {\n upstream \"10.0.0.3:9000\"\n rate-limit rps=100 burst=200\n waf {\n block field=\"path\" match=r\"(?i)union\\s+select\"\n }\n}\n";
     c.bench_function("config_parse/2-sites", |b| {
         b.iter(|| Config::parse(black_box(cfg)).unwrap())
+    });
+
+    // Access-log metric recording: the pre-bound per-host handles (bound once,
+    // used per request) vs the previous `with_label_values` path (hashes label
+    // strings + `format!`/`to_string` allocs on every request). Both bump the same
+    // registered counters; this isolates the per-request cost the prebinding cuts.
+    use sluice::metrics::{HostMetrics, LATENCY, REQUESTS, REQ_BYTES, RESPONSES, RESP_BYTES};
+    let hm = HostMetrics::new("bench.example");
+    c.bench_function("metrics/prebound_record", |b| {
+        b.iter(|| {
+            hm.record(
+                black_box(200),
+                black_box(0.0012),
+                black_box(0),
+                black_box(1024),
+            )
+        })
+    });
+    c.bench_function("metrics/with_label_values", |b| {
+        b.iter(|| {
+            let host = black_box("bench.example");
+            let status: u16 = black_box(200);
+            REQUESTS
+                .with_label_values(&[host, &format!("{}xx", status / 100)])
+                .inc();
+            RESPONSES
+                .with_label_values(&[host, &status.to_string()])
+                .inc();
+            LATENCY.with_label_values(&[host]).observe(0.0012);
+            RESP_BYTES.with_label_values(&[host]).inc_by(1024);
+            REQ_BYTES.with_label_values(&[host]).inc_by(0);
+        })
     });
 }
 

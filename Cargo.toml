@@ -32,6 +32,15 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # both `--features openssl` and `--features boringssl` (Pingora's TLS facade
 # doesn't re-export the ASN.1 date APIs).
 x509-parser = "0.18"
+# Drop-in global allocator for the `sluice` BINARY only (set in src/main.rs).
+# Profiling showed heap allocation is the #1 userspace CPU consumer (~8% named
+# self, ~12-16% with memcpy; libc = 25% of proxy CPU) under the default glibc
+# malloc. mimalloc is a fast, low-fragmentation drop-in that builds cleanly on
+# Linux (x86_64 + aarch64) and macOS (incl. Apple Silicon's 16 KiB pages, where
+# jemalloc needs special page-size config) and is independent of the TLS backend.
+# It affects ONLY the binary — the lib/tests/benches link the system allocator,
+# so it can't perturb test behavior.
+mimalloc = "0.1"
 
 [lib]
 name = "sluice"

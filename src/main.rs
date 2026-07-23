@@ -18,6 +18,15 @@ use sluice::{acme, certs};
 
 const DEFAULT_CONFIG: &str = "/etc/sluice/sluice.kdl";
 
+// Fast, low-fragmentation global allocator for the running proxy. Heap
+// allocation is the largest single userspace CPU cost on the hot path (see
+// scratchpad/perf-analysis-profile.md); mimalloc is a drop-in replacement for
+// glibc malloc with markedly less per-allocation and per-free overhead. This is
+// scoped to the BINARY — the library, its unit tests, integration tests, and
+// benches do not carry it, so it cannot alter test behavior.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
@@ -102,6 +111,10 @@ fn main() {
     };
     let mut conf = ServerConf {
         threads,
+        // Experimental: pin tasks to their starting worker (no cross-thread
+        // stealing) when set false, to A/B the scheduling-locality cost. Default
+        // true keeps stock behavior.
+        work_stealing: config.server.work_stealing,
         grace_period_seconds: Some(config.server.grace_period_secs),
         graceful_shutdown_timeout_seconds: Some(config.server.graceful_shutdown_secs),
         upstream_keepalive_pool_size: config.server.upstream_keepalive_pool,
@@ -641,6 +654,7 @@ fn changed_startup_settings(old: &Config, new: &Config) -> Vec<&'static str> {
     chk!(h2_idle_timeout_secs, "h2-idle-timeout-secs");
     chk!(h2_handshake_timeout_secs, "h2-handshake-timeout-secs");
     chk!(upstream_dns_max_concurrent, "upstream-dns-max-concurrent");
+    chk!(work_stealing, "work-stealing");
 
     // Startup-bound state that lives OUTSIDE `ServerCfg`. Each is baked into a
     // live worker at startup and cannot be moved by a SIGHUP, so a change must be
