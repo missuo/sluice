@@ -22,16 +22,32 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Native build per (os, arch) — no cross toolchain, and BoringSSL is
+        # compiled natively on each. Windows is intentionally NOT built: sluice's
+        # security model is Unix-only (fd-pinned `openat`/`O_NOFOLLOW` directory
+        # walks, `geteuid`/`fstat` privilege checks, unix-socket zero-downtime
+        # upgrade) and Pingora itself targets Unix, so it does not compile there.
         include:
-          # Native x86_64 build.
+          # Linux x86_64.
           - runner: ubuntu-latest
+            os: linux
             arch: x86_64
             asset: sluice-x86_64-linux
-          # Native aarch64 build on the public GitHub-hosted arm64 runner —
-          # avoids a cross toolchain and cross-compiling BoringSSL.
+          # Linux aarch64 on the public GitHub-hosted arm64 runner.
           - runner: ubuntu-24.04-arm
+            os: linux
             arch: aarch64
             asset: sluice-aarch64-linux
+          # macOS x86_64 (Intel) on the last Intel runner image.
+          - runner: macos-13
+            os: macos
+            arch: x86_64
+            asset: sluice-x86_64-macos
+          # macOS aarch64 (Apple Silicon).
+          - runner: macos-14
+            os: macos
+            arch: aarch64
+            asset: sluice-aarch64-macos
     steps:
       # checkout@v5 runs on Node 24 (v4 targeted the now-deprecated Node 20).
       # persist-credentials: false removes the write-scoped token after fetch, so
@@ -49,15 +65,21 @@ jobs:
       - name: Cache cargo build
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
-          key: release-${{ matrix.arch }}
+          key: release-${{ matrix.os }}-${{ matrix.arch }}
 
       # BoringSSL (boring-sys) builds from source with cmake; it needs a C/C++
-      # toolchain, Go, and (on x86_64) nasm. These are the same deps the CI
-      # BoringSSL job uses, plus build-essential/perl for robustness.
-      - name: Install BoringSSL build deps
+      # toolchain, Go, and (on x86_64) nasm.
+      - name: Install BoringSSL build deps (Linux)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential cmake clang golang-go nasm ninja-build perl
+
+      # macOS ships clang (Xcode) already; add cmake/go, plus nasm for the
+      # x86_64 BoringSSL assembly. Homebrew is preinstalled on the runners.
+      - name: Install BoringSSL build deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install cmake go nasm
 
       # Build with the BoringSSL backend, which STATICALLY links BoringSSL — so
       # the artifact does not depend on the runner's system libssl/libcrypto and
@@ -90,15 +112,27 @@ jobs:
             echo "::error::binary version v$BIN_VER != release tag $RELEASE_TAG (bump Cargo.toml)"
             exit 1
           fi
-          echo "--- ldd ---"
-          ldd "$BIN" || true
-          if ldd "$BIN" | grep -qiE 'libssl|libcrypto'; then
+          # Confirm no DYNAMIC libssl/libcrypto (BoringSSL must be statically
+          # linked). ldd on Linux, otool -L on macOS.
+          echo "--- linked libraries ---"
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            otool -L "$BIN"
+            LINKED="$(otool -L "$BIN")"
+          else
+            ldd "$BIN" || true
+            LINKED="$(ldd "$BIN" || true)"
+          fi
+          if printf '%s' "$LINKED" | grep -qiE 'libssl|libcrypto'; then
             echo "::error::binary dynamically links libssl/libcrypto — not self-contained"
             exit 1
           fi
           echo "OK: no dynamic libssl/libcrypto (BoringSSL statically linked)"
-          echo "--- glibc (minimum for this asset) ---"
-          ldd --version | head -1
+          # Runtime floor: glibc version on Linux; the linked libSystem on macOS.
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            sw_vers || true
+          else
+            ldd --version | head -1
+          fi
 
       # Name the asset distinctly per target and make it executable. The raw
       # executable is uploaded — no .tar.gz / .zip.
