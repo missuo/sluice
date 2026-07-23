@@ -1,6 +1,6 @@
 [package]
 name = "sluice"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 description = "A config-driven edge proxy on Pingora. Routes and regulates HTTP traffic from a KDL config, no recompile per change."
 license = "MIT"
