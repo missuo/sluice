@@ -1,0 +1,21 @@
+sluice
+Copyright 2026 the sluice authors
+
+This product is licensed under the Apache License, Version 2.0 (the "License");
+you may not use this product except in compliance with the License. A copy of
+the License is in the LICENSE file, or at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+This product includes a minimally-patched copy of Pingora, developed by
+Cloudflare, Inc. (https://github.com/cloudflare/pingora), which is likewise
+licensed under the Apache License, Version 2.0.
+
+  Pingora
+  Copyright 2024 Cloudflare, Inc.
+
+The vendored copy lives under vendor/pingora-core/; its original license is
+retained at vendor/pingora-core/LICENSE and the exact modifications are
+documented in vendor/pingora-core/PATCH.md.

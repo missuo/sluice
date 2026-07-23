@@ -3,7 +3,7 @@ name = "sluice"
 version = "0.0.2"
 edition = "2021"
 description = "A config-driven edge proxy on Pingora. Routes and regulates HTTP traffic from a KDL config, no recompile per change."
-license = "MIT"
+license = "Apache-2.0"
 
 [dependencies]
 pingora = { version = "0.8", default-features = false, features = ["proxy", "connection_filter"] }
