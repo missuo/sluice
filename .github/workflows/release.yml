@@ -38,12 +38,8 @@ jobs:
             os: linux
             arch: aarch64
             asset: sluice-aarch64-linux
-          # macOS x86_64 (Intel) on the last Intel runner image.
-          - runner: macos-13
-            os: macos
-            arch: x86_64
-            asset: sluice-x86_64-macos
-          # macOS aarch64 (Apple Silicon).
+          # macOS aarch64 (Apple Silicon). macOS Intel is intentionally not built:
+          # the macos-13 (Intel) hosted runners no longer reliably pick up jobs.
           - runner: macos-14
             os: macos
             arch: aarch64
