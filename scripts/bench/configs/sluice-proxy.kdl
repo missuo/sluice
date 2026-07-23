@@ -1,6 +1,6 @@
 server {
     threads 0
-    metrics-addr "127.0.0.1:19090"
+    access-log-format "off"
     upstream-keepalive-pool 256
 }
 
