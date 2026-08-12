@@ -36,7 +36,7 @@ jobs:
 
       # Swatinem/rust-cache (Node 24) instead of actions/cache@v4 (Node 20).
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Format check
         run: cargo fmt --all -- --check
@@ -94,7 +94,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: boringssl
       # BoringSSL (boring-sys) needs these beyond the C toolchain on Ubuntu.
